@@ -481,8 +481,18 @@ def main() -> int:
         if float(getattr(args, "print_every_s", 0.0)) > 0.0 and (now - last_print) >= float(args.print_every_s):
             last_print = now
             cmd_np = last_cmd.detach().view(-1).to("cpu").numpy()
-            cmd_norm = float(np.linalg.norm(cmd_np[:6]))
-            print(f"[GT] t={now:5.1f}s steps={steps} a_idx={a_idx}/{len(actions)} cmd_norm={cmd_norm:.4f}")
+            sim_t = float(steps) * float(dt)
+            rtf = sim_t / max(1e-6, float(now))
+            dpos_m = float(np.linalg.norm(cmd_np[0:3]))
+            drot_rad = float(np.linalg.norm(cmd_np[3:6]))
+            v_mps = dpos_m / max(1e-9, float(dt))
+            w_rps = drot_rad / max(1e-9, float(dt))
+            print(
+                f"[GT] wall={now:6.1f}s sim={sim_t:6.2f}s rtf={rtf:4.2f} "
+                f"steps={steps} a_idx={a_idx}/{len(actions)} "
+                f"dpos_step={dpos_m*1e3:6.3f}mm v~{v_mps:6.3f}m/s "
+                f"drot_step={drot_rad*1e3:6.3f}mrad w~{w_rps:6.3f}rad/s"
+            )
 
     simulation_app.close()
     return 0

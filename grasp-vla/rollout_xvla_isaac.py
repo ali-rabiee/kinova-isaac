@@ -1064,10 +1064,17 @@ def main() -> int:
         if float(getattr(args, "print_every_s", 0.0)) > 0.0 and (now - last_print_t) >= float(args.print_every_s):
             last_print_t = now
             la = last_action.detach().view(-1).to("cpu").numpy() if isinstance(last_action, torch.Tensor) else None
-            la_norm = float(np.linalg.norm(la[:6])) if la is not None and la.size >= 6 else 0.0
+            sim_t = float(steps) * float(dt)
+            rtf = sim_t / max(1e-6, float(now))
+            dpos_m = float(np.linalg.norm(la[0:3])) if la is not None and la.size >= 3 else 0.0
+            drot_rad = float(np.linalg.norm(la[3:6])) if la is not None and la.size >= 6 else 0.0
+            v_mps = dpos_m / max(1e-9, float(dt))
+            w_rps = drot_rad / max(1e-9, float(dt))
             print(
-                f"[xVLA] t={now:5.1f}s steps={steps} policy_calls={policy_calls} "
-                f"no_rgb={skipped_no_rgb} last_cmd_norm={la_norm:.4f}"
+                f"[xVLA] wall={now:6.1f}s sim={sim_t:6.2f}s rtf={rtf:4.2f} "
+                f"steps={steps} policy_calls={policy_calls} no_rgb={skipped_no_rgb} "
+                f"dpos_step={dpos_m*1e3:6.3f}mm v~{v_mps:6.3f}m/s "
+                f"drot_step={drot_rad*1e3:6.3f}mrad w~{w_rps:6.3f}rad/s"
             )
 
     simulation_app.close()
