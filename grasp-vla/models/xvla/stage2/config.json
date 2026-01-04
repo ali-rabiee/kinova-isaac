@@ -1,0 +1,221 @@
+{
+    "type": "xvla",
+    "n_obs_steps": 1,
+    "input_features": {
+        "observation.images.image": {
+            "type": "VISUAL",
+            "shape": [
+                3,
+                256,
+                256
+            ]
+        },
+        "observation.images.image2": {
+            "type": "VISUAL",
+            "shape": [
+                3,
+                256,
+                256
+            ]
+        },
+        "observation.state": {
+            "type": "STATE",
+            "shape": [
+                8
+            ]
+        },
+        "observation.images.empty_camera_0": {
+            "type": "VISUAL",
+            "shape": [
+                3,
+                224,
+                224
+            ]
+        }
+    },
+    "output_features": {
+        "action": {
+            "type": "ACTION",
+            "shape": [
+                7
+            ]
+        }
+    },
+    "device": "cuda",
+    "use_amp": false,
+    "push_to_hub": true,
+    "repo_id": null,
+    "private": null,
+    "tags": null,
+    "license": null,
+    "pretrained_path": "/home/kye/.cache/huggingface/hub/models--lerobot--xvla-base/snapshots/4e63a23a885feda4315b7f679242b8eee7778b2d",
+    "chunk_size": 30,
+    "n_action_steps": 30,
+    "dtype": "bfloat16",
+    "normalization_mapping": {
+        "STATE": "IDENTITY",
+        "ACTION": "MEAN_STD",
+        "VISUAL": "IDENTITY"
+    },
+    "florence_config": {
+        "model_type": "florence2",
+        "bos_token_id": 0,
+        "eos_token_id": 2,
+        "ignore_index": -100,
+        "pad_token_id": 1,
+        "projection_dim": 1024,
+        "text_config": {
+            "vocab_size": 51289,
+            "activation_dropout": 0.1,
+            "activation_function": "gelu",
+            "add_bias_logits": false,
+            "add_final_layer_norm": false,
+            "attention_dropout": 0.1,
+            "bos_token_id": 0,
+            "classif_dropout": 0.1,
+            "classifier_dropout": 0.0,
+            "d_model": 1024,
+            "decoder_attention_heads": 16,
+            "decoder_ffn_dim": 4096,
+            "decoder_layerdrop": 0.0,
+            "decoder_layers": 12,
+            "decoder_start_token_id": 2,
+            "dropout": 0.1,
+            "early_stopping": true,
+            "encoder_attention_heads": 16,
+            "encoder_ffn_dim": 4096,
+            "encoder_layerdrop": 0.0,
+            "encoder_layers": 12,
+            "eos_token_id": 2,
+            "forced_eos_token_id": 2,
+            "forced_bos_token_id": 0,
+            "gradient_checkpointing": false,
+            "init_std": 0.02,
+            "is_encoder_decoder": true,
+            "label2id": {
+                "LABEL_0": 0,
+                "LABEL_1": 1,
+                "LABEL_2": 2
+            },
+            "max_position_embeddings": 4096,
+            "no_repeat_ngram_size": 3,
+            "normalize_before": false,
+            "num_hidden_layers": 12,
+            "pad_token_id": 1,
+            "scale_embedding": false,
+            "num_beams": 3
+        },
+        "vision_config": {
+            "model_type": "davit",
+            "drop_path_rate": 0.1,
+            "patch_size": [
+                7,
+                3,
+                3,
+                3
+            ],
+            "patch_stride": [
+                4,
+                2,
+                2,
+                2
+            ],
+            "patch_padding": [
+                3,
+                1,
+                1,
+                1
+            ],
+            "patch_prenorm": [
+                false,
+                true,
+                true,
+                true
+            ],
+            "enable_checkpoint": false,
+            "dim_embed": [
+                256,
+                512,
+                1024,
+                2048
+            ],
+            "num_heads": [
+                8,
+                16,
+                32,
+                64
+            ],
+            "num_groups": [
+                8,
+                16,
+                32,
+                64
+            ],
+            "depths": [
+                1,
+                1,
+                9,
+                1
+            ],
+            "window_size": 12,
+            "projection_dim": 1024,
+            "visual_temporal_embedding": {
+                "type": "COSINE",
+                "max_temporal_embeddings": 100
+            },
+            "image_pos_embed": {
+                "type": "learned_abs_2d",
+                "max_pos_embeddings": 50
+            },
+            "image_feature_source": [
+                "spatial_avg_pool",
+                "temporal_avg_pool"
+            ]
+        },
+        "vocab_size": 51289,
+        "torch_dtype": "float32",
+        "is_encoder_decoder": true
+    },
+    "tokenizer_name": "facebook/bart-large",
+    "tokenizer_max_length": 1024,
+    "tokenizer_padding_side": "right",
+    "pad_language_to": "max_length",
+    "hidden_size": 1024,
+    "depth": 24,
+    "num_heads": 16,
+    "mlp_ratio": 4.0,
+    "num_domains": 30,
+    "len_soft_prompts": 32,
+    "dim_time": 32,
+    "max_len_seq": 512,
+    "use_hetero_proj": false,
+    "action_mode": "auto",
+    "num_denoising_steps": 10,
+    "use_proprio": true,
+    "max_state_dim": 20,
+    "max_action_dim": 20,
+    "domain_feature_key": null,
+    "resize_imgs_with_padding": [
+        224,
+        224
+    ],
+    "num_image_views": 4,
+    "empty_cameras": 1,
+    "freeze_vision_encoder": false,
+    "freeze_language_encoder": false,
+    "train_policy_transformer": true,
+    "train_soft_prompts": true,
+    "optimizer_lr": 0.0001,
+    "optimizer_betas": [
+        0.9,
+        0.95
+    ],
+    "optimizer_eps": 1e-08,
+    "optimizer_weight_decay": 0.0001,
+    "optimizer_grad_clip_norm": 10.0,
+    "optimizer_soft_prompt_lr_scale": 1.0,
+    "optimizer_soft_prompt_warmup_lr_scale": null,
+    "scheduler_warmup_steps": 1000,
+    "scheduler_decay_steps": 30000,
+    "scheduler_decay_lr": 2.5e-06
+}

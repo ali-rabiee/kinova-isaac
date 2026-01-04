@@ -209,5 +209,9 @@ __marimo__/
 # Project logs
 /logs/
 
+# Trained model checkpoints (keep large weights out of git)
+# Keep processor/state safetensors tracked; ignore only the heavyweight model weights.
+grasp-vla/models/**/model.safetensors
+
 # python cache
 __pycache__/
