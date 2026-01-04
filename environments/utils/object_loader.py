@@ -25,6 +25,9 @@ class ObjectLoaderConfig:
     dataset_dirs: list[str]
     bounds: SpawnBounds
     min_distance: float = 0.08
+    # If True, enforce min_distance in XY only (ignores Z). Useful when objects spawn at varying Z
+    # (e.g., dropping from above the table) but we still want them spaced out on the tabletop.
+    min_distance_xy_only: bool = False
     max_placement_tries_per_object: int = 500
     parent_objects_relpath: str = "Objects"
     
@@ -77,6 +80,10 @@ class ObjectLoaderConfig:
     box_size_min: tuple[float, float, float] = (0.04, 0.04, 0.04)
     box_size_max: tuple[float, float, float] = (0.06, 0.06, 0.06)
     box_color: tuple[float, float, float] = (0.2, 0.8, 0.2)
+    # Optional palette for per-object coloring in box mode. If provided, color cycles by object index.
+    box_color_palette: Sequence[tuple[float, float, float]] | None = None
+    # Optional names corresponding to `box_color_palette` (not used by ObjectLoader itself, but useful for logging).
+    box_color_names: Sequence[str] | None = None
 
     # Error reporting / strictness
     # If True, print full tracebacks for exceptions that were previously swallowed.
@@ -288,6 +295,7 @@ class ObjectLoader:
         """Generate non-overlapping positions for objects."""
         positions: list[tuple[float, float, float]] = []
         tries_left = self.cfg.max_placement_tries_per_object * count
+        xy_only = bool(getattr(self.cfg, "min_distance_xy_only", False))
         
         while len(positions) < count and tries_left > 0:
             candidate = list(self._sample_position(self.cfg.bounds))
@@ -299,8 +307,19 @@ class ObjectLoader:
                 
             candidate_t = (candidate[0], candidate[1], candidate[2])
             
-            if all(self._distance(candidate_t, p) >= self.cfg.min_distance for p in positions):
-                positions.append(candidate_t)
+            if xy_only:
+                ok = True
+                for p in positions:
+                    dx = float(candidate_t[0] - p[0])
+                    dy = float(candidate_t[1] - p[1])
+                    if math.hypot(dx, dy) < float(self.cfg.min_distance):
+                        ok = False
+                        break
+                if ok:
+                    positions.append(candidate_t)
+            else:
+                if all(self._distance(candidate_t, p) >= self.cfg.min_distance for p in positions):
+                    positions.append(candidate_t)
                 
             tries_left -= 1
             
@@ -667,6 +686,12 @@ class ObjectLoader:
                 print(traceback.format_exc())
                 if getattr(self.cfg, "raise_on_exceptions", False):
                     raise
+            if CuboidCfg is None:
+                print(
+                    "[ObjectLoader][ERROR] spawn_mode='box' but required IsaacLab shape spawners could not be imported. "
+                    "This would cause silent spawn failures. Check your IsaacLab installation/environment."
+                )
+                return []
 
         for idx, (item, pos) in enumerate(zip(selection, positions), start=1):
             prim_path = f"{objects_root}/Obj_{idx:02d}"
@@ -688,10 +713,19 @@ class ObjectLoader:
                     sx = random.uniform(self.cfg.box_size_min[0], self.cfg.box_size_max[0])
                     sy = random.uniform(self.cfg.box_size_min[1], self.cfg.box_size_max[1])
                     sz = random.uniform(self.cfg.box_size_min[2], self.cfg.box_size_max[2])
+
+                    # Visual: optionally color each box differently (cycles through palette).
+                    box_color = tuple(self.cfg.box_color)
+                    try:
+                        pal = getattr(self.cfg, "box_color_palette", None)
+                        if pal is not None and len(pal) > 0:
+                            box_color = tuple(float(v) for v in pal[(idx - 1) % len(pal)])
+                    except Exception:
+                        box_color = tuple(self.cfg.box_color)
                     
                     obj_cfg = CuboidCfg(
                         size=(sx, sy, sz),
-                        visual_material=PreviewSurfaceCfg(diffuse_color=self.cfg.box_color),
+                        visual_material=PreviewSurfaceCfg(diffuse_color=box_color),
                         rigid_props=sim_utils.RigidBodyPropertiesCfg(
                             rigid_body_enabled=True,
                             kinematic_enabled=False,

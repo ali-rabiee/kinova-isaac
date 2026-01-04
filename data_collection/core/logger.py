@@ -16,10 +16,14 @@ from isaaclab.utils.math import quat_apply, quat_conjugate, subtract_frame_trans
 @dataclass
 class TickLoggingConfig:
     log_rate_hz: int = 10
+    # Intended rate of the *learned policy* (Hz). If None, defaults to log_rate_hz.
+    # This is recorded to metadata/ticks to avoid ambiguity when downsampling.
+    policy_rate_hz: Optional[int] = None
     workspace_min: Optional[Tuple[Optional[float], Optional[float], Optional[float]]] = None
     workspace_max: Optional[Tuple[Optional[float], Optional[float], Optional[float]]] = None
     ee_link_name: str = "j2n6s300_end_effector"
     arm_joint_regex: str = "j2n6s300_joint_[1-6]"
+    log_joint_data: bool = False  # Enable joint positions/velocities logging (for VLA training)
 
 
 class SessionLogWriter:
@@ -40,6 +44,11 @@ class SessionLogWriter:
         self._ee_jacobi_idx: Optional[int] = None
         self._arm_joint_ids: Optional[List[int]] = None
         self._obj_last_pos: Dict[str, Tuple[List[float], int]] = {}
+        # Previous-tick caches for policy-aligned action derivation (delta from prev tick).
+        self._prev_tick_ms: Optional[int] = None
+        self._prev_ee_pos_b: Optional[torch.Tensor] = None  # (3,)
+        self._prev_ee_quat_b: Optional[torch.Tensor] = None  # (4,) wxyz
+        self._prev_gr_state: Optional[str] = None
 
     def close(self) -> None:
         try:
@@ -62,14 +71,20 @@ class SessionLogWriter:
         arm_joint_regex: str,
         log_rate_hz: int,
         window_len_s: float,
+        policy_rate_hz: Optional[int] = None,
     ) -> None:
+        policy_rate_hz_i = int(policy_rate_hz) if policy_rate_hz is not None else int(log_rate_hz)
         meta = {
             "version": "data_collection_v0",
             "session_id": self.session_id,
             "started_ms": int(time.time() * 1000),
             "env": {"sim": True, "sim_dt": float(sim_dt), "physics_substeps": int(physics_substeps), "seed": int(seed)},
             "robot": {"name": robot_name, "ee_link": ee_link, "arm_joint_regex": arm_joint_regex},
-            "config": {"log_rate_hz": int(log_rate_hz), "window_len_s": float(window_len_s)},
+            "config": {
+                "log_rate_hz": int(log_rate_hz),
+                "policy_rate_hz": int(policy_rate_hz_i),
+                "window_len_s": float(window_len_s),
+            },
         }
         (self.root / "metadata.json").write_text(json.dumps(_format_numbers(meta, ndigits=4), indent=2))
 
@@ -92,6 +107,32 @@ class SessionLogWriter:
     @staticmethod
     def _quat_inv(q: torch.Tensor) -> torch.Tensor:
         return quat_conjugate(q)
+
+    @staticmethod
+    def _quat_conjugate_wxyz(q: torch.Tensor) -> torch.Tensor:
+        """Conjugate of quaternion q = [w, x, y, z]. Shape (..., 4)."""
+        return torch.stack([q[..., 0], -q[..., 1], -q[..., 2], -q[..., 3]], dim=-1)
+
+    @staticmethod
+    def _quat_multiply_wxyz(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+        """Hamilton product q1 * q2, both [w, x, y, z]. Shape (..., 4)."""
+        w1, x1, y1, z1 = q1.unbind(dim=-1)
+        w2, x2, y2, z2 = q2.unbind(dim=-1)
+        w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+        x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+        y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+        z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+        return torch.stack([w, x, y, z], dim=-1)
+
+    @staticmethod
+    def _quat_to_rotvec_wxyz(q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        """Convert unit quaternion [w,x,y,z] to rotation vector (axis*angle). Shape (...,3)."""
+        w = torch.clamp(q[..., 0], -1.0, 1.0)
+        v = q[..., 1:4]
+        v_norm = torch.linalg.norm(v, dim=-1, keepdim=True).clamp_min(eps)
+        angle = 2.0 * torch.atan2(v_norm, w.unsqueeze(-1))
+        axis = v / v_norm
+        return axis * angle
 
     def write_tick(
         self,
@@ -162,13 +203,57 @@ class SessionLogWriter:
             near = False
 
         # User
+        cmd7: List[float]
+        gripper_cmd: float
         if last_user_cmd is not None:
             u = last_user_cmd.view(-1)
             cmd6 = [float(v) for v in (u[:6].detach().to("cpu").tolist() + [0, 0, 0, 0, 0, 0])][:6]
-            deadman = bool(torch.linalg.norm(u[:6]).item() > 1e-6)
+            u_list = u.detach().to("cpu").tolist()
+            # Normalize to 7D: [dx, dy, dz, rx, ry, rz, g]
+            if len(u_list) >= 7:
+                cmd7 = [float(v) for v in u_list[:7]]
+            else:
+                cmd7 = [float(v) for v in (u_list[:6] + [0.0] * 6)[:6]] + [float(u_list[6]) if len(u_list) > 6 else 0.0]
+            gripper_cmd = float(cmd7[6])
+            # "deadman" should reflect *any* non-zero command (including gripper-only).
+            try:
+                deadman = bool(torch.linalg.norm(u[: min(int(u.numel()), 7)]).item() > 1e-6)
+            except Exception:
+                deadman = bool(any(abs(v) > 1e-9 for v in cmd7))
         else:
             cmd6 = [0.0] * 6
+            cmd7 = [0.0] * 7
+            gripper_cmd = 0.0
             deadman = False
+
+        # Policy-aligned action (5Hz requested): store delta from previous tick in base frame.
+        # This makes the action representation match the tick spacing (dt ~= 1/log_rate_hz).
+        # NOTE: `action_from_prev` is computed between consecutive *logged ticks*,
+        # so its effective rate is the tick log rate.
+        policy_rate_hz = int(cfg.log_rate_hz)
+        dt_expected_s = 1.0 / float(max(1, int(cfg.log_rate_hz)))
+        policy_action_from_prev = None
+        try:
+            curr_pos_b = ee_pos_b[0].detach()
+            curr_quat_b = ee_quat_b[0].detach()
+            if self._prev_ee_pos_b is not None and self._prev_ee_quat_b is not None:
+                dpos = (curr_pos_b - self._prev_ee_pos_b).to("cpu").tolist()
+                q_err = self._quat_multiply_wxyz(curr_quat_b, self._quat_conjugate_wxyz(self._prev_ee_quat_b))
+                drot = self._quat_to_rotvec_wxyz(q_err).to("cpu").tolist()
+                # Discrete gripper action inferred from state change over the interval.
+                g_action = 0
+                if self._prev_gr_state == "open" and gr_state == "close":
+                    g_action = -1
+                elif self._prev_gr_state == "close" and gr_state == "open":
+                    g_action = +1
+                policy_action_from_prev = {
+                    "dt_s": float(dt_expected_s),
+                    "ee_delta_pos_b": [float(v) for v in dpos],
+                    "ee_delta_rotvec_b": [float(v) for v in drot],
+                    "gripper_action": int(g_action),  # -1 close, +1 open, 0 hold
+                }
+        except Exception:
+            policy_action_from_prev = None
 
         # Objects and rel metrics
         obj_list: List[Dict[str, Any]] = []
@@ -229,11 +314,31 @@ class SessionLogWriter:
             "time_since_last_safety_ms": 0 if self._last_safety_ms is None else max(0, now_ms - self._last_safety_ms),
         }
 
-        record = {
-            "t_ms": now_ms,
-            "tick_idx": self.tick_idx,
-            "robot": {
-                "ee_pose_w": {
+        # Build robot record with base fields
+        robot_record = {
+            "ee_pose_w": {
+                "position_m": [float(ee_pose_w[0, 0].item()), float(ee_pose_w[0, 1].item()), float(ee_pose_w[0, 2].item())],
+                "orientation_wxyz": [
+                    float(ee_pose_w[0, 3].item()),
+                    float(ee_pose_w[0, 4].item()),
+                    float(ee_pose_w[0, 5].item()),
+                    float(ee_pose_w[0, 6].item()),
+                ],
+            },
+            "ee_pose_b": {
+                "position_m": [float(ee_pos_b[0, 0].item()), float(ee_pos_b[0, 1].item()), float(ee_pos_b[0, 2].item())],
+                "orientation_wxyz": [
+                    float(ee_quat_b[0, 0].item()),
+                    float(ee_quat_b[0, 1].item()),
+                    float(ee_quat_b[0, 2].item()),
+                    float(ee_quat_b[0, 3].item()),
+                ],
+            },
+            "ee_linear_vel_mps": [float(lin[0].item()), float(lin[1].item()), float(lin[2].item())],
+            "ee_angular_vel_rps": [float(ang[0].item()), float(ang[1].item()), float(ang[2].item())],
+            "gripper": {
+                "state": gr_state,
+                "pose_w": {
                     "position_m": [float(ee_pose_w[0, 0].item()), float(ee_pose_w[0, 1].item()), float(ee_pose_w[0, 2].item())],
                     "orientation_wxyz": [
                         float(ee_pose_w[0, 3].item()),
@@ -242,7 +347,7 @@ class SessionLogWriter:
                         float(ee_pose_w[0, 6].item()),
                     ],
                 },
-                "ee_pose_b": {
+                "pose_b": {
                     "position_m": [float(ee_pos_b[0, 0].item()), float(ee_pos_b[0, 1].item()), float(ee_pos_b[0, 2].item())],
                     "orientation_wxyz": [
                         float(ee_quat_b[0, 0].item()),
@@ -251,32 +356,61 @@ class SessionLogWriter:
                         float(ee_quat_b[0, 3].item()),
                     ],
                 },
-                "ee_linear_vel_mps": [float(lin[0].item()), float(lin[1].item()), float(lin[2].item())],
-                "ee_angular_vel_rps": [float(ang[0].item()), float(ang[1].item()), float(ang[2].item())],
-                "gripper": {
-                    "state": gr_state,
-                    "pose_w": {
-                        "position_m": [float(ee_pose_w[0, 0].item()), float(ee_pose_w[0, 1].item()), float(ee_pose_w[0, 2].item())],
-                        "orientation_wxyz": [
-                            float(ee_pose_w[0, 3].item()),
-                            float(ee_pose_w[0, 4].item()),
-                            float(ee_pose_w[0, 5].item()),
-                            float(ee_pose_w[0, 6].item()),
-                        ],
-                    },
-                    "pose_b": {
-                        "position_m": [float(ee_pos_b[0, 0].item()), float(ee_pos_b[0, 1].item()), float(ee_pos_b[0, 2].item())],
-                        "orientation_wxyz": [
-                            float(ee_quat_b[0, 0].item()),
-                            float(ee_quat_b[0, 1].item()),
-                            float(ee_quat_b[0, 2].item()),
-                            float(ee_quat_b[0, 3].item()),
-                        ],
-                    },
-                },
-                "safety": {"jacobian_s_min": s_min, "workspace_clamped_axes": clamped_axes, "near_joint_limit": near},
             },
-            "user": {"joystick": {"cartesian_vel_cmd": cmd6, "speed_scale": 1.0}, "mode": "velocity", "deadman": deadman},
+            "safety": {"jacobian_s_min": s_min, "workspace_clamped_axes": clamped_axes, "near_joint_limit": near},
+        }
+
+        # Add joint data if enabled (for VLA training)
+        if cfg.log_joint_data and arm_ids:
+            try:
+                # Get joint positions
+                joint_positions = [
+                    float(robot.data.joint_pos[0, jid].item()) 
+                    for jid in arm_ids
+                ]
+                joint_names = [
+                    str(robot.data.joint_names[jid]) 
+                    for jid in arm_ids
+                ]
+                
+                # Get joint velocities
+                joint_velocities = []
+                if hasattr(robot.data, "joint_vel"):
+                    joint_velocities = [
+                        float(robot.data.joint_vel[0, jid].item()) 
+                        for jid in arm_ids
+                    ]
+                else:
+                    joint_velocities = [0.0] * len(arm_ids)
+                
+                robot_record["joints"] = {
+                    "positions": joint_positions,
+                    "velocities": joint_velocities,
+                    "names": joint_names,
+                }
+            except Exception:
+                # If joint data extraction fails, skip it
+                pass
+
+        record = {
+            "t_ms": now_ms,
+            "tick_idx": self.tick_idx,
+            "robot": robot_record,
+            "user": {
+                "joystick": {
+                    "cartesian_vel_cmd": cmd6,
+                    "cartesian_vel_cmd_7d": cmd7,
+                    "gripper_cmd": float(gripper_cmd),
+                    "speed_scale": 1.0,
+                },
+                "mode": "velocity",
+                "deadman": deadman,
+            },
+            "policy": {
+                "rate_hz": int(policy_rate_hz),
+                "requested_rate_hz": (int(cfg.policy_rate_hz) if cfg.policy_rate_hz is not None else None),
+                "action_from_prev": policy_action_from_prev,
+            },
             "objects": obj_list,
             "recency": rec,
         }
@@ -287,6 +421,14 @@ class SessionLogWriter:
 
         self.ticks_f.write(json.dumps(_format_numbers(record, ndigits=4)) + "\n")
         self.tick_idx += 1
+        # Update prev caches after writing (so tick_idx aligns with record's tick_idx).
+        try:
+            self._prev_tick_ms = int(now_ms)
+            self._prev_ee_pos_b = ee_pos_b[0].detach()
+            self._prev_ee_quat_b = ee_quat_b[0].detach()
+            self._prev_gr_state = str(gr_state)
+        except Exception:
+            pass
 
     def log_event(self, event_type: str, data: Dict[str, Any]) -> None:
         now_ms = int(time.time() * 1000)

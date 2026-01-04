@@ -23,6 +23,8 @@ from data_collection.core.objects import ObjectsTracker
 from data_collection.core.logger import SessionLogWriter, TickLoggingConfig
 
 
+
+
 def run(sim, robot, controller: CartesianVelocityJogController, simulation_app, *, mux_input: CommandMuxInputProvider | None, obj_tracker: ObjectsTracker | None, session_logger: SessionLogWriter | None, tick_cfg: TickLoggingConfig | None, id_to_label: dict[str, str] | None = None):
     dt = sim.get_physics_dt()
     controller.reset(robot)

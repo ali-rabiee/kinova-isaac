@@ -116,13 +116,18 @@ python -m data_collection.collect_data \
   --planner curobo_v2 \
   --device cuda:0 \
   --enable_cameras \
-  --log-rate-hz 10 \
-  --render-rate-hz 60 \
-  --curobo-world-from-scene \
-  --num-episodes 1 \
-  --workspace-min-z -0.02 \
+  --log-rate-hz 5 \
+  --num-episodes 10 \
   --spawn-mode box \
-  --box-size 0.08
+  --planner-speed-mps 0.4 \
+  --planner-waypoint-max-seg-m 0.01 \
+  --target-selection first \
+  --max-steps-per-episode 8000 \
+  --grasp-depth -0.07 \
+  --close-if-within-m 0.005 \
+  --min-distance 0.20 \
+  --domain-rand \
+  --domain-rand-seed 0
 ```
 
 **Key Arguments:**
@@ -130,6 +135,8 @@ python -m data_collection.collect_data \
 - `--box-size`: Side length of the cubes (m).
 - `--curobo-world-from-scene`: Sync simulation obstacles to planner world.
 - `--enable_cameras`: Record camera images.
+- `--log-rate-hz`: Tick/image logging rate. In `vla_v1` this is also the intended **policy rate**.
+- `--domain-rand`: Enable per-episode domain randomization (camera + lighting). Off by default.
 - `--workspace-min-z`: Minimum allowed EE height (negative allows reaching surface).
 
 ### 7) Data Collection (Random Objects)
@@ -144,7 +151,7 @@ python -m data_collection.collect_data \
   --planner curobo_v2 \
   --device cuda:0 \
   --enable_cameras \
-  --log-rate-hz 10 \
+  --log-rate-hz 5 \
   --render-rate-hz 60 \
   --curobo-world-from-scene \
   --num-episodes 10 \
@@ -162,11 +169,22 @@ Common arguments for tuning the data collection process:
 | `--headless` | (flag) | Run without GUI (faster, good for batch collection). |
 | `--num-objects` | `5` | Number of objects to spawn per episode. |
 | `--planner` | `curobo_v2` | Planner backend (`curobo_v2`, `scripted`, `rmpflow`). |
+| `--log-rate-hz` | `5` | Tick/image logging rate (and intended policy rate for VLA training). |
 | `--grasp-depth` | `-0.05` | Grasp offset relative to object top (m). Increase magnitude to grasp deeper. |
 | `--lift` | `0.15` | Height to lift object after grasping (m). |
 | `--workspace-min-z` | `0.0` | Safety floor for EE. Set negative (e.g. `-0.02`) if robot can't reach table surface. |
 | `--spawn-mode` | `usd` | `usd` for random YCB objects, `box` for uniform cubes. |
 | `--box-size` | `0.05` | Size of cubes when using `--spawn-mode box`. |
+| `--domain-rand` | off | Enable per-episode domain randomization (camera + lighting). |
+| `--domain-rand-seed` | (none) | Optional RNG seed for reproducible randomization. |
+| `--domain-rand-camera-xy-m` | `0.02` | Uniform XY jitter (m) for the top-down camera. |
+| `--domain-rand-camera-z-m` | `0.10` | Uniform Z jitter (m) for the top-down camera height. |
+| `--domain-rand-camera-yaw-deg` | `20.0` | Uniform yaw jitter (deg) for the top-down camera. |
+| `--domain-rand-camera-pitch-deg` | `0.0` | Uniform pitch jitter (deg) for the top-down camera (tilt). |
+| `--domain-rand-camera-roll-deg` | `0.0` | Uniform roll jitter (deg) for the top-down camera (tilt). |
+| `--domain-rand-camera-fov-deg` | `5.0` | Uniform FOV jitter (deg) for the top-down camera. |
+| `--domain-rand-light-intensity-mult-min/max` | `0.5/1.5` | Dome light intensity multiplier range. |
+| `--domain-rand-light-color-jitter` | `0.15` | Dome light RGB jitter per channel (0..1). |
 
 ## Logs
 
@@ -176,3 +194,31 @@ Common arguments for tuning the data collection process:
 
 - **Keyboard teleop requires GUI**: run without `--headless` to use keyboard input.
 - **Object spawning depends on asset availability**: if spawning fails, rerun with `--no-objects` to isolate issues.
+
+## VLA data collection (recommended command)
+
+Uniform boxes + cuRobo planner + cameras + domain randomization, with **box locations reshuffled every episode**:
+
+```bash
+python -m data_collection.collect_data \
+  --profile vla_v1 \
+  --env reach_to_grasp_VLA \
+  --control planner \
+  --planner curobo_v2 \
+  --device cuda:0 \
+  --enable_cameras \
+  --log-rate-hz 5 \
+  --num-episodes 10 \
+  --spawn-mode box \
+  --planner-speed-mps 0.4 \
+  --planner-waypoint-max-seg-m 0.01 \
+  --target-selection first \
+  --max-steps-per-episode 8000 \
+  --grasp-depth -0.07 \
+  --close-if-within-m 0.005 \
+  --min-distance 0.20 \
+  --domain-rand \
+  --domain-rand-seed 0 \
+  --respawn-every-n-episodes 1
+```
+

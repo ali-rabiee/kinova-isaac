@@ -29,6 +29,17 @@ class ObjectsTracker:
         root_prim = stage.GetPrimAtPath(root_path)
         if not root_prim.IsValid():
             return None
+        # Common case (especially for simple shape spawners): the rigid body is the root prim itself.
+        # If we don't handle this, we fall back to USD XformCache which may not reflect dynamic motion reliably.
+        try:
+            if root_prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                rigid_path = str(root_path)
+                SimulationManager = importlib.import_module("isaacsim.core.simulation_manager").SimulationManager
+                physx_view = SimulationManager.get_physics_sim_view().create_rigid_body_view(rigid_path)
+                self._rigid_root_map[root_path] = (rigid_path, physx_view)
+                return self._rigid_root_map[root_path]
+        except Exception:
+            pass
         # Traverse children and find first prim with RigidBodyAPI applied
         get_all_matching_child_prims = getattr(sim_utils, "get_all_matching_child_prims")
         rigid_prims = get_all_matching_child_prims(
