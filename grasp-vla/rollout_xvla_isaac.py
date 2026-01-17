@@ -577,14 +577,35 @@ def main() -> int:
     )
     ap.add_argument("--print-actions", action="store_true", help="Print policy actions periodically.")
     ap.add_argument(
+        "--print-actions-every",
+        type=int,
+        default=10,
+        help="When --print-actions is enabled, print once every N policy calls (default: 10).",
+    )
+    ap.add_argument(
+        "--trace-policy",
+        action="store_true",
+        help=(
+            "Print a debug line every policy call: image stats + state + raw/scaled action. "
+            "Useful to diagnose 'policy always goes one direction'."
+        ),
+    )
+    ap.add_argument(
+        "--trace-policy-every",
+        type=int,
+        default=1,
+        help="When --trace-policy is enabled, only emit the trace once every N policy calls (default: 1).",
+    )
+    ap.add_argument(
         "--state-mode",
         type=str,
-        default="joints7",
-        choices=["joints7", "ee_pose8"],
+        default="joints8",
+        choices=["joints8", "ee_pose8", "joints7"],
         help=(
             "Which proprio state to feed the policy.\n"
-            "  - joints7: [j1..j6, 0.0] (matches your logged dataset stats)\n"
+            "  - joints8: [j1..j6, gripper_open_frac, 0.0] (matches your stage2 normalizer stats)\n"
             "  - ee_pose8: [ee_pos_b(3), ee_quat_b_wxyz(4), gripper_open_frac] (legacy/debug)\n"
+            "  - joints7: [j1..j6, 0.0] (legacy; will be zero-padded/truncated to match model state dim)\n"
         ),
     )
     ap.add_argument(
@@ -605,6 +626,17 @@ def main() -> int:
         help=(
             "Optional path to LeRobot source '.../lerobot/src'. "
             "If not provided, we try $LEROBOT_SRC and common local checkout locations."
+        ),
+    )
+    ap.add_argument(
+        "--init-joints",
+        type=float,
+        nargs=6,
+        default=None,
+        metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
+        help=(
+            "Optional: override the initial arm joint positions (radians) for joints 1..6.\n"
+            "Tip: Use values from a vla_v1 log tick0 to match the training start distribution."
         ),
     )
 
@@ -692,6 +724,18 @@ def main() -> int:
         sys.stdout.flush()
     except Exception as e:
         raise RuntimeError(f"Failed to load policy config from {model_dir}: {e}") from e
+
+    # Model input/output dims (useful for debugging mismatches).
+    model_state_dim = 8
+    try:
+        model_state_dim = int(((cfg.input_features or {}).get("observation.state") or {}).get("shape", [8])[0])
+    except Exception:
+        model_state_dim = 8
+    model_action_dim = 20
+    try:
+        model_action_dim = int(((cfg.output_features or {}).get("action") or {}).get("shape", [20])[0])
+    except Exception:
+        model_action_dim = 20
 
     try:
         print("[xVLA] (pre-Kit) Loading policy weights (this can take a while the first time)...")
@@ -850,6 +894,22 @@ def main() -> int:
     except Exception:
         arm_joint_ids = []
 
+    # Optional: reset robot to provided initial joint positions (helps match training distribution).
+    if getattr(args, "init_joints", None) is not None:
+        try:
+            init = [float(x) for x in list(getattr(args, "init_joints"))]
+            if len(init) >= 6 and arm_joint_ids:
+                q = robot.data.joint_pos.clone()
+                qd = torch.zeros_like(robot.data.joint_vel)
+                q[0, arm_joint_ids[:6]] = torch.tensor(init[:6], device=sim.device, dtype=q.dtype)
+                robot.write_joint_state_to_sim(q, qd)
+                robot.reset()
+                controller.reset(robot)
+                controller.set_mode("translate")
+                print(f"[xVLA] Applied --init-joints to arm joints: {init[:6]}")
+        except Exception as e:
+            print(f"[xVLA][WARN] Failed to apply --init-joints (continuing): {e}")
+
     # --- Policy already loaded pre-Kit. Keep `policy`, `preproc`, `postproc` from above. ---
 
     # Build instruction
@@ -896,6 +956,10 @@ def main() -> int:
     last_print_t = 0.0
     policy_calls = 0
     skipped_no_rgb = 0
+    warned_state_dim = False
+    prev_rgb_u8 = None
+    prev_a7_raw = None
+    prev_dist_to_target = None
 
     while simulation_app.is_running() and (time.time() - t0) < float(args.max_seconds):
         steps += 1
@@ -948,21 +1012,9 @@ def main() -> int:
             #  - observation.images.empty_camera_0 (3,224,224)
             empty_224 = torch.zeros(3, 224, 224, dtype=torch.uint8)
 
-            # State should match training distribution.
-            # Your saved stats show observation.state = [j1..j6, 0.0] (7D) (arm joint positions + dummy).
-            state_mode = str(getattr(args, "state_mode", "joints7"))
-            if state_mode == "joints7":
-                try:
-                    if arm_joint_ids:
-                        q = robot.data.joint_pos[0, arm_joint_ids].detach().to("cpu", dtype=torch.float32).view(-1)
-                    else:
-                        q = robot.data.joint_pos[0].detach().to("cpu", dtype=torch.float32).view(-1)
-                    q6 = q[:6] if q.numel() >= 6 else torch.nn.functional.pad(q, (0, 6 - int(q.numel())))
-                except Exception:
-                    q6 = torch.zeros(6, dtype=torch.float32)
-                state = torch.cat([q6, torch.zeros(1, dtype=torch.float32)], dim=0)  # (7,)
-            else:
-                # Legacy/debug mode: EE pose + gripper open fraction (8D)
+            # Proprio state must match model config (your Stage-2 config expects 8D).
+            state_mode = str(getattr(args, "state_mode", "ee_pose8"))
+            if state_mode == "ee_pose8":
                 pos_b, quat_b = _read_ee_pose_b(robot, ctrl_cfg.ee_link_name)
                 g_frac = _read_gripper_open_fraction(
                     robot,
@@ -985,6 +1037,55 @@ def main() -> int:
                     ],
                     dtype=torch.float32,
                 )
+            elif state_mode == "joints8":
+                try:
+                    if arm_joint_ids:
+                        q = robot.data.joint_pos[0, arm_joint_ids].detach().to("cpu", dtype=torch.float32).view(-1)
+                    else:
+                        q = robot.data.joint_pos[0].detach().to("cpu", dtype=torch.float32).view(-1)
+                    q6 = q[:6] if q.numel() >= 6 else torch.nn.functional.pad(q, (0, 6 - int(q.numel())))
+                except Exception:
+                    q6 = torch.zeros(6, dtype=torch.float32)
+                g_frac = _read_gripper_open_fraction(
+                    robot,
+                    joint_regex=str(
+                        getattr(ctrl_cfg, "gripper_joint_regex", ".*_joint_finger_.*|.*_joint_finger_tip_.*")
+                    ),
+                    open_pos=float(getattr(ctrl_cfg, "gripper_open_pos", 0.0)),
+                    close_pos=float(getattr(ctrl_cfg, "gripper_close_pos", 1.2)),
+                )
+                state = torch.cat(
+                    [
+                        q6,
+                        torch.tensor([float(g_frac), 0.0], dtype=torch.float32),
+                    ],
+                    dim=0,
+                )  # (8,)
+            else:
+                # Legacy: joints7. Keep it for compatibility, but ensure we match the model dim via pad/truncate.
+                try:
+                    if arm_joint_ids:
+                        q = robot.data.joint_pos[0, arm_joint_ids].detach().to("cpu", dtype=torch.float32).view(-1)
+                    else:
+                        q = robot.data.joint_pos[0].detach().to("cpu", dtype=torch.float32).view(-1)
+                    q6 = q[:6] if q.numel() >= 6 else torch.nn.functional.pad(q, (0, 6 - int(q.numel())))
+                except Exception:
+                    q6 = torch.zeros(6, dtype=torch.float32)
+                state = torch.cat([q6, torch.zeros(1, dtype=torch.float32)], dim=0)  # (7,)
+
+            # Match state vector length expected by the model config.
+            state = state.view(-1).to(dtype=torch.float32, device="cpu")
+            if int(state.numel()) != int(model_state_dim):
+                if not warned_state_dim:
+                    print(
+                        f"[xVLA][WARN] observation.state dim={int(state.numel())} but model expects {int(model_state_dim)}. "
+                        "Padding/truncating."
+                    )
+                    warned_state_dim = True
+                if int(state.numel()) < int(model_state_dim):
+                    state = torch.nn.functional.pad(state, (0, int(model_state_dim) - int(state.numel())))
+                else:
+                    state = state[: int(model_state_dim)]
 
             raw_batch = {
                 "task": instruction,
@@ -1001,63 +1102,202 @@ def main() -> int:
                 act = postproc(act)  # -> cpu (may still be bfloat16)
                 # Numpy cannot represent bfloat16; cast before converting.
                 act_f32 = act.to(dtype=torch.float32)
-                a = act_f32.view(-1).detach().cpu().numpy()
+                a_model = act_f32.view(-1).detach().cpu().numpy()
                 policy_calls += 1
                 if bool(getattr(args, "debug", False)) and policy_calls <= 3:
                     # Early sanity: show shapes + basic stats
                     print(
                         f"[xVLA][dbg] infer#{policy_calls} rgb_shape={tuple(rgb_np.shape)} "
-                        f"state={state.tolist()} a_shape={tuple(a.shape)} "
+                        f"state={state.tolist()} a_shape={tuple(a_model.shape)} "
                         f"dt={time.time() - t_inf0:.3f}s"
                     )
             except Exception as e:
                 print(f"[xVLA][WARN] Policy step failed: {e}")
                 continue
 
-            if a.shape[0] < 7:
-                a = np.pad(a, (0, 7 - a.shape[0]))
-            a = a[:7]
-
-            # Optional global scaling (helps tame aggressive outputs without retraining).
-            a[0:6] = a[0:6] * float(getattr(args, "action_scale", 1.0))
+            # Controller uses 7D: [dx, dy, dz, rx, ry, rz, g]. Model outputs may be padded to 20D.
+            a7_raw = np.array(a_model[:7], dtype=np.float32, copy=True)
+            if a7_raw.shape[0] < 7:
+                a7_raw = np.pad(a7_raw, (0, 7 - a7_raw.shape[0])).astype(np.float32, copy=False)
+            a7_scaled = a7_raw.copy()
+            # Optional global scaling (helps speed up / tame outputs without retraining).
+            a7_scaled[0:6] = a7_scaled[0:6] * float(getattr(args, "action_scale", 1.0))
 
             # Convert policy action (per policy tick) into per-physics-step deltas.
             # Your dataset stats show action magnitudes on the order of mm–cm per tick (policy_hz),
             # so we distribute the delta across `policy_stride` physics steps.
             stride_f = float(policy_stride)
-            a_step = a.copy()
-            a_step[0:6] = a_step[0:6] / max(1.0, stride_f)
+            a7_step = a7_scaled.copy()
+            a7_step[0:6] = a7_step[0:6] / max(1.0, stride_f)
 
             # Clamp translation/rotation per physics step for stability.
-            a_step[0:3] = np.clip(a_step[0:3], -max_dpos, max_dpos)
-            a_step[3:6] = np.clip(a_step[3:6], -max_drot, max_drot)
+            a7_step[0:3] = np.clip(a7_step[0:3], -max_dpos, max_dpos)
+            a7_step[3:6] = np.clip(a7_step[3:6], -max_drot, max_drot)
 
             # Choose controller mode
-            g_val = float(a_step[6]) if a_step.shape[0] >= 7 else 0.0
-            drot_norm = float(np.linalg.norm(a_step[3:6]))
+            g_val = float(a7_step[6]) if a7_step.shape[0] >= 7 else 0.0
+            drot_norm = float(np.linalg.norm(a7_step[3:6]))
             ema = float(getattr(args, "action_ema", 0.0))
             ema = ema if (0.0 <= ema < 1.0) else 0.0
+            chosen_mode = "translate"
             if abs(g_val) > 0.2:
                 controller.set_mode("gripper")
+                chosen_mode = "gripper"
                 last_action = torch.zeros(1, 7, dtype=torch.float32, device=sim.device)
                 last_action[0, 6] = 1.0 if g_val > 0.0 else -1.0
             elif drot_norm > (0.25 * max_drot):
                 controller.set_mode("rotate")
+                chosen_mode = "rotate"
                 new_cmd = torch.zeros(1, 7, dtype=torch.float32, device=sim.device)
-                new_cmd[0, 0:6] = torch.tensor(a_step[:6], dtype=torch.float32, device=sim.device).view(1, 6)
+                new_cmd[0, 0:6] = torch.tensor(a7_step[:6], dtype=torch.float32, device=sim.device).view(1, 6)
                 if ema > 0.0:
                     new_cmd[0, 0:6] = ema * last_action[0, 0:6] + (1.0 - ema) * new_cmd[0, 0:6]
                 last_action = new_cmd
             else:
                 controller.set_mode("translate")
+                chosen_mode = "translate"
                 new_cmd = torch.zeros(1, 7, dtype=torch.float32, device=sim.device)
-                new_cmd[0, 0:6] = torch.tensor(a_step[:6], dtype=torch.float32, device=sim.device).view(1, 6)
+                new_cmd[0, 0:6] = torch.tensor(a7_step[:6], dtype=torch.float32, device=sim.device).view(1, 6)
                 if ema > 0.0:
                     new_cmd[0, 0:6] = ema * last_action[0, 0:6] + (1.0 - ema) * new_cmd[0, 0:6]
                 last_action = new_cmd
 
-            if bool(args.print_actions) and (steps % (policy_stride * 10) == 0):
-                print(f"[xVLA] a7={a.tolist()} a7_step={a_step.tolist()}")
+            # Trace/debug prints
+            if bool(getattr(args, "trace_policy", False)):
+                every = max(1, int(getattr(args, "trace_policy_every", 1)))
+                if (policy_calls % every) == 0:
+                    # Image stats + frame delta (helps detect a stuck camera feed).
+                    rgb_min = int(rgb_np.min())
+                    rgb_max = int(rgb_np.max())
+                    rgb_mean = float(rgb_np.mean())
+                    rgb_diff = None
+                    if prev_rgb_u8 is not None:
+                        try:
+                            rgb_diff = float(
+                                np.mean(np.abs(rgb_np.astype(np.int16) - prev_rgb_u8.astype(np.int16)))
+                            )
+                        except Exception:
+                            rgb_diff = None
+                    prev_rgb_u8 = rgb_np
+
+                    a_delta = None
+                    if prev_a7_raw is not None:
+                        try:
+                            a_delta = float(np.linalg.norm(a7_raw - prev_a7_raw))
+                        except Exception:
+                            a_delta = None
+                    prev_a7_raw = a7_raw.copy()
+
+                    # Target-relative geometry (helps diagnose frame mismatches / safety clamping).
+                    target_leaf = f"Obj_{max(1, int(getattr(args, 'target_index', 1))):02d}"
+                    target_pos_b_list = None
+                    dist_to_target = None
+                    cos_to_target = None
+                    pinned = []
+                    try:
+                        ee_pos_b_dbg, _ee_quat_b_dbg = _read_ee_pose_b(robot, ctrl_cfg.ee_link_name)
+                        ee_pos_b_cpu = ee_pos_b_dbg.detach().to("cpu", dtype=torch.float32).view(-1).numpy()
+
+                        target_obj = None
+                        for o in tracker.snapshot():
+                            if str(getattr(o, "id", "")) == target_leaf:
+                                target_obj = o
+                                break
+                        if target_obj is not None:
+                            from isaaclab.utils.math import subtract_frame_transforms
+
+                            root_pose_w = robot.data.root_pose_w
+                            pos_w = torch.tensor(
+                                list(getattr(getattr(target_obj, "pose", None), "position_m", (0.0, 0.0, 0.0))),
+                                device=sim.device,
+                                dtype=torch.float32,
+                            ).view(1, 3)
+                            quat_w = torch.tensor(
+                                list(getattr(getattr(target_obj, "pose", None), "orientation_wxyz", (1.0, 0.0, 0.0, 0.0))),
+                                device=sim.device,
+                                dtype=torch.float32,
+                            ).view(1, 4)
+                            pos_b, _quat_b = subtract_frame_transforms(
+                                root_pose_w[:, 0:3], root_pose_w[:, 3:7], pos_w, quat_w
+                            )
+                            target_pos_b = pos_b[0].detach().to("cpu", dtype=torch.float32).view(-1).numpy()
+                            target_pos_b_list = [float(x) for x in target_pos_b.tolist()]
+
+                            rel = target_pos_b - ee_pos_b_cpu
+                            dist_to_target = float(np.linalg.norm(rel))
+                            if prev_dist_to_target is not None:
+                                d_dist = float(dist_to_target - prev_dist_to_target)
+                            else:
+                                d_dist = None
+                            prev_dist_to_target = float(dist_to_target)
+
+                            dpos = a7_scaled[0:3].astype(np.float32, copy=False)
+                            denom = float(np.linalg.norm(dpos) * np.linalg.norm(rel))
+                            if denom > 1e-9:
+                                cos_to_target = float(np.dot(dpos, rel) / denom)
+                            else:
+                                cos_to_target = None
+
+                            # Detect likely workspace pinning (command pushing out of bounds).
+                            ws_min = getattr(ctrl_cfg, "workspace_min", (None, None, None))
+                            ws_max = getattr(ctrl_cfg, "workspace_max", (None, None, None))
+                            eps = 1e-4
+                            if ws_min and ws_min[0] is not None and (ee_pos_b_cpu[0] <= float(ws_min[0]) + eps) and dpos[0] < 0:
+                                pinned.append("x_min")
+                            if ws_max and ws_max[0] is not None and (ee_pos_b_cpu[0] >= float(ws_max[0]) - eps) and dpos[0] > 0:
+                                pinned.append("x_max")
+                            if ws_min and ws_min[1] is not None and (ee_pos_b_cpu[1] <= float(ws_min[1]) + eps) and dpos[1] < 0:
+                                pinned.append("y_min")
+                            if ws_max and ws_max[1] is not None and (ee_pos_b_cpu[1] >= float(ws_max[1]) - eps) and dpos[1] > 0:
+                                pinned.append("y_max")
+                            if ws_min and ws_min[2] is not None and (ee_pos_b_cpu[2] <= float(ws_min[2]) + eps) and dpos[2] < 0:
+                                pinned.append("z_min")
+                            if ws_max and ws_max[2] is not None and (ee_pos_b_cpu[2] >= float(ws_max[2]) - eps) and dpos[2] > 0:
+                                pinned.append("z_max")
+
+                            # Append delta-distance info to target line (positive means moving away).
+                            if d_dist is not None:
+                                dist_to_target = float(dist_to_target)
+                                # Keep d_dist in a local for the print below.
+                                _d_dist = d_dist
+                            else:
+                                _d_dist = None
+                        else:
+                            _d_dist = None
+                    except Exception:
+                        target_pos_b_list = None
+                        dist_to_target = None
+                        cos_to_target = None
+                        pinned = []
+                        _d_dist = None
+
+                    print(
+                        f"[xVLA][trace] policy#{policy_calls} "
+                        f"rgb(min/mean/max)={rgb_min}/{rgb_mean:.1f}/{rgb_max} "
+                        f"rgb_diff={rgb_diff if rgb_diff is not None else 'NA'} "
+                        f"state={state.tolist()} "
+                        f"a7_raw={a7_raw.tolist()} "
+                        f"a7_scaled={a7_scaled.tolist()} "
+                        f"a7_step={a7_step.tolist()} "
+                        f"a_raw_delta={a_delta if a_delta is not None else 'NA'} "
+                        f"mode={chosen_mode} "
+                        f"model_action_dim={int(a_model.shape[0])}/{int(model_action_dim)} "
+                        f"target={target_leaf} "
+                        f"target_pos_b={target_pos_b_list if target_pos_b_list is not None else 'NA'} "
+                        f"dist_to_target={dist_to_target if dist_to_target is not None else 'NA'} "
+                        f"d_dist={_d_dist if '_d_dist' in locals() and _d_dist is not None else 'NA'} "
+                        f"cos_to_target={cos_to_target if cos_to_target is not None else 'NA'} "
+                        f"pinned={','.join(pinned) if pinned else 'none'}"
+                    )
+
+            if bool(getattr(args, "print_actions", False)):
+                every = max(1, int(getattr(args, "print_actions_every", 10)))
+                if (policy_calls % every) == 0:
+                    print(
+                        f"[xVLA][act] policy#{policy_calls} "
+                        f"a7_raw={a7_raw.tolist()} a7_scaled={a7_scaled.tolist()} a7_step={a7_step.tolist()} "
+                        f"mode={chosen_mode} model_action_dim={int(a_model.shape[0])}"
+                    )
 
         # Heartbeat (helps confirm the loop is actually running)
         now = time.time() - t0

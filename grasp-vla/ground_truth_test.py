@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -41,6 +42,99 @@ def _ensure_repo_on_syspath() -> Path:
     return root
 
 
+def _default_logs_root(repo_root: Path) -> Path:
+    return (repo_root / "logs" / "data_collection").resolve()
+
+
+_SESSION_RE = re.compile(r"^session_\d{8}_\d{6}$")
+_EPISODE_RE = re.compile(r"^episode_(\d{4})$")
+
+
+def _find_latest_session_dir(logs_root: Path) -> Path | None:
+    """Return the newest session_* directory under logs_root (by name, which encodes timestamp)."""
+    if not logs_root.exists() or not logs_root.is_dir():
+        return None
+    cands = [p for p in logs_root.iterdir() if p.is_dir() and _SESSION_RE.match(p.name)]
+    if not cands:
+        return None
+    # session_YYYYMMDD_HHMMSS sorts lexicographically by time.
+    return sorted(cands, key=lambda p: p.name)[-1]
+
+
+def _find_latest_episode_idx(session_dir: Path) -> int | None:
+    """Return the highest episode index present in a session directory."""
+    if not session_dir.exists() or not session_dir.is_dir():
+        return None
+    best: int | None = None
+    for p in session_dir.iterdir():
+        if not p.is_dir():
+            continue
+        m = _EPISODE_RE.match(p.name)
+        if not m:
+            continue
+        try:
+            idx = int(m.group(1))
+        except Exception:
+            continue
+        if best is None or idx > best:
+            best = idx
+    return best
+
+
+def _iter_episode_dirs(session_dir: Path) -> list[tuple[int, Path]]:
+    """Return sorted [(episode_idx, episode_dir)] for episode_XXXX subdirs."""
+    out: list[tuple[int, Path]] = []
+    if not session_dir.exists() or not session_dir.is_dir():
+        return out
+    for p in session_dir.iterdir():
+        if not p.is_dir():
+            continue
+        m = _EPISODE_RE.match(p.name)
+        if not m:
+            continue
+        try:
+            idx = int(m.group(1))
+        except Exception:
+            continue
+        out.append((idx, p))
+    return sorted(out, key=lambda t: t[0])
+
+
+def _count_jsonl_records(path: Path) -> int:
+    """Count non-empty lines in a JSONL file (fast; does not parse JSON)."""
+    n = 0
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    n += 1
+    except Exception:
+        return 0
+    return n
+
+
+def _episode_tick_counts(session_dir: Path) -> list[tuple[int, int]]:
+    """Return [(episode_idx, tick_count)] for episodes with a ticks.jsonl."""
+    out: list[tuple[int, int]] = []
+    for idx, ep_dir in _iter_episode_dirs(session_dir):
+        ticks_path = ep_dir / "ticks.jsonl"
+        if not ticks_path.exists():
+            continue
+        out.append((idx, _count_jsonl_records(ticks_path)))
+    return out
+
+
+def _find_longest_episode_idx(session_dir: Path) -> int | None:
+    """Return the episode index with the most ticks.jsonl lines (ties -> higher idx)."""
+    best_idx: int | None = None
+    best_ticks = -1
+    for idx, n_ticks in _episode_tick_counts(session_dir):
+        if n_ticks > best_ticks or (n_ticks == best_ticks and (best_idx is None or idx > best_idx)):
+            best_idx = idx
+            best_ticks = n_ticks
+    return best_idx
+
+
 @dataclass
 class _TickAction:
     """One action over a single logged tick interval (typically ~0.2s at 5Hz)."""
@@ -65,7 +159,7 @@ def _load_episode(
     *,
     session_dir: Path,
     episode_idx: int,
-) -> tuple[list[dict[str, Any]], str | None]:
+) -> tuple[list[dict[str, Any]], str | None, dict[str, Any] | None]:
     ep_dir = session_dir / f"episode_{int(episode_idx):04d}"
     ticks_path = ep_dir / "ticks.jsonl"
     if not ticks_path.exists():
@@ -75,11 +169,28 @@ def _load_episode(
     instr_path = ep_dir / "instruction.json"
     if instr_path.exists():
         try:
-            instruction = json.loads(instr_path.read_text(encoding="utf-8")).get("instruction")
+            payload = json.loads(instr_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                # Backward/forward-compatible: support multiple key names.
+                for k in ("instruction", "language_command", "command", "text"):
+                    v = payload.get(k)
+                    if isinstance(v, str) and v.strip():
+                        instruction = v.strip()
+                        break
         except Exception:
             instruction = None
 
-    return _read_jsonl(ticks_path), instruction
+    metadata: dict[str, Any] | None = None
+    meta_path = ep_dir / "metadata.json"
+    if meta_path.exists():
+        try:
+            payload = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                metadata = payload
+        except Exception:
+            metadata = None
+
+    return _read_jsonl(ticks_path), instruction, metadata
 
 
 def _extract_objects_tick0(ticks: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -99,6 +210,50 @@ def _extract_objects_tick0(ticks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         except Exception:
             continue
     return out
+
+
+def _extract_robot_joints_tick0(
+    ticks: list[dict[str, Any]],
+) -> tuple[list[str], list[float], list[float]] | None:
+    """
+    Return (joint_names, joint_positions, joint_velocities) from tick 0 if present.
+
+    Logs commonly store floats as strings; we coerce via float().
+    """
+    if not ticks:
+        return None
+    try:
+        joints = (ticks[0].get("robot") or {}).get("joints") or {}
+        names = joints.get("names") or []
+        pos = joints.get("positions") or []
+        vel = joints.get("velocities") or []
+        if not isinstance(names, list) or not isinstance(pos, list):
+            return None
+        if not vel or not isinstance(vel, list):
+            vel = [0.0] * len(pos)
+        if len(names) != len(pos):
+            return None
+        # Allow vel to be shorter; pad with zeros.
+        if len(vel) < len(pos):
+            vel = list(vel) + [0.0] * (len(pos) - len(vel))
+        names_out = [str(n) for n in names]
+        pos_out = [float(x) for x in pos]
+        vel_out = [float(x) for x in vel[: len(pos_out)]]
+        return names_out, pos_out, vel_out
+    except Exception:
+        return None
+
+
+def _extract_gripper_state_tick0(ticks: list[dict[str, Any]]) -> str | None:
+    if not ticks:
+        return None
+    try:
+        gs = (((ticks[0].get("robot") or {}).get("gripper") or {}).get("state"))
+        if isinstance(gs, str) and gs.strip():
+            return gs.strip()
+    except Exception:
+        return None
+    return None
 
 
 def _extract_tick_actions(
@@ -251,16 +406,29 @@ def main() -> int:
     except Exception:
         pass
 
+    # Pre-parse just enough args to allow a `--dry-run` log inspection without importing IsaacLab/Kit.
+    ap_pre = argparse.ArgumentParser(add_help=False)
+    ap_pre.add_argument("--dry-run", action="store_true")
+    ap_pre.add_argument("--list-episodes", action="store_true")
+    args_pre, _unknown = ap_pre.parse_known_args()
+
     ap = argparse.ArgumentParser(description="Replay logged ground-truth actions inside Isaac Sim (sanity test).")
     ap.add_argument(
         "--session-dir",
         type=str,
-        default=str(
-            (repo_root / "logs" / "data_collection" / "session_20251231_214301").resolve()
-        ),
+        default=None,
         help="Path to a data_collection session directory (contains episode_XXXX folders).",
     )
-    ap.add_argument("--episode", type=int, default=0, help="Episode index (0-based, episode_0000 = 0).")
+    ap.add_argument(
+        "--episode",
+        type=int,
+        default=0,
+        help=(
+            "Episode index (0-based, episode_0000 = 0).\n"
+            "  -1: latest episode index in the session\n"
+            "  -2: longest episode (most ticks) in the session"
+        ),
+    )
     ap.add_argument(
         "--action-source",
         type=str,
@@ -275,7 +443,30 @@ def main() -> int:
     ap.add_argument("--tick-start", type=int, default=1, help="First tick_idx to replay from (default: 1).")
     ap.add_argument("--max-ticks", type=int, default=None, help="Replay at most N tick actions.")
     ap.add_argument("--box-size", type=float, default=0.08)
-    ap.add_argument("--spawn-from-log", action="store_true", help="Spawn boxes at tick0 logged poses (recommended).")
+    ap.add_argument(
+        "--spawn-from-log",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Spawn boxes at tick0 logged poses (recommended for faithful replay).",
+    )
+    ap.add_argument(
+        "--reset-robot-from-log",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reset robot arm joints to tick0 logged joint positions (recommended for faithful replay).",
+    )
+    ap.add_argument(
+        "--reset-vel-from-log",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If resetting robot from log, also set initial joint velocities from tick0 (default: off for stability).",
+    )
+    ap.add_argument(
+        "--use-metadata-physics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use episode metadata.json (sim_dt/substeps) to match data-collection physics settings when available.",
+    )
     ap.add_argument("--speed", type=float, default=0.7, help="Controller linear speed (m/s) for clamping.")
     ap.add_argument("--rot-speed", type=float, default=2.0, help="Rotation speed (rad/s) for clamping.")
     ap.add_argument("--action-scale", type=float, default=1.0, help="Scale ground-truth action before replay.")
@@ -283,7 +474,86 @@ def main() -> int:
     ap.add_argument("--settle-steps", type=int, default=180, help="Physics settle steps before replay.")
     ap.add_argument("--max-seconds", type=float, default=60.0)
     ap.add_argument("--print-every-s", type=float, default=1.0)
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Only load/parse logs and print a summary (does not launch Isaac Sim).",
+    )
+    ap.add_argument(
+        "--list-episodes",
+        action="store_true",
+        help="List available episode indices and tick counts for the resolved session (does not launch Isaac Sim).",
+    )
     ap.add_argument("--debug", action="store_true")
+
+    # Handle log inspection without importing IsaacLab.
+    if bool(getattr(args_pre, "dry_run", False)) or bool(getattr(args_pre, "list_episodes", False)):
+        args = ap.parse_args()
+        logs_root = _default_logs_root(repo_root)
+        session_dir = (
+            Path(str(args.session_dir)).expanduser().resolve()
+            if args.session_dir
+            else _find_latest_session_dir(logs_root)
+        )
+        if session_dir is None:
+            raise RuntimeError(f"No session dirs found under: {logs_root}")
+
+        if bool(getattr(args, "list_episodes", False)):
+            counts = _episode_tick_counts(session_dir)
+            if not counts:
+                print(f"[GT][list] No episodes with ticks.jsonl found under: {session_dir}")
+                return 0
+            print(f"[GT][list] session_dir={session_dir}")
+            for idx, n in counts:
+                # ticks include tick0; actions_from_prev are typically ticks-1
+                print(f"[GT][list] episode_{idx:04d}: ticks={n} actions~{max(0, n - 1)}")
+            longest = _find_longest_episode_idx(session_dir)
+            latest = _find_latest_episode_idx(session_dir)
+            if longest is not None:
+                print(f"[GT][list] longest: episode_{longest:04d}")
+            if latest is not None:
+                print(f"[GT][list] latest: episode_{latest:04d}")
+            return 0
+
+        episode_idx = int(args.episode)
+        if episode_idx < 0:
+            if episode_idx == -1:
+                latest_ep = _find_latest_episode_idx(session_dir)
+                if latest_ep is None:
+                    raise RuntimeError(f"No episode_XXXX folders found under: {session_dir}")
+                episode_idx = int(latest_ep)
+            elif episode_idx == -2:
+                longest_ep = _find_longest_episode_idx(session_dir)
+                if longest_ep is None:
+                    raise RuntimeError(f"No episode_XXXX folders found under: {session_dir}")
+                episode_idx = int(longest_ep)
+            else:
+                raise ValueError(f"Unsupported --episode value: {episode_idx}")
+        ticks, instruction, metadata = _load_episode(session_dir=session_dir, episode_idx=episode_idx)
+        actions = _extract_tick_actions(
+            ticks,
+            action_source=str(args.action_source),
+            tick_start=int(args.tick_start),
+            max_ticks=None if args.max_ticks is None else int(args.max_ticks),
+        )
+        objs0 = _extract_objects_tick0(ticks)
+        joints0 = _extract_robot_joints_tick0(ticks)
+        print(f"[GT][dry] session_dir={session_dir}")
+        print(f"[GT][dry] episode=episode_{episode_idx:04d}")
+        print(f"[GT][dry] ticks={len(ticks)} actions={len(actions)} objects_tick0={len(objs0)}")
+        print(f"[GT][dry] instruction={instruction!r}")
+        if metadata is not None:
+            env = metadata.get("env", {}) if isinstance(metadata, dict) else {}
+            cfg = metadata.get("config", {}) if isinstance(metadata, dict) else {}
+            print(f"[GT][dry] metadata.env={env}")
+            print(f"[GT][dry] metadata.config={cfg}")
+        if joints0 is not None:
+            jn, jp, jv = joints0
+            print(f"[GT][dry] tick0 joints: n={len(jn)} names={jn}")
+            print(f"[GT][dry] tick0 joint_pos={jp}")
+            if bool(getattr(args, "reset_vel_from_log", False)):
+                print(f"[GT][dry] tick0 joint_vel={jv}")
+        return 0
 
     # IsaacLab / AppLauncher args (headless, enable_cameras, device, etc.)
     from isaaclab.app import AppLauncher
@@ -307,15 +577,35 @@ def main() -> int:
     enable_cameras = bool(getattr(args, "enable_cameras", False))
     carb.settings.get_settings().set_bool("/isaaclab/cameras_enabled", enable_cameras)
 
+    from environments.reach_to_grasp.config import DEFAULT_CAMERA
     from environments.reach_to_grasp_VLA.config import DEFAULT_SCENE, DEFAULT_TOP_DOWN_CAMERA
     from environments.reach_to_grasp_VLA.utils import design_scene
     from environments.utils.camera import create_topdown_camera
     from environments.utils.physix import PhysicsConfig, apply_to_simulation_cfg
     from controllers import CartesianVelocityJogConfig, CartesianVelocityJogController
 
+    # Resolve session/episode from current logs folder unless explicitly provided.
+    logs_root = _default_logs_root(repo_root)
+    session_dir = Path(str(args.session_dir)).expanduser().resolve() if args.session_dir else _find_latest_session_dir(logs_root)
+    if session_dir is None:
+        raise RuntimeError(f"No session dirs found under: {logs_root}")
+    episode_idx = int(args.episode)
+    if episode_idx < 0:
+        if episode_idx == -1:
+            latest_ep = _find_latest_episode_idx(session_dir)
+            if latest_ep is None:
+                raise RuntimeError(f"No episode_XXXX folders found under: {session_dir}")
+            episode_idx = int(latest_ep)
+        elif episode_idx == -2:
+            longest_ep = _find_longest_episode_idx(session_dir)
+            if longest_ep is None:
+                raise RuntimeError(f"No episode_XXXX folders found under: {session_dir}")
+            episode_idx = int(longest_ep)
+        else:
+            raise ValueError(f"Unsupported --episode value: {episode_idx}")
+
     # Load episode logs (no LeRobot involved)
-    session_dir = Path(str(args.session_dir)).expanduser().resolve()
-    ticks, instruction = _load_episode(session_dir=session_dir, episode_idx=int(args.episode))
+    ticks, instruction, metadata = _load_episode(session_dir=session_dir, episode_idx=episode_idx)
     actions = _extract_tick_actions(
         ticks,
         action_source=str(args.action_source),
@@ -324,7 +614,7 @@ def main() -> int:
     )
     if not actions:
         raise RuntimeError(
-            f"No actions extracted (source={args.action_source}) from session={session_dir} episode={args.episode}."
+            f"No actions extracted (source={args.action_source}) from session={session_dir} episode={episode_idx}."
         )
 
     if bool(getattr(args, "debug", False)):
@@ -335,17 +625,45 @@ def main() -> int:
 
     # Sim setup (match vla_v1 style)
     phys = PhysicsConfig(device=str(getattr(args, "device", "cuda:0")))
+    if bool(getattr(args, "use_metadata_physics", True)) and isinstance(metadata, dict):
+        env = metadata.get("env", {}) if isinstance(metadata.get("env", {}), dict) else {}
+        try:
+            dt_meta = env.get("sim_dt")
+            if dt_meta is not None:
+                phys.dt = float(dt_meta)
+        except Exception:
+            pass
+        try:
+            sub_meta = env.get("physics_substeps")
+            if sub_meta is not None:
+                phys.sub_steps = int(sub_meta)
+        except Exception:
+            pass
     sim_cfg = sim_utils.SimulationCfg(device=phys.device)
     apply_to_simulation_cfg(sim_cfg, phys)
     sim = sim_utils.SimulationContext(sim_cfg)
+
+    # Set viewport camera for GUI runs so you can see the replay.
+    if not bool(getattr(args, "headless", False)):
+        try:
+            sim.set_camera_view(DEFAULT_CAMERA.eye, DEFAULT_CAMERA.target)
+        except Exception:
+            pass
 
     scene_entities, scene_origins = design_scene(DEFAULT_SCENE)
     robot = scene_entities["kinova_j2n6s300"]
 
     # Top-down camera prim + sensor
     camera_sensor = None
-    if enable_cameras and DEFAULT_TOP_DOWN_CAMERA is not None:
+    if DEFAULT_TOP_DOWN_CAMERA is not None:
+        # Always create the camera prim so you can view it in the GUI. The sensor is optional.
         create_topdown_camera(DEFAULT_TOP_DOWN_CAMERA)
+        if not bool(getattr(args, "headless", False)):
+            print(
+                f"[GT] Top-down camera prim: {DEFAULT_TOP_DOWN_CAMERA.prim_path} "
+                "(open: Window > Views > Camera, then select this prim)."
+            )
+    if enable_cameras and DEFAULT_TOP_DOWN_CAMERA is not None:
         camera_cfg = CameraCfg(
             prim_path=DEFAULT_TOP_DOWN_CAMERA.prim_path,
             offset=CameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
@@ -359,7 +677,7 @@ def main() -> int:
     # Objects: either spawn from log poses or skip (replay motion still valid).
     prim_paths: list[str] = []
     id_to_label: dict[str, str] = {}
-    if bool(getattr(args, "spawn_from_log", False)):
+    if bool(getattr(args, "spawn_from_log", True)):
         objs0 = _extract_objects_tick0(ticks)
         prim_paths, id_to_label = _spawn_boxes_from_log(
             objects=objs0,
@@ -377,7 +695,38 @@ def main() -> int:
     root_state[:, :3] += origin0
     robot.write_root_pose_to_sim(root_state[:, :7])
     robot.write_root_velocity_to_sim(root_state[:, 7:])
-    robot.write_joint_state_to_sim(robot.data.default_joint_pos, robot.data.default_joint_vel)
+    # Start from defaults, then optionally overwrite joints with tick0 log.
+    q = robot.data.default_joint_pos.clone()
+    qd = robot.data.default_joint_vel.clone()
+    if bool(getattr(args, "reset_robot_from_log", True)):
+        j0 = _extract_robot_joints_tick0(ticks)
+        if j0 is not None:
+            names0, pos0, vel0 = j0
+            # Build name->id mapping from the articulation
+            name_to_id: dict[str, int] = {}
+            try:
+                for i, n in enumerate(robot.data.joint_names):
+                    name_to_id[str(n)] = int(i)
+            except Exception:
+                name_to_id = {}
+
+            used = 0
+            for name, p, v in zip(names0, pos0, vel0):
+                jid = name_to_id.get(str(name))
+                if jid is None:
+                    continue
+                q[0, jid] = float(p)
+                if bool(getattr(args, "reset_vel_from_log", False)):
+                    qd[0, jid] = float(v)
+                else:
+                    qd[0, jid] = 0.0
+                used += 1
+            if bool(getattr(args, "debug", False)):
+                print(f"[GT] Reset robot arm joints from log: matched {used}/{len(names0)} joint names.")
+        else:
+            if bool(getattr(args, "debug", False)):
+                print("[GT] No tick0 joint state found in logs; using robot defaults.")
+    robot.write_joint_state_to_sim(q, qd)
     robot.reset()
 
     if camera_sensor is not None:
@@ -401,15 +750,31 @@ def main() -> int:
     cmd_input = _ConstantCmdInput(device=str(sim.device))
     controller.set_input_provider(cmd_input)  # type: ignore[arg-type]
 
+    # Optionally set initial gripper pose based on tick0 log state (best-effort).
+    gr0 = _extract_gripper_state_tick0(ticks)
+    if bool(getattr(args, "reset_robot_from_log", True)) and gr0 is not None:
+        try:
+            if gr0.lower().startswith("close"):
+                controller.set_mode("gripper")
+                controller.gripper.command_close(robot)
+                controller.set_mode("translate")
+            elif gr0.lower().startswith("open"):
+                controller.set_mode("gripper")
+                controller.gripper.command_open(robot)
+                controller.set_mode("translate")
+        except Exception:
+            pass
+
     # Optional settle
     dt = float(sim.get_physics_dt())
     settle_steps = max(0, int(args.settle_steps))
     if settle_steps > 0:
         zero = torch.zeros(1, 7, dtype=torch.float32, device=sim.device)
+        do_render = bool(enable_cameras) or (not bool(getattr(args, "headless", False)))
         for _ in range(settle_steps):
             cmd_input.set(zero)
             controller.step(robot, dt)
-            sim.step(render=bool(enable_cameras))
+            sim.step(render=bool(do_render))
             robot.update(dt)
         if bool(getattr(args, "debug", False)):
             print(f"[GT] Settled for {settle_steps} physics steps.")
@@ -428,7 +793,7 @@ def main() -> int:
     last_cmd = torch.zeros(1, 7, dtype=torch.float32, device=sim.device)
 
     print(f"[GT] instruction={instruction!r}")
-    print(f"[GT] Replaying {len(actions)} tick actions from episode_{int(args.episode):04d} ({args.action_source}).")
+    print(f"[GT] Replaying {len(actions)} tick actions from episode_{int(episode_idx):04d} ({args.action_source}).")
 
     while simulation_app.is_running() and (time.time() - t0) < float(args.max_seconds):
         steps += 1
@@ -453,10 +818,17 @@ def main() -> int:
 
             # Gripper action (rare/usually 0 in these logs)
             g_val = float(a_step[6])
+            drot_norm = float(np.linalg.norm(a_step[3:6]))
             if abs(g_val) > 0.2:
                 controller.set_mode("gripper")
                 last_cmd = torch.zeros(1, 7, dtype=torch.float32, device=sim.device)
                 last_cmd[0, 6] = 1.0 if g_val > 0.0 else -1.0
+            elif drot_norm > (0.25 * max_drot):
+                controller.set_mode("rotate")
+                new_cmd = torch.tensor(a_step, dtype=torch.float32, device=sim.device).view(1, 7)
+                if ema > 0.0:
+                    new_cmd[0, 0:6] = ema * last_cmd[0, 0:6] + (1.0 - ema) * new_cmd[0, 0:6]
+                last_cmd = new_cmd
             else:
                 controller.set_mode("translate")
                 new_cmd = torch.tensor(a_step, dtype=torch.float32, device=sim.device).view(1, 7)
@@ -473,7 +845,8 @@ def main() -> int:
         # Apply current command every physics step
         cmd_input.set(last_cmd)
         controller.step(robot, dt)
-        sim.step(render=bool(enable_cameras))
+        do_render = bool(enable_cameras) or (not bool(getattr(args, "headless", False)))
+        sim.step(render=bool(do_render))
         robot.update(dt)
         steps_left_in_tick -= 1
 
