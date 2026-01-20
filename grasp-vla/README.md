@@ -16,6 +16,7 @@ conda activate riften
   --device cuda:0 --enable_cameras \
   --lerobot-src /home/kye/Desktop/Depo/Code/Grasp-VLA/lerobot/src \
   --model-dir /home/kye/Desktop/Depo/Code/kinova-isaac/grasp-vla/models/xvla/stage2 \
+  --seed 0 \
   --policy-hz 5 \
   --state-mode joints8 \
   --init-joints 0.0072 2.2704 4.5114 0.2286 5.0707 1.4764 \
@@ -31,3 +32,7 @@ conda activate riften
   --max-seconds 120
 ```
 
+Notes:
+- Box IDs are spawned as `Obj_01..Obj_04` with colors matching the dataset convention: **red, blue, yellow, purple**.
+- For an in-distribution evaluation (exact object poses from a recorded demo), add:
+  - `--layout-raw-episode /home/kye/Desktop/Depo/Code/Grasp-VLA/Grasp-VLA/raw_data/session_YYYYMMDD_HHMMSS/episode_0000`

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -360,6 +361,8 @@ def _spawn_colored_boxes(
     min_dist: float,
     size_m: float,
     device: str,
+    fixed_poses_w: Optional[List[Tuple[Tuple[float, float, float], Tuple[float, float, float, float]]]] = None,
+    id_to_label_override: Optional[Dict[str, str]] = None,
 ) -> Tuple[List[str], Dict[str, str]]:
     """
     Spawn boxes under parent_prim_path with deterministic IDs Obj_01..Obj_N
@@ -375,11 +378,16 @@ def _spawn_colored_boxes(
     prim_utils = importlib.import_module("isaacsim.core.utils.prims")
     prim_utils.create_prim(parent_prim_path, "Xform")
 
+    # Match the dataset convention (see raw_data instruction.json meta + ticks.jsonl labels):
+    #   Obj_01 -> red box 1
+    #   Obj_02 -> blue box 2
+    #   Obj_03 -> yellow box 3
+    #   Obj_04 -> purple box 4
     colors = [
         ("red", (0.85, 0.15, 0.15)),
         ("blue", (0.20, 0.35, 0.95)),
-        ("green", (0.20, 0.85, 0.20)),
         ("yellow", (0.90, 0.85, 0.20)),
+        ("purple", (0.65, 0.25, 0.85)),
     ]
 
     def sample_positions(n: int) -> List[Tuple[float, float, float]]:
@@ -411,9 +419,16 @@ def _spawn_colored_boxes(
             ]
         return out
 
-    positions = sample_positions(int(num_boxes))
+    if fixed_poses_w is not None:
+        if len(fixed_poses_w) < int(num_boxes):
+            raise ValueError(f"fixed_poses_w must have >= num_boxes entries, got {len(fixed_poses_w)}")
+        positions = [tuple(float(x) for x in fixed_poses_w[i][0]) for i in range(int(num_boxes))]
+        orientations = [tuple(float(x) for x in fixed_poses_w[i][1]) for i in range(int(num_boxes))]
+    else:
+        positions = sample_positions(int(num_boxes))
+        orientations = []
     prim_paths: List[str] = []
-    id_to_label: Dict[str, str] = {}
+    id_to_label: Dict[str, str] = {} if id_to_label_override is None else dict(id_to_label_override)
 
     for i in range(1, int(num_boxes) + 1):
         leaf = f"Obj_{i:02d}"
@@ -421,10 +436,13 @@ def _spawn_colored_boxes(
         color_name, rgb = colors[(i - 1) % len(colors)]
         label = f"{color_name} box {i}"
 
-        # Random yaw for variety
-        yaw = float(np.random.uniform(-np.pi, np.pi))
-        half = 0.5 * yaw
-        quat_wxyz = (float(np.cos(half)), 0.0, 0.0, float(np.sin(half)))
+        if fixed_poses_w is not None:
+            quat_wxyz = orientations[i - 1]
+        else:
+            # Random yaw for variety
+            yaw = float(np.random.uniform(-np.pi, np.pi))
+            half = 0.5 * yaw
+            quat_wxyz = (float(np.cos(half)), 0.0, 0.0, float(np.sin(half)))
 
         cfg = CuboidCfg(
             size=(float(size_m), float(size_m), float(size_m)),
@@ -455,9 +473,222 @@ def _spawn_colored_boxes(
         sim_utils.bind_physics_material(prim, mat_prim)
 
         prim_paths.append(prim)
-        id_to_label[leaf] = label
+        if leaf not in id_to_label:
+            id_to_label[leaf] = label
 
     return prim_paths, id_to_label
+
+
+def _load_fixed_layout_from_raw_episode(
+    raw_episode: Path, *, num_boxes: int
+) -> Tuple[List[Tuple[Tuple[float, float, float], Tuple[float, float, float, float]]], Dict[str, str]]:
+    """
+    Load a fixed box layout from a raw_data episode folder (or a direct ticks.jsonl file path).
+
+    We read the FIRST tick of ticks.jsonl and use each object's `pose_w` (world-frame pose).
+    This is the easiest way to evaluate a trained policy on an in-distribution layout from your dataset.
+    """
+    raw_episode = raw_episode.expanduser().resolve()
+    ticks_path = raw_episode if raw_episode.is_file() else (raw_episode / "ticks.jsonl")
+    if not ticks_path.exists():
+        raise FileNotFoundError(f"Could not find ticks.jsonl at: {ticks_path}")
+
+    with ticks_path.open("r", encoding="utf-8") as f:
+        line = f.readline()
+    tick0 = json.loads(line)
+    objs = tick0.get("objects") or []
+    if not isinstance(objs, list) or not objs:
+        raise RuntimeError(f"No objects found in first tick of: {ticks_path}")
+
+    obj_by_id: Dict[str, dict] = {}
+    for o in objs:
+        if not isinstance(o, dict):
+            continue
+        oid = o.get("id")
+        if isinstance(oid, str) and oid:
+            obj_by_id[oid] = o
+
+    fixed: List[Tuple[Tuple[float, float, float], Tuple[float, float, float, float]]] = []
+    id_to_label: Dict[str, str] = {}
+
+    for i in range(1, int(num_boxes) + 1):
+        leaf = f"Obj_{i:02d}"
+        o = obj_by_id.get(leaf)
+        if o is None:
+            raise RuntimeError(
+                f"Missing object '{leaf}' in first tick of {ticks_path}. Found IDs: {sorted(obj_by_id.keys())}"
+            )
+
+        pose_w = o.get("pose_w") or {}
+        pos = pose_w.get("position_m")
+        quat = pose_w.get("orientation_wxyz")
+
+        if not (isinstance(pos, (list, tuple)) and len(pos) == 3):
+            raise RuntimeError(f"Object '{leaf}' missing pose_w.position_m in {ticks_path}")
+        if not (isinstance(quat, (list, tuple)) and len(quat) == 4):
+            # Default orientation if missing
+            quat = (1.0, 0.0, 0.0, 0.0)
+
+        pos_f = (float(pos[0]), float(pos[1]), float(pos[2]))
+        quat_f = (float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3]))
+        fixed.append((pos_f, quat_f))
+
+        lab = o.get("label")
+        if isinstance(lab, str) and lab.strip():
+            id_to_label[leaf] = lab.strip()
+
+    return fixed, id_to_label
+
+
+def _load_init_joints_from_raw_episode(raw_episode: Path) -> Optional[List[float]]:
+    """
+    Best-effort helper: read tick0 robot joint positions (first 6) from a raw_data episode.
+    Returns None if missing/invalid.
+    """
+    raw_episode = raw_episode.expanduser().resolve()
+    ticks_path = raw_episode if raw_episode.is_file() else (raw_episode / "ticks.jsonl")
+    if not ticks_path.exists():
+        return None
+    try:
+        with ticks_path.open("r", encoding="utf-8") as f:
+            line = f.readline()
+        tick0 = json.loads(line)
+        robot = tick0.get("robot") or {}
+        joints = (robot.get("joints") or {}).get("positions") or []
+        jf: List[float] = []
+        for v in joints:
+            try:
+                jf.append(float(v))
+            except Exception:
+                continue
+        if len(jf) < 6:
+            return None
+        return [float(x) for x in jf[:6]]
+    except Exception:
+        return None
+
+
+def _load_domain_randomization_from_raw_episode(raw_episode: Path) -> Optional[dict]:
+    """
+    Best-effort helper: read the first `domain_randomization` event from a raw_data episode's events.jsonl.
+
+    Returns the event `data` dict (with optional 'light' and 'camera' fields) or None if missing.
+    """
+    raw_episode = raw_episode.expanduser().resolve()
+    ep_dir = raw_episode if raw_episode.is_dir() else raw_episode.parent
+    events_path = ep_dir / "events.jsonl"
+    if not events_path.exists():
+        return None
+    try:
+        with events_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    evt = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(evt, dict):
+                    continue
+                if str(evt.get("type") or "").strip() == "domain_randomization":
+                    data = evt.get("data")
+                    return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+    return None
+
+
+def _apply_domain_randomization_dict(dr: dict, *, enable_cameras: bool, debug: bool = False) -> None:
+    """Apply a vla_v1-style `domain_randomization` dict to the current USD stage (light + camera)."""
+    try:
+        import importlib
+
+        omni_usd = importlib.import_module("omni.usd")
+        UsdGeom = importlib.import_module("pxr.UsdGeom")
+        UsdLux = importlib.import_module("pxr.UsdLux")
+        Gf = importlib.import_module("pxr.Gf")
+        stage = omni_usd.get_context().get_stage()
+    except Exception as e:
+        if debug:
+            print(f"[xVLA][WARN] DR apply: failed to import USD modules: {e}")
+        return
+
+    # --- Lighting (UsdLux.DomeLight)
+    try:
+        light = dr.get("light") if isinstance(dr, dict) else None
+        if isinstance(light, dict):
+            prim_path = str(light.get("prim_path") or "/World/Light")
+            prim = stage.GetPrimAtPath(prim_path)
+            if prim.IsValid():
+                dome = UsdLux.DomeLight(prim)
+                if "intensity" in light:
+                    dome.GetIntensityAttr().Set(float(light["intensity"]))
+                c = light.get("color_rgb")
+                if isinstance(c, (list, tuple)) and len(c) == 3:
+                    dome.GetColorAttr().Set(Gf.Vec3f(float(c[0]), float(c[1]), float(c[2])))
+                if debug:
+                    try:
+                        _i = float(dome.GetIntensityAttr().Get())
+                        _c = dome.GetColorAttr().Get()
+                        print(
+                            f"[xVLA] Applied DR light: path={prim_path} intensity={_i:.4f} "
+                            f"color_rgb={[float(_c[0]), float(_c[1]), float(_c[2])]}"
+                        )
+                    except Exception:
+                        print(f"[xVLA] Applied DR light: path={prim_path}")
+    except Exception as e:
+        if debug:
+            print(f"[xVLA][WARN] DR apply: light failed: {e}")
+
+    # --- Camera pose + FOV
+    if not enable_cameras:
+        return
+    try:
+        cam = dr.get("camera") if isinstance(dr, dict) else None
+        if not isinstance(cam, dict):
+            return
+        cam_prim_path = cam.get("prim_path")
+        if not cam_prim_path:
+            return
+        cam_prim_path = str(cam_prim_path)
+        cam_prim = stage.GetPrimAtPath(cam_prim_path)
+        if not cam_prim.IsValid():
+            return
+
+        pos = cam.get("pos_xyz")
+        rpy = cam.get("rpy_deg")
+        if isinstance(pos, (list, tuple)) and len(pos) == 3 and isinstance(rpy, (list, tuple)) and len(rpy) == 3:
+            xform = UsdGeom.Xformable(cam_prim)
+            xform.ClearXformOpOrder()
+            translate_op = xform.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble)
+            rotate_op = xform.AddRotateXYZOp(UsdGeom.XformOp.PrecisionFloat)
+            translate_op.Set(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
+            rotate_op.Set(Gf.Vec3f(float(rpy[0]), float(rpy[1]), float(rpy[2])))
+
+        fov = cam.get("fov_deg")
+        if fov is not None:
+            try:
+                cam_geom = UsdGeom.Camera(cam_prim)
+                import math as _math
+
+                # Match data_collection/profiles/vla_v1.py convention.
+                sensor_size_mm = 36.0
+                focal_length_mm = sensor_size_mm / (2.0 * _math.tan(_math.radians(float(fov)) / 2.0))
+                cam_geom.GetFocalLengthAttr().Set(float(focal_length_mm))
+            except Exception:
+                pass
+
+        if debug:
+            print(
+                f"[xVLA] Applied DR camera: path={cam_prim_path} "
+                f"pos_xyz={pos if isinstance(pos, (list, tuple)) else 'NA'} "
+                f"rpy_deg={rpy if isinstance(rpy, (list, tuple)) else 'NA'} "
+                f"fov_deg={fov if fov is not None else 'NA'}"
+            )
+    except Exception as e:
+        if debug:
+            print(f"[xVLA][WARN] DR apply: camera failed: {e}")
 
 
 def _read_ee_pose_b(robot, ee_link_name: str) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -525,6 +756,49 @@ def main() -> int:
         type=str,
         default=str((Path(__file__).resolve().parent / "models" / "xvla" / "stage2")),
         help="Path to your stage2 folder (contains config.json + model.safetensors + policy_{pre,post}processor.json).",
+    )
+    ap.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for box spawning (and random box yaw when using random layout).",
+    )
+    ap.add_argument(
+        "--layout-raw-episode",
+        type=str,
+        default=None,
+        help=(
+            "If set, spawn boxes using poses from a raw_data episode (ticks.jsonl first line, pose_w). "
+            "Provide an episode dir like .../raw_data/session_*/episode_0000 or a direct ticks.jsonl path."
+        ),
+    )
+    ap.add_argument(
+        "--init-joints-from-layout",
+        action="store_true",
+        default=True,
+        help=(
+            "When using --layout-raw-episode, also apply tick0 joint positions (first 6) as --init-joints. "
+            "Disable with --no-init-joints-from-layout."
+        ),
+    )
+    ap.add_argument(
+        "--no-init-joints-from-layout",
+        action="store_true",
+        help="Disable --init-joints-from-layout behavior.",
+    )
+    ap.add_argument(
+        "--domain-rand-from-layout",
+        action="store_true",
+        default=True,
+        help=(
+            "When using --layout-raw-episode, also apply the episode's logged domain randomization "
+            "(camera + light) from events.jsonl. Disable with --no-domain-rand-from-layout."
+        ),
+    )
+    ap.add_argument(
+        "--no-domain-rand-from-layout",
+        action="store_true",
+        help="Disable --domain-rand-from-layout behavior.",
     )
     ap.add_argument("--policy-hz", type=float, default=5.0, help="How often to query the policy (Hz).")
     ap.add_argument("--max-seconds", type=float, default=30.0)
@@ -645,6 +919,8 @@ def main() -> int:
 
     AppLauncher.add_app_launcher_args(ap)
     args = ap.parse_args()
+    if getattr(args, "seed", None) is not None:
+        np.random.seed(int(args.seed))
 
     # ---------------------------------------------------------------------
     # Load LeRobot policy BEFORE starting Kit.
@@ -821,19 +1097,45 @@ def main() -> int:
     create_topdown_camera(DEFAULT_TOP_DOWN_CAMERA)
     camera_sensor = None
     if enable_cameras:
-        # Match model input expectations (256x256). We attach to the created prim; no spawn.
+        # Match data-collection camera sensor resolution (typically 640x640) and downsample to model size later.
         camera_cfg = CameraCfg(
             prim_path=DEFAULT_TOP_DOWN_CAMERA.prim_path,
             offset=CameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
             spawn=None,
             data_types=["rgb"],
-            width=256,
-            height=256,
+            width=int(getattr(DEFAULT_TOP_DOWN_CAMERA, "resolution", (640, 640))[0]),
+            height=int(getattr(DEFAULT_TOP_DOWN_CAMERA, "resolution", (640, 640))[1]),
         )
         camera_sensor = Camera(cfg=camera_cfg)
 
     # Spawn colored boxes under /World/Origin1/Objects (matching log dataset naming).
     obj_root = "/World/Origin1/Objects"
+    fixed_poses_w = None
+    label_override = None
+    dr_from_layout_data: Optional[dict] = None
+    if getattr(args, "layout_raw_episode", None):
+        raw_ep = Path(str(args.layout_raw_episode))
+        fixed_poses_w, label_override = _load_fixed_layout_from_raw_episode(raw_ep, num_boxes=int(args.num_objects))
+        print(f"[xVLA] Using fixed object layout from raw episode: {args.layout_raw_episode}")
+
+        # Optionally also match the training start distribution by applying tick0 joint positions.
+        init_from_layout = bool(getattr(args, "init_joints_from_layout", True)) and not bool(
+            getattr(args, "no_init_joints_from_layout", False)
+        )
+        if init_from_layout and getattr(args, "init_joints", None) is None:
+            init6 = _load_init_joints_from_raw_episode(raw_ep)
+            if init6 is not None:
+                args.init_joints = init6  # type: ignore[attr-defined]
+                print(f"[xVLA] Loaded --init-joints from raw episode tick0: {init6}")
+
+        # Optionally also match the domain-randomization distribution by applying the logged DR parameters.
+        dr_from_layout = bool(getattr(args, "domain_rand_from_layout", True)) and not bool(
+            getattr(args, "no_domain_rand_from_layout", False)
+        )
+        if dr_from_layout:
+            dr_from_layout_data = _load_domain_randomization_from_raw_episode(raw_ep)
+            if dr_from_layout_data is not None and bool(dr_from_layout_data.get("enabled", True)):
+                print("[xVLA] Loaded domain randomization from raw episode events.jsonl (will apply).")
     prim_paths, id_to_label = _spawn_colored_boxes(
         parent_prim_path=obj_root,
         num_boxes=int(args.num_objects),
@@ -842,6 +1144,8 @@ def main() -> int:
         min_dist=float(args.min_distance),
         size_m=float(args.box_size),
         device=str(sim.device),
+        fixed_poses_w=fixed_poses_w,
+        id_to_label_override=label_override,
     )
     tracker = ObjectsTracker(prim_paths=prim_paths)
 
@@ -866,6 +1170,23 @@ def main() -> int:
         except Exception as e:
             print(f"[xVLA][WARN] Camera reset failed: {e}. Disabling camera.")
             camera_sensor = None
+
+    # If available, apply domain randomization from the raw episode after sim.reset so the prims exist/stabilize.
+    if dr_from_layout_data is not None and bool(dr_from_layout_data.get("enabled", True)):
+        try:
+            _apply_domain_randomization_dict(
+                dr_from_layout_data,
+                enable_cameras=bool(enable_cameras),
+                debug=bool(getattr(args, "debug", False)),
+            )
+            # Reset camera so render products refresh after moving the camera/changing FOV.
+            if camera_sensor is not None:
+                try:
+                    camera_sensor.reset()
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[xVLA][WARN] Failed to apply domain randomization from layout (continuing): {e}")
 
     # Controller
     ctrl_cfg = CartesianVelocityJogConfig(
@@ -1000,11 +1321,21 @@ def main() -> int:
             # Drop alpha channel if present (RGBA -> RGB)
             if rgb_np.ndim == 3 and rgb_np.shape[-1] >= 4:
                 rgb_np = rgb_np[..., :3]
+            # If not square, center-crop to square (matches dataset conversion).
+            if rgb_np.ndim == 3 and rgb_np.shape[0] != rgb_np.shape[1]:
+                h, w = int(rgb_np.shape[0]), int(rgb_np.shape[1])
+                side = min(h, w)
+                top = (h - side) // 2
+                left = (w - side) // 2
+                rgb_np = rgb_np[top : top + side, left : left + side, :]
             if rgb_np.max() <= 1.0:
                 rgb_np = (rgb_np * 255).astype(np.uint8)
             else:
                 rgb_np = rgb_np.astype(np.uint8)
-            img = torch.from_numpy(rgb_np).permute(2, 0, 1).contiguous()  # (3,256,256)
+            img = torch.from_numpy(rgb_np).permute(2, 0, 1).contiguous()  # (3,H,W) uint8
+            # Downsample to model input size exactly like dataset conversion (bilinear resize).
+            if img.shape[-2:] != (256, 256):
+                img = _resize_chw_uint8(img, size_hw=(256, 256))
 
             # Model expects:
             #  - observation.images.image (3,256,256)
