@@ -48,7 +48,7 @@
     "private": null,
     "tags": null,
     "license": null,
-    "pretrained_path": "/home/kye/.cache/huggingface/hub/models--lerobot--xvla-base/snapshots/4e63a23a885feda4315b7f679242b8eee7778b2d",
+    "pretrained_path": "/home/kye/Desktop/Depo/Code/Grasp-VLA/Grasp-VLA/outputs/xvla_v1_run_20260119_192918/stage2",
     "chunk_size": 30,
     "n_action_steps": 30,
     "dtype": "bfloat16",
