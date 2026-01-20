@@ -599,6 +599,52 @@ def _load_domain_randomization_from_raw_episode(raw_episode: Path) -> Optional[d
     return None
 
 
+def _infer_box_size_from_raw_episode(raw_episode: Path, *, table_z_w: float) -> Optional[float]:
+    """
+    Best-effort helper: infer a cube side length from a raw episode by assuming objects rest on the table.
+
+    For each object in tick0, if its world-frame center z is `z_center`, and the table top is at `table_z_w`,
+    then for an axis-aligned cube resting on the table, side ~= 2*(z_center - table_z_w).
+    We take the median over objects and clamp to a reasonable range.
+    """
+    raw_episode = raw_episode.expanduser().resolve()
+    ticks_path = raw_episode if raw_episode.is_file() else (raw_episode / "ticks.jsonl")
+    if not ticks_path.exists():
+        return None
+    try:
+        with ticks_path.open("r", encoding="utf-8") as f:
+            line = f.readline()
+        tick0 = json.loads(line)
+        objs = tick0.get("objects") or []
+        if not isinstance(objs, list) or not objs:
+            return None
+        sizes: list[float] = []
+        for o in objs:
+            if not isinstance(o, dict):
+                continue
+            pose_w = o.get("pose_w") or {}
+            pos = pose_w.get("position_m")
+            if not (isinstance(pos, (list, tuple)) and len(pos) == 3):
+                continue
+            try:
+                zc = float(pos[2])
+            except Exception:
+                continue
+            dz = zc - float(table_z_w)
+            if dz <= 0.0:
+                continue
+            s = 2.0 * dz
+            if 0.01 <= s <= 0.20:
+                sizes.append(float(s))
+        if not sizes:
+            return None
+        s_med = float(np.median(np.asarray(sizes, dtype=np.float32)))
+        # Clamp to sane bounds in case of small penetration/jitter.
+        return float(np.clip(s_med, 0.02, 0.12))
+    except Exception:
+        return None
+
+
 def _apply_domain_randomization_dict(dr: dict, *, enable_cameras: bool, debug: bool = False) -> None:
     """Apply a vla_v1-style `domain_randomization` dict to the current USD stage (light + camera)."""
     try:
@@ -809,7 +855,15 @@ def main() -> int:
         help="Physics settle steps after sim.reset/robot reset before starting policy control (reduces initial jitter).",
     )
     ap.add_argument("--num-objects", type=int, default=4)
-    ap.add_argument("--box-size", type=float, default=0.08)
+    ap.add_argument(
+        "--box-size",
+        type=float,
+        default=None,
+        help=(
+            "Side length for spawned cubes (meters). If omitted, defaults to ~0.05.\n"
+            "When using --layout-raw-episode and box size is omitted, we will auto-infer it from tick0 object z."
+        ),
+    )
     ap.add_argument("--spawn-min", type=float, nargs=3, default=[0.25, -0.25, 0.95])
     ap.add_argument("--spawn-max", type=float, nargs=3, default=[0.60, 0.25, 0.95])
     ap.add_argument("--min-distance", type=float, default=0.10)
@@ -919,6 +973,12 @@ def main() -> int:
 
     AppLauncher.add_app_launcher_args(ap)
     args = ap.parse_args()
+    _box_size_provided = getattr(args, "box_size", None) is not None
+    # Stable default close to the dataset distribution (vla_v1 uses ~0.04–0.06).
+    if getattr(args, "box_size", None) is None:
+        args.box_size = 0.05  # type: ignore[attr-defined]
+    # Keep a private marker so we can decide whether to override from layout.
+    setattr(args, "_box_size_provided", bool(_box_size_provided))
     if getattr(args, "seed", None) is not None:
         np.random.seed(int(args.seed))
 
@@ -1117,6 +1177,17 @@ def main() -> int:
         raw_ep = Path(str(args.layout_raw_episode))
         fixed_poses_w, label_override = _load_fixed_layout_from_raw_episode(raw_ep, num_boxes=int(args.num_objects))
         print(f"[xVLA] Using fixed object layout from raw episode: {args.layout_raw_episode}")
+
+        # If box size was not explicitly provided, infer it from tick0 object center heights.
+        if not bool(getattr(args, "_box_size_provided", False)):
+            try:
+                table_z = float(getattr(DEFAULT_SCENE, "table_translation", (0.0, 0.0, 0.8))[2])
+            except Exception:
+                table_z = 0.8
+            est = _infer_box_size_from_raw_episode(raw_ep, table_z_w=table_z)
+            if est is not None:
+                args.box_size = float(est)  # type: ignore[attr-defined]
+                print(f"[xVLA] Loaded --box-size from raw episode tick0 (median): {float(est):.4f} m")
 
         # Optionally also match the training start distribution by applying tick0 joint positions.
         init_from_layout = bool(getattr(args, "init_joints_from_layout", True)) and not bool(
