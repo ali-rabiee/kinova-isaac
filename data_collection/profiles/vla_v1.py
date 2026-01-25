@@ -51,6 +51,16 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     # Default was previously 0.35m, which is below the tabletop in this scene (~0.8-0.9m),
     # causing the controller to clamp Z and the arm to jitter/oscillate near the clamp.
     parser.add_argument("--workspace-max-z", type=float, default=1.20, help="Maximum EE z in base frame (m).")
+    # Initial arm joint configuration override (applied after every sim.reset()).
+    # If omitted, uses the environment's default joints. For planner runs, a tucked "home" pose close to
+    # the robot base generally produces smoother starts and more consistent datasets.
+    parser.add_argument(
+        "--init-joints",
+        type=float,
+        nargs=6,
+        default=None,
+        help="Optional initial arm joints (6 floats, radians) applied after each reset. Example: --init-joints j1 j2 j3 j4 j5 j6",
+    )
     # Waypoint follower tuning (planner execution)
     parser.add_argument(
         "--wp-max-steps-per-waypoint",
@@ -84,6 +94,17 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
         default="curobo_v2",
         choices=["curobo_v2", "curobo", "lula", "rmpflow", "scripted"],
         help="Planner backend for --control planner (default: curobo_v2)",
+    )
+    parser.add_argument(
+        "--approach-trajectory",
+        type=str,
+        default="auto",
+        choices=["auto", "curobo", "straight"],
+        help=(
+            "How to generate approach waypoints in planner mode. "
+            "'curobo' follows the planner's EE trajectory; 'straight' uses direct (pregrasp->grasp->lift) waypoints; "
+            "'auto' uses 'straight' for --spawn-mode box and 'curobo' otherwise."
+        ),
     )
     parser.add_argument("--target-label", type=str, default=None, help="Optional target object label filter")
     parser.add_argument(
@@ -152,6 +173,12 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=0.005,
         help="Only start closing gripper if EE is within this distance of the final approach goal.",
+    )
+    parser.add_argument(
+        "--pre-close-hold-steps",
+        type=int,
+        default=10,
+        help="Hold steps after reaching the final approach goal before closing (reduces end-of-approach jitter).",
     )
     parser.add_argument(
         "--grasp-depth-step",
@@ -257,11 +284,20 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--respawn-every-n-episodes",
         type=int,
-        default=0,
+        default=1,
         help=(
             "Re-randomize object poses every N episodes in planner mode. "
-            "If 0 (default), respawn once per full target cycle (i.e., every num_objects episodes). "
+            "If 0, respawn once per full target cycle (i.e., every num_objects episodes). "
             "Use 1 to respawn every episode."
+        ),
+    )
+    parser.add_argument(
+        "--respawn-seed",
+        type=int,
+        default=None,
+        help=(
+            "Optional base RNG seed for object respawn pose sampling. If omitted, defaults to --domain-rand-seed when provided, "
+            "otherwise uses a time-based seed."
         ),
     )
     parser.add_argument(
@@ -274,6 +310,21 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=180,
         help="Physics settle steps after reset/respawn before planning (reduces initial bounce/ragdoll).",
+    )
+    parser.add_argument(
+        "--respawn-warmup-steps",
+        type=int,
+        default=8,
+        help=(
+            "Physics steps to run immediately after each sim.reset() (before respawn/teleport). "
+            "Some IsaacSim/PhysX builds only populate rigid-body tensor views after a few steps."
+        ),
+    )
+    parser.add_argument(
+        "--respawn-verify-max-delta-m",
+        type=float,
+        default=0.02,
+        help="If respawn verification exceeds this XY error (m), trigger a more aggressive fallback respawn path.",
     )
 
     # NEW in v1: dynamic cuRobo world sync (USD -> cuRobo cuboids)
@@ -295,6 +346,15 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=0.4,
         help="Planner execution linear speed (m/s). Used only for --control planner.",
+    )
+    parser.add_argument(
+        "--planner-speed-cap-mps",
+        type=float,
+        default=0.20,
+        help=(
+            "Safety cap on planner execution speed (m/s) to reduce wobble/overshoot during approach. "
+            "Effective speed = min(--planner-speed-mps, --planner-speed-cap-mps)."
+        ),
     )
     parser.add_argument(
         "--planner-waypoint-max-seg-m",
@@ -320,7 +380,7 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--box-size",
         type=float,
-        default=0.08,
+        default=0.05,
         help="Side length for uniform boxes (m). Used if spawn-mode=box.",
     )
 
@@ -407,6 +467,18 @@ def run(args: argparse.Namespace) -> int:
     scene_entities, scene_origins = design_scene(DEFAULT_SCENE)
     robot = scene_entities["kinova_j2n6s300"]
 
+    # -----------------------------
+    # Profile defaults / overrides
+    # -----------------------------
+    # For planner runs, default to a tucked "home" pose close to the base unless the user overrides it.
+    try:
+        _ctrl_mode = str(getattr(args, "control", "keyboard"))
+        if _ctrl_mode == "planner" and getattr(args, "init_joints", None) is None:
+            # Matches the xVLA IsaacSim rollout README (stable starting configuration).
+            args.init_joints = [0.0072, 2.2704, 4.5114, 0.2286, 5.0707, 1.4764]  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
     # Create top-down camera prim ONLY if cameras are enabled.
     # IsaacLab will error during sim.reset() if a Camera exists without --enable_cameras.
     if enable_cameras and DEFAULT_TOP_DOWN_CAMERA is not None:
@@ -441,6 +513,18 @@ def run(args: argparse.Namespace) -> int:
             _dr_seed_base = int(time.time() * 1000) & 0x7FFFFFFF
     except Exception:
         _dr_seed_base = 0
+
+    # Respawn RNG seed base (separate from domain rand, but defaults to it for reproducibility).
+    _respawn_seed_base = None
+    try:
+        if getattr(args, "respawn_seed", None) is not None:
+            _respawn_seed_base = int(getattr(args, "respawn_seed"))
+        elif getattr(args, "domain_rand_seed", None) is not None:
+            _respawn_seed_base = int(getattr(args, "domain_rand_seed"))
+        else:
+            _respawn_seed_base = int(time.time() * 1000) & 0x7FFFFFFF
+    except Exception:
+        _respawn_seed_base = 0
 
     def _apply_domain_randomization(*, ep_idx: int, logger: Optional["SessionLogWriter"] = None) -> Optional[dict]:
         """Apply domain randomization (camera + lighting) once per episode.
@@ -843,6 +927,13 @@ def run(args: argparse.Namespace) -> int:
         return cmd, meta
 
     def _table_z() -> float:
+        # Prefer phys.snap_z_to when available (used by object spawning/snapping).
+        try:
+            tz = getattr(phys, "snap_z_to", None)
+            if tz is not None:
+                return float(tz)
+        except Exception:
+            pass
         try:
             t = getattr(DEFAULT_SCENE, "table_translation", (0.0, 0.0, 0.8))
             return float(t[2])
@@ -860,15 +951,231 @@ def run(args: argparse.Namespace) -> int:
             return None
         return None
 
-    # Cache for Isaac Sim core prim wrappers used during respawn (box mode).
-    # We use `isaacsim.core.prims.RigidPrim` because it is physics-aware and survives repeated `sim.reset()`
-    # better than raw tensor views in this script.
-    _respawn_rigidprims: dict[str, object] = {}
+    def _sample_object_poses(
+        paths: list[str],
+        *,
+        seed: Optional[int] = None,
+    ) -> list[tuple[tuple[float, float, float], float]]:
+        """Sample object poses (Origin1 frame) within spawn bounds.
+
+        This is used for per-episode respawn in planner mode.
+        """
+        if not paths:
+            return []
+        try:
+            import random
+            import math
+        except Exception:
+            return []
+
+        try:
+            rng = random.Random(int(seed)) if seed is not None else random
+        except Exception:
+            rng = random
+
+        bmin = tuple(float(v) for v in getattr(args, "spawn_min", (0.30, -0.20, 0.81)))
+        bmax = tuple(float(v) for v in getattr(args, "spawn_max", (0.55, 0.20, 0.81)))
+        # Keep box respawn in a "comfortable" reach band to avoid joint-limit/singularity edge cases.
+        try:
+            if str(getattr(args, "spawn_mode", "usd")) == "box":
+                bx0, by0, bz0 = float(bmin[0]), float(bmin[1]), float(bmin[2])
+                bx1, by1, bz1 = float(bmax[0]), float(bmax[1]), float(bmax[2])
+                bx1 = min(bx1, 0.55)
+                by0 = max(by0, -0.35)
+                by1 = min(by1, 0.35)
+                if bx1 > bx0 and by1 > by0:
+                    bmin = (bx0, by0, bz0)
+                    bmax = (bx1, by1, bz1)
+                    if not hasattr(_sample_object_poses, "_printed_bounds"):
+                        setattr(_sample_object_poses, "_printed_bounds", True)  # type: ignore[attr-defined]
+                        print(f"[VLA_V1][RESPAWN] box_mode respawn_bounds_xy x=[{bx0:.3f},{bx1:.3f}] y=[{by0:.3f},{by1:.3f}]")
+        except Exception:
+            pass
+        min_dist = float(getattr(args, "min_distance", 0.10))
+        # For respawn we want objects to be immediately usable for grasping.
+        # Prefer snapping to the table plane when available (same mechanism as ObjectLoader).
+        snap_z = None
+        try:
+            snap_z = getattr(phys, "snap_z_to", None)
+        except Exception:
+            snap_z = None
+        z_clear = 0.005
+        try:
+            z_clear = float(getattr(phys, "z_clearance", 0.005))
+        except Exception:
+            z_clear = 0.005
+        z_jitter_max = 0.01
+        # In box mode, Cuboid prims are centered at their translation. If we snap Z to the table surface,
+        # we must add half the box height so the box rests on the table (instead of being half-submerged).
+        box_half_h = None
+        try:
+            if str(getattr(args, "spawn_mode", "usd")) == "box":
+                bs = float(getattr(args, "box_size", 0.05))
+                box_half_h = 0.5 * float(bs)
+        except Exception:
+            box_half_h = None
+
+        positions: list[tuple[float, float, float]] = []
+        tries = 0
+        while len(positions) < len(paths) and tries < 4000:
+            tries += 1
+            x = rng.uniform(min(bmin[0], bmax[0]), max(bmin[0], bmax[0]))
+            y = rng.uniform(min(bmin[1], bmax[1]), max(bmin[1], bmax[1]))
+            if snap_z is not None:
+                # Snap to table surface (stable, avoids planning to falling objects).
+                z = float(snap_z) + float(z_clear) + float(rng.uniform(0.0, float(z_jitter_max)))
+                if box_half_h is not None:
+                    z += float(box_half_h)
+            else:
+                table_z_guess = float(getattr(DEFAULT_SCENE, "table_translation", (0.0, 0.0, 0.8))[2]) if "DEFAULT_SCENE" in locals() else 0.8
+                z_min_safe = max(float(bmin[2]), float(table_z_guess) + 0.05)  # at least 5cm above table plane
+                z = rng.uniform(z_min_safe, max(z_min_safe, float(max(bmin[2], bmax[2]))))
+            # Keep objects slightly away from the robot base (Origin1 frame) to reduce near-singularity grasps.
+            try:
+                min_robot_dist = float(getattr(args, "spawn_min_robot_dist", 0.0))
+                if min_robot_dist > 1e-6 and math.hypot(float(x), float(y)) < min_robot_dist:
+                    continue
+            except Exception:
+                pass
+            cand = (float(x), float(y), float(z))
+            ok = True
+            for p in positions:
+                if math.hypot(cand[0] - p[0], cand[1] - p[1]) < float(min_dist):
+                    ok = False
+                    break
+            if ok:
+                positions.append(cand)
+
+        if len(positions) != len(paths):
+            # Fallback: allow overlaps rather than failing.
+            if snap_z is not None:
+                z0 = float(snap_z) + float(z_clear)
+                if box_half_h is not None:
+                    z0 += float(box_half_h)
+                positions = [
+                    (
+                        float(rng.uniform(min(bmin[0], bmax[0]), max(bmin[0], bmax[0]))),
+                        float(rng.uniform(min(bmin[1], bmax[1]), max(bmin[1], bmax[1]))),
+                        float(z0),
+                    )
+                    for _ in paths
+                ]
+            else:
+                table_z_guess = float(getattr(DEFAULT_SCENE, "table_translation", (0.0, 0.0, 0.8))[2]) if "DEFAULT_SCENE" in locals() else 0.8
+                z_min_safe = max(float(bmin[2]), float(table_z_guess) + 0.05)  # at least 5cm above table plane
+                positions = [
+                    (
+                        float(rng.uniform(min(bmin[0], bmax[0]), max(bmin[0], bmax[0]))),
+                        float(rng.uniform(min(bmin[1], bmax[1]), max(bmin[1], bmax[1]))),
+                        float(rng.uniform(z_min_safe, max(z_min_safe, float(max(bmin[2], bmax[2]))))),
+                    )
+                    for _ in paths
+                ]
+
+        try:
+            import math
+
+            yaws = [float(rng.uniform(-math.pi, math.pi)) for _ in paths]
+        except Exception:
+            yaws = [0.0 for _ in paths]
+
+        return list(zip(positions, yaws))
+
+    def _apply_object_poses_usd(
+        paths: list[str],
+        poses: list[tuple[tuple[float, float, float], float]],
+    ) -> bool:
+        """Apply poses by authoring USD xform ops (best-effort)."""
+        if not paths or not poses or len(paths) != len(poses):
+            return False
+        try:
+            import importlib
+            import math
+
+            omni_usd = importlib.import_module("omni.usd")
+            UsdGeom = importlib.import_module("pxr.UsdGeom")
+            UsdPhysics = importlib.import_module("pxr.UsdPhysics")
+            Usd = importlib.import_module("pxr.Usd")
+            Gf = importlib.import_module("pxr.Gf")
+            stage = omni_usd.get_context().get_stage()
+        except Exception as e:
+            print(f"[VLA_V1][RESPAWN][WARN] USD pose apply unavailable: {e}")
+            return False
+
+        ok_all = True
+        applied_paths: dict[str, str] = {}
+        for prim_path, (pos, yaw) in zip(paths, poses):
+            try:
+                root = stage.GetPrimAtPath(str(prim_path))
+                if not root.IsValid():
+                    ok_all = False
+                    continue
+
+                # Prefer writing the transform on the actual rigid-body prim when the root is just a container.
+                target = root
+                try:
+                    if not root.HasAPI(UsdPhysics.RigidBodyAPI):
+                        for p in Usd.PrimRange(root, Usd.TraverseInstanceProxies()):
+                            if p.IsValid() and p.HasAPI(UsdPhysics.RigidBodyAPI):
+                                target = p
+                                break
+                except Exception:
+                    target = root
+
+                target_path = str(target.GetPath().pathString) if target is not None and target.IsValid() else str(prim_path)
+                applied_paths[str(prim_path).split("/")[-1]] = target_path.split("/")[-1]
+
+                xf = UsdGeom.Xformable(target)
+                ops = xf.GetOrderedXformOps()
+                translate_op = None
+                orient_op = None
+                rotate_op = None
+                for op in ops:
+                    try:
+                        ot = op.GetOpType()
+                    except Exception:
+                        ot = None
+                    if ot == UsdGeom.XformOp.TypeTranslate:
+                        translate_op = op
+                    elif ot == UsdGeom.XformOp.TypeOrient:
+                        orient_op = op
+                    elif ot == UsdGeom.XformOp.TypeRotateXYZ:
+                        rotate_op = op
+
+                if translate_op is None:
+                    translate_op = xf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble)
+                translate_op.Set(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
+
+                half = 0.5 * float(yaw)
+                qw = float(math.cos(half))
+                qz = float(math.sin(half))
+                if orient_op is None:
+                    try:
+                        orient_op = xf.AddOrientOp(UsdGeom.XformOp.PrecisionFloat)
+                    except Exception:
+                        orient_op = None
+                if orient_op is not None:
+                    orient_op.Set(Gf.Quatf(qw, Gf.Vec3f(0.0, 0.0, qz)))
+                else:
+                    if rotate_op is None:
+                        rotate_op = xf.AddRotateXYZOp(UsdGeom.XformOp.PrecisionFloat)
+                    rotate_op.Set(Gf.Vec3f(0.0, 0.0, float(math.degrees(float(yaw)))))
+            except Exception:
+                ok_all = False
+                continue
+
+        try:
+            if applied_paths:
+                print(f"[VLA_V1][RESPAWN] usd_apply_targets={applied_paths}")
+        except Exception:
+            pass
+        return bool(ok_all)
 
     def _rerandomize_object_poses(
         paths: list[str],
         *,
         poses: Optional[list[tuple[tuple[float, float, float], float]]] = None,
+        seed: Optional[int] = None,
     ) -> Optional[list[tuple[tuple[float, float, float], float]]]:
         """Teleport existing objects to poses (or new random poses) without delete/recreate.
 
@@ -892,6 +1199,13 @@ def run(args: argparse.Namespace) -> int:
             from isaacsim.core.simulation_manager import SimulationManager
         except Exception:
             return None
+
+        # Dedicated RNG so respawn is deterministic per-episode when seeded, and independent of any other
+        # random usage inside Isaac/Omni.
+        try:
+            rng = random.Random(int(seed)) if seed is not None else random
+        except Exception:
+            rng = random
 
         # Best-effort: locate the *actual* rigid body prim under each object root.
         # Some spawners create a container prim (e.g. Xform) at /Objects/Obj_XX and put the
@@ -944,9 +1258,9 @@ def run(args: argparse.Namespace) -> int:
             tries = 0
             while len(positions) < len(paths) and tries < 2000:
                 tries += 1
-                x = random.uniform(bmin[0], bmax[0])
-                y = random.uniform(bmin[1], bmax[1])
-                z = random.uniform(z_min_safe, float(bmax[2]))
+                x = rng.uniform(bmin[0], bmax[0])
+                y = rng.uniform(bmin[1], bmax[1])
+                z = rng.uniform(z_min_safe, float(bmax[2]))
                 # Keep objects slightly away from the robot base (Origin1 frame) to reduce near-singularity grasps.
                 try:
                     min_robot_dist = float(getattr(args, "spawn_min_robot_dist", 0.0))
@@ -971,15 +1285,15 @@ def run(args: argparse.Namespace) -> int:
                 # Fallback: allow overlaps rather than failing.
                 positions = [
                     (
-                        random.uniform(bmin[0], bmax[0]),
-                        random.uniform(bmin[1], bmax[1]),
-                        random.uniform(z_min_safe, float(bmax[2])),
+                        rng.uniform(bmin[0], bmax[0]),
+                        rng.uniform(bmin[1], bmax[1]),
+                        rng.uniform(z_min_safe, float(bmax[2])),
                     )
                     for _ in paths
                 ]
 
             # Random yaw per object to diversify orientation.
-            yaws = [random.uniform(-math.pi, math.pi) for _ in paths]
+            yaws = [rng.uniform(-math.pi, math.pi) for _ in paths]
 
         sim_view = SimulationManager.get_physics_sim_view()
         # Convert parent-relative spawn coordinates into world coordinates using the scene origin.
@@ -1005,12 +1319,9 @@ def run(args: argparse.Namespace) -> int:
             try:
                 import numpy as np
 
+                # NOTE: Do NOT cache RigidPrim across sim.reset(); handles can go stale and silently no-op.
                 key = str(rb_prim_path)
-                rp = _respawn_rigidprims.get(key)
-                if rp is None:
-                    # reset_xform_properties=False avoids rewriting xformOpOrder on every init.
-                    rp = RigidPrim(prim_paths_expr=str(rb_prim_path), name=f"respawn_{key.split('/')[-1]}", reset_xform_properties=False)
-                    _respawn_rigidprims[key] = rp
+                rp = RigidPrim(prim_paths_expr=str(rb_prim_path), name=f"respawn_{key.split('/')[-1]}", reset_xform_properties=False)
 
                 # Ensure physics handles are valid after sim.reset().
                 try:
@@ -1088,7 +1399,10 @@ def run(args: argparse.Namespace) -> int:
                             pos_xyz=(float(px), float(py), float(pz)),
                             quat_wxyz=(float(qw), float(qx), float(qy), float(qz)),
                         ):
-                            continue
+                            # Do not early-continue here: across some IsaacSim/PhysX versions a cached RigidPrim can
+                            # report success while leaving the rigid body unmoved after sim.reset(). We still run the
+                            # tensor-view teleport below as a reliability backstop when available.
+                            pass
                 except Exception:
                     pass
 
@@ -1177,7 +1491,31 @@ def run(args: argparse.Namespace) -> int:
         root_state[:, :3] += origin0
         robot.write_root_pose_to_sim(root_state[:, :7])
         robot.write_root_velocity_to_sim(root_state[:, 7:])
-        robot.write_joint_state_to_sim(robot.data.default_joint_pos, robot.data.default_joint_vel)
+        # Default joint state from env, with optional arm override via --init-joints.
+        qpos = robot.data.default_joint_pos
+        qvel = robot.data.default_joint_vel
+        try:
+            init = getattr(args, "init_joints", None)
+            if init is not None:
+                init6 = [float(v) for v in list(init)][:6]
+                qpos2 = qpos.clone()
+                if qpos2.ndim == 1:
+                    qpos2 = qpos2.view(1, -1)
+                arm_ids = None
+                try:
+                    arm_joint_ids, _ = robot.find_joints("j2n6s300_joint_[1-6]")
+                    if hasattr(arm_joint_ids, "view"):
+                        arm_ids = [int(v) for v in arm_joint_ids.view(-1).tolist()]
+                    else:
+                        arm_ids = [int(v) for v in list(arm_joint_ids)]
+                except Exception:
+                    arm_ids = None
+                if arm_ids is not None and len(arm_ids) >= 6:
+                    qpos2[:, arm_ids[:6]] = torch.tensor(init6, dtype=qpos2.dtype, device=qpos2.device).view(1, 6)
+                    qpos = qpos2
+        except Exception as e:
+            print(f"[VLA_V1][WARN] Failed to apply --init-joints (continuing): {e}")
+        robot.write_joint_state_to_sim(qpos, qvel)
         robot.reset()
 
     _reset_sim_and_robot()
@@ -1210,7 +1548,18 @@ def run(args: argparse.Namespace) -> int:
     _control_mode_tmp = str(getattr(args, "control", "keyboard"))
     linear_speed_mps = float(getattr(args, "speed", 0.7))
     if _control_mode_tmp == "planner":
-        linear_speed_mps = float(getattr(args, "planner_speed_mps", 0.25))
+        req = float(getattr(args, "planner_speed_mps", 0.25))
+        cap = float(getattr(args, "planner_speed_cap_mps", req))
+        linear_speed_mps = float(min(req, cap))
+        try:
+            dt_tmp = float(sim.get_physics_dt())
+            step_mm = 1000.0 * float(linear_speed_mps) * float(dt_tmp)
+            print(
+                f"[VLA_V1][PLANNER] speed requested={req:.3f} cap={cap:.3f} effective={linear_speed_mps:.3f} m/s "
+                f"(dt={dt_tmp:.6f}s step≈{step_mm:.2f}mm)"
+            )
+        except Exception:
+            print(f"[VLA_V1][PLANNER] speed requested={req:.3f} cap={cap:.3f} effective={linear_speed_mps:.3f} m/s")
 
     ctrl_cfg = CartesianVelocityJogConfig(
         ee_link_name=str(getattr(args, "ee_link", "j2n6s300_end_effector")),
@@ -1312,6 +1661,9 @@ def run(args: argparse.Namespace) -> int:
         # Ensure waypoint tolerance is not larger than the close gate; otherwise we can end up
         # "finishing" the last waypoint while still being too far to close, causing a hover loop.
         _close_gate_m = float(getattr(args, "close_if_within_m", 0.005))
+        # Never override the user's close gate; only guard against invalid/zero values.
+        if _close_gate_m <= 0.0:
+            _close_gate_m = 0.005
         _wp_tol_m = float(getattr(args, "tolerance", 0.005))
         _wp_tol_m = float(min(_wp_tol_m, _close_gate_m))
         wp = WaypointFollowerInput(
@@ -1562,24 +1914,6 @@ def run(args: argparse.Namespace) -> int:
                     window_len_s=2.0,
                 )
 
-                # Reset sim/robot for a clean episode start.
-                _reset_sim_and_robot()
-                if camera_sensor is not None:
-                    try:
-                        camera_sensor.reset()
-                    except Exception:
-                        pass
-
-                # IMPORTANT: PhysX views are not reliably populated immediately after `sim.reset()`.
-                # If we try to create rigid-body views and teleport *before* the first post-reset step,
-                # the view can be empty and the respawn becomes a silent no-op (objects never move).
-                # Stepping once here ensures rigid bodies are registered before we respawn/teleport.
-                try:
-                    sim.step(render=False)
-                    robot.update(dt)
-                except Exception:
-                    pass
-
                 # Reset object poses each episode, but only *generate new random poses* every N episodes.
                 do_respawn = bool(getattr(args, "respawn_each_episode", False)) or (
                     control_mode == "planner" and (not bool(getattr(args, "no_respawn_each_episode", False)))
@@ -1593,61 +1927,107 @@ def run(args: argparse.Namespace) -> int:
                     if respawn_every <= 0:
                         respawn_every = max(1, int(len(spawned_paths)))
                     regenerate = (cycle_object_poses is None) or ((int(ep) % int(respawn_every)) == 0)
+                    # Deterministic per-episode respawn when seeded, while still changing every episode.
+                    try:
+                        _seed = int((_respawn_seed_base or 0) + int(ep) * 9973)
+                    except Exception:
+                        _seed = None
+
                     if regenerate:
                         print(
-                            f"[VLA_V1][RESPAWN] ep={int(ep)} regenerate=True respawn_every={int(respawn_every)} n_objects={len(spawned_paths)}"
+                            f"[VLA_V1][RESPAWN] ep={int(ep)} regenerate=True respawn_every={int(respawn_every)} n_objects={len(spawned_paths)} seed={_seed}"
                         )
-                        new_poses = _rerandomize_object_poses(spawned_paths)
-                        if new_poses is not None:
-                            cycle_object_poses = new_poses
-                            # Log/print intended new positions for easy verification.
-                            try:
-                                pose_xy = {
-                                    str(p).split("/")[-1]: [round(float(pos[0]), 4), round(float(pos[1]), 4)]
-                                    for p, (pos, _yaw) in zip(spawned_paths, new_poses)
-                                }
-                                print(f"[VLA_V1][RESPAWN] intended_xy={pose_xy}")
-                                session_logger.log_event(
-                                    "object_respawn",
-                                    {
-                                        "episode_idx": int(ep),
-                                        "respawn_every": int(respawn_every),
-                                        "intended_xy": pose_xy,
-                                    },
-                                )
-                            except Exception:
-                                pass
-                            # Best-effort verification: read back current PhysX poses after one step.
-                            try:
-                                sim.step(render=False)
-                                robot.update(dt)
-                                _trk = ObjectsTracker(prim_paths=spawned_paths)
-                                snap = _trk.snapshot()
-                                actual_xy = {
-                                    str(o.id): [round(float(o.pose.position_m[0]), 4), round(float(o.pose.position_m[1]), 4)]
-                                    for o in snap
-                                }
-                                print(f"[VLA_V1][RESPAWN] actual_xy={actual_xy}")
-                                try:
-                                    session_logger.log_event(
-                                        "object_respawn_actual",
-                                        {
-                                            "episode_idx": int(ep),
-                                            "respawn_every": int(respawn_every),
-                                            "actual_xy": actual_xy,
-                                        },
-                                    )
-                                except Exception:
-                                    pass
-                            except Exception:
-                                pass
-                        else:
-                            print(
-                                "[VLA_V1][RESPAWN][WARN] Respawn requested but teleport failed (no poses applied). "
-                                "Objects may remain at their original locations."
-                            )
+                        cycle_object_poses = _sample_object_poses(spawned_paths, seed=_seed) or None
                     else:
-                        _rerandomize_object_poses(spawned_paths, poses=cycle_object_poses)
+                        print(
+                            f"[VLA_V1][RESPAWN] ep={int(ep)} regenerate=False respawn_every={int(respawn_every)} using_cached=True"
+                        )
+
+                    if cycle_object_poses is None or len(cycle_object_poses) != len(spawned_paths):
+                        print("[VLA_V1][RESPAWN][WARN] No cached/sample poses available; skipping respawn.")
+                    else:
+                        # Log/print intended new positions for easy verification.
+                        try:
+                            pose_xy = {
+                                str(p).split("/")[-1]: [round(float(pos[0]), 4), round(float(pos[1]), 4)]
+                                for p, (pos, _yaw) in zip(spawned_paths, cycle_object_poses)
+                            }
+                            print(f"[VLA_V1][RESPAWN] intended_xy={pose_xy}")
+                            session_logger.log_event(
+                                "object_respawn",
+                                {
+                                    "episode_idx": int(ep),
+                                    "respawn_every": int(respawn_every),
+                                    "seed": _seed,
+                                    "spawn_min": [float(v) for v in getattr(args, "spawn_min", [])],
+                                    "spawn_max": [float(v) for v in getattr(args, "spawn_max", [])],
+                                    "intended_xy": pose_xy,
+                                },
+                            )
+                        except Exception:
+                            pass
+
+                        # Author USD xform ops BEFORE sim.reset(). This avoids mid-episode extra resets that can
+                        # desync planner/controller state and lead to stale targets.
+                        applied_usd = bool(_apply_object_poses_usd(spawned_paths, cycle_object_poses))
+                        print(f"[VLA_V1][RESPAWN] usd_apply_ok={applied_usd} (will apply on upcoming sim.reset)")
+
+                # Reset sim/robot for a clean episode start (single reset point).
+                _reset_sim_and_robot()
+                if camera_sensor is not None:
+                    try:
+                        camera_sensor.reset()
+                    except Exception:
+                        pass
+
+                # IMPORTANT: PhysX views are not reliably populated immediately after `sim.reset()`.
+                # Stepping a few times here ensures rigid bodies are registered before we read/plan.
+                try:
+                    warm = int(getattr(args, "respawn_warmup_steps", 1))
+                    warm = max(1, int(warm))
+                    for _ in range(warm):
+                        sim.step(render=False)
+                        robot.update(dt)
+                except Exception:
+                    pass
+
+                # Verify respawn took effect (debug-only; does not mutate state).
+                if do_respawn and cycle_object_poses is not None and len(cycle_object_poses) == len(spawned_paths):
+                    try:
+                        snap = ObjectsTracker(prim_paths=spawned_paths).snapshot()
+                        actual_xy = {
+                            str(o.id): [round(float(o.pose.position_m[0]), 4), round(float(o.pose.position_m[1]), 4)]
+                            for o in snap
+                        }
+                        print(f"[VLA_V1][RESPAWN] actual_xy={actual_xy}")
+                        try:
+                            intended_xy = pose_xy  # type: ignore[name-defined]
+                            delta_xy = {}
+                            for k, v in intended_xy.items():
+                                av = actual_xy.get(str(k), None)
+                                if av is None:
+                                    continue
+                                dx = float(av[0]) - float(v[0])
+                                dy = float(av[1]) - float(v[1])
+                                delta_xy[str(k)] = round((dx * dx + dy * dy) ** 0.5, 4)
+                            print(f"[VLA_V1][RESPAWN] delta_xy={delta_xy}")
+                        except Exception:
+                            delta_xy = None
+                        try:
+                            session_logger.log_event(
+                                "object_respawn_actual",
+                                {
+                                    "episode_idx": int(ep),
+                                    "respawn_every": int(respawn_every) if do_respawn else None,
+                                    "actual_xy": actual_xy,
+                                    "delta_xy": delta_xy,
+                                    "usd_apply_ok": bool(applied_usd) if do_respawn else None,
+                                },
+                            )
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
 
                 # HARD reset controller + follower per episode to avoid leftover impulses after sim.reset()
                 try:
@@ -1891,6 +2271,32 @@ def run(args: argparse.Namespace) -> int:
                                         # Convert a "contact point" on the object into an EE-link target by shifting upward.
                                         # This prevents commanding the wrist/palm inside the object volume.
                                         gz_ee = gz + ee_z_offset
+                                        # Clamp grasp depth so the implied fingertip Z does not go below the table plane.
+                                        # NOTE: With the ee_z_offset convention, fingertip_z ~= object_top_z + grasp_depth.
+                                        try:
+                                            top_z_w = float(_pos_w[2])
+                                            table_z_w = float(_table_z())
+                                            z_clear = float(getattr(phys, "z_clearance", 0.005))
+                                            min_tip_z_w = float(table_z_w + max(0.001, z_clear))
+                                            desired_tip_z_w = float(top_z_w + float(grasp_depth_eff))
+                                            if desired_tip_z_w < min_tip_z_w:
+                                                old = float(grasp_depth_eff)
+                                                grasp_depth_eff = float(min_tip_z_w - top_z_w)
+                                                session_logger.log_event(
+                                                    "debug",
+                                                    {
+                                                        "episode_idx": int(ep),
+                                                        "event": "CLAMP_GRASP_DEPTH_TABLE",
+                                                        "table_z_w": float(table_z_w),
+                                                        "top_z_w": float(top_z_w),
+                                                        "min_tip_z_w": float(min_tip_z_w),
+                                                        "desired_tip_z_w": float(desired_tip_z_w),
+                                                        "grasp_depth_old": float(old),
+                                                        "grasp_depth_new": float(grasp_depth_eff),
+                                                    },
+                                                )
+                                        except Exception:
+                                            pass
                                         # Clamp grasp depth so the requested grasp Z is reachable under workspace_min_z.
                                         try:
                                             z_floor = float(getattr(ctrl_cfg.safety_cfg, "workspace_min", (None, None, 0.0))[2] or 0.0)
@@ -1921,11 +2327,30 @@ def run(args: argparse.Namespace) -> int:
                                         )
                                         vla_planner_state["grasp_goal_b"] = grasp_goal_b
 
+                                        # High-signal per-plan debug (shapes + key goals).
+                                        try:
+                                            leaf = str(target_prim).split("/")[-1]
+                                            print(
+                                                f"[VLA_V1][PLAN] target={leaf} "
+                                                f"pos_b=({gx:.3f},{gy:.3f},{gz:.3f}) ee_z_offset={ee_z_offset:.3f} "
+                                                f"grasp_depth_eff={float(grasp_depth_eff):.3f} "
+                                                f"grasp_goal_b=({float(grasp_goal_b[0]):.3f},{float(grasp_goal_b[1]):.3f},{float(grasp_goal_b[2]):.3f})"
+                                            )
+                                        except Exception:
+                                            pass
+
                                         # Provide cuRobo with a proper start_state (required by some MotionGen builds).
                                         try:
                                             if hasattr(planner, "set_start_state") and _arm_joint_ids is not None and len(_arm_joint_ids) > 0:
                                                 q = robot.data.joint_pos[0, _arm_joint_ids].detach().to("cpu").tolist()
                                                 planner.set_start_state(joint_pos=[float(v) for v in q], joint_names=_arm_joint_names)
+                                                try:
+                                                    print(
+                                                        f"[VLA_V1][CUROBO] start_state n={len(q)} "
+                                                        f"names_n={len(_arm_joint_names)} q0={float(q[0]):.3f} q_last={float(q[-1]):.3f}"
+                                                    )
+                                                except Exception:
+                                                    pass
                                         except Exception:
                                             pass
 
@@ -1954,16 +2379,41 @@ def run(args: argparse.Namespace) -> int:
                                                 "action": "PLAN_TO_PREGRASP",
                                                 "planner": str(getattr(args, "planner", "curobo_v2")),
                                                 "target_prim": str(target_prim),
+                                                "approach_trajectory": str(getattr(args, "approach_trajectory", "auto")),
                                                 "episode_idx": int(ep),
                                             },
                                         )
-                                        waypoints = planner.plan_to_pose_b(
-                                            target_pos_b=(gx, gy, gz_ee),
-                                            target_quat_b_wxyz=None if bool(getattr(args, "ignore_grasp_orientation", True)) else quat_b,
-                                            pregrasp_offset_m=float(getattr(args, "pregrasp", 0.10)),
-                                            grasp_depth_m=float(grasp_depth_eff),
-                                            lift_height_m=float(getattr(args, "lift", 0.15)),
-                                        )
+                                        # Choose the path source.
+                                        traj_mode = str(getattr(args, "approach_trajectory", "auto"))
+                                        if traj_mode == "auto":
+                                            traj_mode = "straight" if str(getattr(args, "spawn_mode", "usd")) == "box" else "curobo"
+                                        if traj_mode == "straight":
+                                            waypoints = planner.plan_waypoints_b(
+                                                target_pos_b=(gx, gy, gz_ee),
+                                                pregrasp_offset_m=float(getattr(args, "pregrasp", 0.10)),
+                                                grasp_depth_m=float(grasp_depth_eff),
+                                                lift_height_m=float(getattr(args, "lift", 0.15)),
+                                            )
+                                        else:
+                                            waypoints = planner.plan_to_pose_b(
+                                                target_pos_b=(gx, gy, gz_ee),
+                                                target_quat_b_wxyz=None
+                                                if bool(getattr(args, "ignore_grasp_orientation", False))
+                                                else quat_b,
+                                                pregrasp_offset_m=float(getattr(args, "pregrasp", 0.10)),
+                                                grasp_depth_m=float(grasp_depth_eff),
+                                                lift_height_m=float(getattr(args, "lift", 0.15)),
+                                            )
+                                        try:
+                                            # Sanity log: list length + first/last waypoint values.
+                                            wp0 = waypoints[0] if len(waypoints) > 0 else None
+                                            wpn = waypoints[-1] if len(waypoints) > 0 else None
+                                            print(
+                                                f"[VLA_V1][PLAN] waypoints_n={len(waypoints)} "
+                                                f"first={wp0} last={wpn} traj_mode={traj_mode}"
+                                            )
+                                        except Exception:
+                                            pass
                                         vla_planner_state["last_plan_step"] = int(steps)
                                         session_logger.log_event(
                                             "action_end",
@@ -2254,9 +2704,25 @@ def run(args: argparse.Namespace) -> int:
                                             pass
                                         vla_planner_state["stage"] = "approach"
                                     else:
-                                        vla_planner_state["stage"] = "close"
-                                        vla_planner_state["close_queued"] = False
-                                        vla_planner_state["close_left"] = int(getattr(args, "gripper_close_steps", 60))
+                                        pre_hold = int(getattr(args, "pre_close_hold_steps", 0))
+                                        if pre_hold > 0:
+                                            vla_planner_state["stage"] = "pre_close_hold"
+                                            vla_planner_state["pre_close_hold_left"] = int(pre_hold)
+                                        else:
+                                            vla_planner_state["stage"] = "close"
+                                            vla_planner_state["close_queued"] = False
+                                            vla_planner_state["close_left"] = int(getattr(args, "gripper_close_steps", 60))
+
+                            if str(vla_planner_state.get("stage", "")) == "pre_close_hold":
+                                # Hold briefly before closing to reduce visible oscillation/jitter at the goal.
+                                controller.set_mode("translate")
+                                left = int(vla_planner_state.get("pre_close_hold_left", 0))
+                                if left > 0:
+                                    vla_planner_state["pre_close_hold_left"] = left - 1
+                                else:
+                                    vla_planner_state["stage"] = "close"
+                                    vla_planner_state["close_queued"] = False
+                                    vla_planner_state["close_left"] = int(getattr(args, "gripper_close_steps", 60))
 
                             if str(vla_planner_state.get("stage", "")) == "close":
                                 close_left = int(vla_planner_state.get("close_left", 0))

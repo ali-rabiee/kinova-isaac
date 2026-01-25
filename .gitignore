@@ -213,5 +213,8 @@ __marimo__/
 # Keep processor/state safetensors tracked; ignore only the heavyweight model weights.
 grasp-vla/models/**/model.safetensors
 
+# BRACE artifacts (local-only)
+grasp-vla/BRACE/
+
 # python cache
 __pycache__/

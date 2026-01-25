@@ -740,7 +740,15 @@ class ObjectLoader:
                             min_torsional_patch_radius=self.cfg.min_torsional_patch_radius,
                         ),
                     )
-                    obj_cfg.func(prim_path, obj_cfg, translation=pos, orientation=orientation)
+                    # IMPORTANT: Cuboid prim translation is its center. If we're snapping Z to the table surface,
+                    # we must add half the box height so the box rests *on* the table (not half-submerged).
+                    spawn_pos = pos
+                    try:
+                        if self.cfg.snap_z_to is not None:
+                            spawn_pos = (float(pos[0]), float(pos[1]), float(pos[2]) + 0.5 * float(sz))
+                    except Exception:
+                        spawn_pos = pos
+                    obj_cfg.func(prim_path, obj_cfg, translation=spawn_pos, orientation=orientation)
                     label = "box"
 
                     # Bind friction material manually since we don't call _ensure_object_physics
