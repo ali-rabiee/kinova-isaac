@@ -216,6 +216,51 @@ def _stage_label(stage_raw: str) -> str:
 
 
 def run(args: argparse.Namespace) -> int:
+    # ------------------------------------------------------------
+    # Kit/RTX stability overrides (applied BEFORE AppLauncher re-exec)
+    # ------------------------------------------------------------
+    #
+    # Some hybrid-GPU laptop setups (e.g., NVIDIA + Intel Arc) can become unstable during early RTX
+    # PSO/shader compilation when multi-GPU is enabled by the default IsaacLab rendering experience.
+    # When that happens, the process may get SIGKILL'ed (often looks like an IsaacSim "crash" with only
+    # "Killed" printed in the terminal).
+    #
+    # These settings are safe for data collection (we don't need multi-GPU) and can be overridden by
+    # advanced users by editing their IsaacLab/Kit configs.
+    # NOTE: `data_collection.collect_data` now supports a global `--kit-safe-mode` and
+    # `--kit-thread-count` that apply to all profiles. We keep a small fallback here so
+    # running this profile directly still works, but we avoid overriding user/global choices.
+    kit_safe_mode = bool(getattr(args, "kit_safe_mode", True))
+    kit_thread_count = int(getattr(args, "kit_thread_count", 8) or 8)
+    kit_thread_count = max(1, min(kit_thread_count, 64))
+
+    def _append_kit_setting_if_missing(key_prefix: str, value: str) -> None:
+        try:
+            for a in sys.argv:
+                if str(a).startswith(key_prefix):
+                    return
+            sys.argv.append(f"{key_prefix}{value}")
+        except Exception:
+            pass
+
+    if kit_safe_mode:
+        # Force multi-GPU off (common crash trigger on hybrid GPU systems).
+        #
+        # IMPORTANT: do this through SimulationApp config (multi_gpu=False) *and* keep the Kit
+        # setting override as a backstop (in case the experience file sets it).
+        try:
+            setattr(args, "multi_gpu", False)
+        except Exception:
+            pass
+        _append_kit_setting_if_missing("--/renderer/multiGpu/enabled=", "False")
+
+        # Reduce Kit thread pools to lower peak memory pressure during shader compilation.
+        _append_kit_setting_if_missing("--/plugins/carb.tasking.plugin/threadCount=", str(kit_thread_count))
+        _append_kit_setting_if_missing("--/plugins/omni.tbb.globalcontrol/maxThreadCount=", str(kit_thread_count))
+
+        # RTX: disable internal multi-threading defaults if present (can reduce stalls on some systems).
+        _append_kit_setting_if_missing("--/rtx-defaults/multiThreading/enabled=", "False")
+
     # Ensure kinova-isaac root is first on sys.path (Kit may mutate sys.path).
     from pathlib import Path as _Path
 
