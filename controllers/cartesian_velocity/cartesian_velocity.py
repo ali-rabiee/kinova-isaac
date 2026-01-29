@@ -80,6 +80,11 @@ class CartesianVelocityJogController(ArmController):
         self.gripper = GripperController(_gc, num_envs, str(self.device))
         self._cmd_builder = MotionCommandBuilder(device=str(self.device))
         self.motion = MotionPrimitives(self._cmd_builder, self)
+        # Lightweight command taps for logging/debugging (shared autonomy datasets).
+        # These store the most recent command (padded/truncated to 7D) before safety, and the
+        # equivalent command after safety projections/clamps applied inside the controller.
+        self.last_cmd_pre_safety: Optional[torch.Tensor] = None
+        self.last_cmd_post_safety: Optional[torch.Tensor] = None
 
     def set_mode(self, mode: Literal["translate", "rotate", "gripper"]) -> None:
         if self._mode != mode:
@@ -122,6 +127,8 @@ class CartesianVelocityJogController(ArmController):
         )
         self._ee_quat_hold_b = ee_quat_b.clone()
         self._ee_quat_last_safe_b = ee_quat_b.clone()
+        self.last_cmd_pre_safety = None
+        self.last_cmd_post_safety = None
 
     def step(self, robot, dt: float) -> None:
         assert self._diff_ik is not None, "Controller not reset()"
@@ -147,6 +154,18 @@ class CartesianVelocityJogController(ArmController):
         g_val: Optional[torch.Tensor] = None
         if cmd.shape[-1] >= 7:
             g_val = cmd[..., 6]
+
+        # Record "pre-safety" command (normalized to 7D for consistent logging).
+        try:
+            cmd_pre7 = cmd
+            if cmd_pre7.shape[-1] < 7:
+                pad7 = torch.zeros(cmd_pre7.shape[0], 7 - cmd_pre7.shape[-1], device=cmd_pre7.device, dtype=cmd_pre7.dtype)
+                cmd_pre7 = torch.cat([cmd_pre7, pad7], dim=-1)
+            elif cmd_pre7.shape[-1] > 7:
+                cmd_pre7 = cmd_pre7[..., :7]
+            self.last_cmd_pre_safety = cmd_pre7.detach()
+        except Exception:
+            self.last_cmd_pre_safety = None
 
         # State
         jac = robot.root_physx_view.get_jacobians()[:, self._ee_jacobi_idx, :, self._arm_joint_ids]
@@ -196,6 +215,19 @@ class CartesianVelocityJogController(ArmController):
         else:  # gripper
             pos_des = self.safety.clamp_position(ee_pos_b)
             quat_des = ee_quat_b
+
+        # Record "post-safety" command as the incremental delta actually sent to IK (7D).
+        try:
+            cmd_post7 = torch.zeros(cmd.shape[0], 7, device=cmd.device, dtype=cmd.dtype)
+            cmd_post7[..., 0:3] = (pos_des - ee_pos_b)
+            if self._mode == "rotate":
+                cmd_post7[..., 3:6] = drot_safe
+            # Gripper is not safety-clamped (by design); carry it through if provided.
+            if g_val is not None:
+                cmd_post7[..., 6] = g_val
+            self.last_cmd_post_safety = cmd_post7.detach()
+        except Exception:
+            self.last_cmd_post_safety = None
 
         # Feed IK
         self._diff_ik.ee_pos_des[:] = pos_des

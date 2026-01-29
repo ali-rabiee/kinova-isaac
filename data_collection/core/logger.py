@@ -143,6 +143,8 @@ class SessionLogWriter:
         last_user_cmd: Optional[torch.Tensor],
         cfg: TickLoggingConfig,
         image_path: Optional[str] = None,
+        shared_autonomy: Optional[Dict[str, Any]] = None,
+        task: Optional[Dict[str, Any]] = None,
     ) -> None:
         now_ms = int(time.time() * 1000)
         self._resolve_robot_indices(robot, cfg.ee_link_name, cfg.arm_joint_regex)
@@ -418,6 +420,12 @@ class SessionLogWriter:
         # Add image path if provided
         if image_path is not None:
             record["image"] = {"path": image_path}
+
+        # Optional shared-autonomy extensions (kept out of the base schema for backward compatibility).
+        if shared_autonomy is not None:
+            record["shared_autonomy"] = shared_autonomy
+        if task is not None:
+            record["task"] = task
 
         self.ticks_f.write(json.dumps(_format_numbers(record, ndigits=4)) + "\n")
         self.tick_idx += 1
