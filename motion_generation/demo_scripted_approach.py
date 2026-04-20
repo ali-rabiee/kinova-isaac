@@ -40,7 +40,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     # Scene / objects
     parser.add_argument("--num-objects", type=int, default=3, help="Number of uniform cubes to visit.")
-    parser.add_argument("--box-size", type=float, default=0.09, help="Cube side length (m). Bigger = easier to grasp and see.")
+    parser.add_argument("--box-size", type=float, default=0.08, help="Cube side length (m). Bigger = easier to grasp and see.")
     parser.add_argument("--spawn-min", type=float, nargs=3, default=[0.30, -0.30, 0.90], metavar=("X", "Y", "Z"))
     parser.add_argument("--spawn-max", type=float, nargs=3, default=[0.55, 0.30, 0.95], metavar=("X", "Y", "Z"))
     parser.add_argument("--min-distance", type=float, default=0.22, help="Min pairwise distance between cubes (m).")
@@ -77,7 +77,13 @@ def _parse_args() -> argparse.Namespace:
                         default=".*_joint_finger_.*|.*_joint_finger_tip_.*")
     parser.add_argument("--gripper-open-pos", type=float, default=0.0)
     parser.add_argument("--gripper-close-pos", type=float, default=1.2)
-    parser.add_argument("--seed", type=int, default=0)
+    # Yaw alignment to the cube's OBB (keeps palm-down, only rotates around base Z).
+    parser.add_argument("--align-to-obb", dest="align_to_obb", action="store_true", default=True,
+                        help="(default) Rotate the gripper around base Z during APPROACH to align with the cube's OBB yaw.")
+    parser.add_argument("--no-align-to-obb", dest="align_to_obb", action="store_false",
+                        help="Disable OBB yaw alignment. Gripper yaw stays at the home-pose value.")
+    parser.add_argument("--seed", type=int, default=-1,
+                        help="RNG seed for spawn positions/yaws. Use a non-negative int for a reproducible layout; the default (-1) picks a fresh layout every run.")
     # AppLauncher args (headless, device, enable_cameras, etc.)
     from isaaclab.app import AppLauncher
 
@@ -115,28 +121,88 @@ def main() -> int:
     DEFAULT_CAMERA = getattr(env_cfg_mod, "DEFAULT_CAMERA", None)
     design_scene = getattr(env_utils_mod, "design_scene")
 
-    random.seed(int(args.seed))
+    # Only seed when a non-negative value is provided; otherwise let every run differ.
+    if int(args.seed) >= 0:
+        random.seed(int(args.seed))
+        print(f"[DEMO] RNG seeded with --seed {int(args.seed)} (reproducible layout).")
+    else:
+        print("[DEMO] RNG not seeded (layout is random each run; pass --seed <int> to reproduce).")
 
     # ------------------------------------------------------------------
-    # Easing helper (quintic / min-jerk: zero vel+acc at endpoints).
+    # Easing + quaternion helpers (wxyz convention everywhere).
     # ------------------------------------------------------------------
     def _quintic(s: float) -> float:
         s = max(0.0, min(1.0, float(s)))
         return 10.0 * s**3 - 15.0 * s**4 + 6.0 * s**5
 
-    class _MoveSegment:
-        """Quintic-eased position segment with fixed orientation.
+    def _quat_mul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+        """Hamilton product of two (..., 4) wxyz quaternions."""
+        w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
+        w2, x2, y2, z2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
+        return torch.stack(
+            [
+                w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            ],
+            dim=-1,
+        )
 
-        Tracks an absolute EE pose target that eases from ``p0`` to ``p1`` over
-        ``min_duration_s``. After ``min_duration_s`` the target stays pinned to
-        ``p1`` so the controller can continue driving until convergence.
+    def _yaw_quat(yaw_rad: float, *, device, dtype=torch.float32) -> torch.Tensor:
+        """Unit quaternion for a pure rotation about +Z by ``yaw_rad`` (wxyz)."""
+        half = 0.5 * float(yaw_rad)
+        return torch.tensor([math.cos(half), 0.0, 0.0, math.sin(half)], device=device, dtype=dtype)
+
+    def _quat_to_yaw(q: torch.Tensor) -> float:
+        """Extract yaw (rotation about world/base Z) from a wxyz quaternion."""
+        w, x, y, z = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+        return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+    def _wrap_quarter_pi(a: float) -> float:
+        """Wrap angle to [-pi/4, pi/4] using pi/2 symmetry (square cube = 4-fold symmetric).
+
+        Keeps the gripper's rotation to at most 45 deg to align, because for a square
+        cube rotations by multiples of pi/2 yield an equivalent grasp footprint."""
+        a = (a + math.pi / 4.0) % (math.pi / 2.0) - math.pi / 4.0
+        return a
+
+    def _slerp(q0: torch.Tensor, q1: torch.Tensor, t: float) -> torch.Tensor:
+        """Spherical linear interpolation between two wxyz unit quaternions."""
+        q0 = q0 / (q0.norm() + 1e-12)
+        q1 = q1 / (q1.norm() + 1e-12)
+        dot = float(torch.dot(q0, q1))
+        if dot < 0.0:  # always take the short arc
+            q1 = -q1
+            dot = -dot
+        if dot > 0.9995:  # nearly identical -> linear + renormalise
+            out = (1.0 - t) * q0 + t * q1
+            return out / (out.norm() + 1e-12)
+        theta_0 = math.acos(max(-1.0, min(1.0, dot)))
+        sin_theta_0 = math.sin(theta_0)
+        theta = theta_0 * t
+        s0 = math.cos(theta) - dot * math.sin(theta) / sin_theta_0
+        s1 = math.sin(theta) / sin_theta_0
+        return s0 * q0 + s1 * q1
+
+    class _MoveSegment:
+        """Quintic-eased absolute pose segment.
+
+        Position eases from ``p0`` to ``p1`` and orientation SLERPs from ``q0``
+        to ``q1`` using the same quintic factor. If ``q0 == q1`` the SLERP is a
+        no-op and the orientation stays constant (used for descend/lift).
+
+        After ``min_duration_s`` the target stays pinned to ``(p1, q1)`` so the
+        outer loop can continue driving until convergence.
         """
 
-        def __init__(self, p0: torch.Tensor, p1: torch.Tensor, q_fixed: torch.Tensor,
+        def __init__(self, p0: torch.Tensor, p1: torch.Tensor,
+                     q0: torch.Tensor, q1: torch.Tensor,
                      min_duration_s: float, max_duration_s: float) -> None:
             self.p0 = p0.clone()
             self.p1 = p1.clone()
-            self.q_fixed = q_fixed.clone()
+            self.q0 = q0.clone()
+            self.q1 = q1.clone()
             self.min_duration_s = max(1e-3, float(min_duration_s))
             self.max_duration_s = max(self.min_duration_s, float(max_duration_s))
             self.t_elapsed = 0.0
@@ -148,7 +214,8 @@ def main() -> int:
             s = self.t_elapsed / self.min_duration_s
             se = _quintic(s)
             p_t = self.p0 + se * (self.p1 - self.p0)
-            return p_t, self.q_fixed
+            q_t = _slerp(self.q0, self.q1, se)
+            return p_t, q_t
 
         @property
         def timed_out(self) -> bool:
@@ -246,6 +313,41 @@ def main() -> int:
     grasp_provider = ObbGraspPoseProvider(align_to_min_width=False)
 
     # ------------------------------------------------------------------
+    # Direct USD yaw reader.
+    # The existing ObbGraspPoseProvider uses UsdGeom.BBoxCache.ComputeWorldBound,
+    # which for USD shape prims (Cuboid/Sphere/etc.) returns a world-AABB-style
+    # GfBBox3d whose matrix is effectively identity. That silently strips the
+    # cube's yaw, and the provider returns yaw=0 no matter how the cube was
+    # spawned. For this demo we just read the prim's world transform directly
+    # and take its yaw about +Z, which is what we actually want to align to.
+    # ------------------------------------------------------------------
+    import importlib as _importlib_for_yaw
+    _pxr_usd = _importlib_for_yaw.import_module("pxr.Usd")
+    _pxr_usdgeom = _importlib_for_yaw.import_module("pxr.UsdGeom")
+    _omni_usd = _importlib_for_yaw.import_module("omni.usd")
+    _usd_stage = _omni_usd.get_context().get_stage()
+
+    def _read_prim_world_yaw_rad(prim_path: str) -> float | None:
+        """Yaw (rotation about world +Z) of a prim's world transform, in radians.
+
+        Returns None if the prim cannot be read.
+        """
+        try:
+            prim = _usd_stage.GetPrimAtPath(str(prim_path))
+            if not prim.IsValid():
+                return None
+            xformable = _pxr_usdgeom.Xformable(prim)
+            M = xformable.ComputeLocalToWorldTransform(_pxr_usd.TimeCode.Default())
+            # USD uses row-vector post-multiplication: v_world = v_local * M
+            # -> local +X ends up at world = (M[0][0], M[0][1], M[0][2])
+            m00 = float(M[0][0])
+            m01 = float(M[0][1])
+            return math.atan2(m01, m00)
+        except Exception as e:
+            print(f"[DEMO][WARN] could not read world yaw for {prim_path}: {e}")
+            return None
+
+    # ------------------------------------------------------------------
     # Helpers.
     # ------------------------------------------------------------------
     def _read_ee_pose_b() -> tuple[torch.Tensor, torch.Tensor]:
@@ -300,18 +402,24 @@ def main() -> int:
         ee_pos_b, _ = _read_ee_pose_b()
         return float((ee_pos_b - goal_b).norm())
 
-    def _run_segment(label: str, goal_pos_b: torch.Tensor, q_fixed_b: torch.Tensor, dt: float) -> tuple[bool, float]:
-        """Drive the EE to ``goal_pos_b`` with fixed orientation ``q_fixed_b``.
+    def _run_segment(label: str, goal_pos_b: torch.Tensor, q_end_b: torch.Tensor,
+                     dt: float, q_start_b: torch.Tensor | None = None) -> tuple[bool, float]:
+        """Drive the EE to ``goal_pos_b`` with orientation SLERPing from ``q_start_b`` to ``q_end_b``.
+
+        If ``q_start_b`` is None we default to the current EE orientation (so a pose segment
+        with only ``q_end_b`` specified behaves like "rotate in place toward q_end_b").
+        Pass ``q_start_b == q_end_b`` for pure-XYZ motion with no rotation.
 
         Uses quintic easing for at least ``min_duration_s`` (distance-proportional),
         then keeps driving until convergence or ``max_duration_s`` timeout.
         Returns (converged, final_err_m).
         """
-        p0, _ = _read_ee_pose_b()
+        p0, q0_measured = _read_ee_pose_b()
+        q_start_b = q0_measured if q_start_b is None else q_start_b
         dist = float((goal_pos_b - p0).norm())
         min_dur = max(float(args.min_segment_s), dist / max(1e-6, float(args.cruise_mps)))
         max_dur = max(min_dur + 0.5, float(args.max_segment_s))
-        seg = _MoveSegment(p0=p0, p1=goal_pos_b, q_fixed=q_fixed_b,
+        seg = _MoveSegment(p0=p0, p1=goal_pos_b, q0=q_start_b, q1=q_end_b,
                            min_duration_s=min_dur, max_duration_s=max_dur)
         pos_tol = float(args.converge_pos_tol_m)
 
@@ -373,7 +481,11 @@ def main() -> int:
         f"[DEMO] Home EE pose (base frame): pos={[round(float(v),4) for v in ee_pos_b_home.tolist()]} "
         f"quat_wxyz={[round(float(v),4) for v in q_home_b.tolist()]}"
     )
-    print(f"[DEMO] All EE targets will use this fixed (palm-down) orientation. XYZ-only motion.")
+    if bool(getattr(args, "align_to_obb", True)):
+        print("[DEMO] Yaw alignment: ON  (gripper rotates around base Z during APPROACH to match cube OBB yaw,")
+        print("[DEMO]                    wrapped to [-pi/4, +pi/4] for 4-fold cube symmetry).")
+    else:
+        print("[DEMO] Yaw alignment: OFF (--no-align-to-obb).")
     print(f"[DEMO] Spawned {len(spawned_paths)} cubes. Full pick sequence for each.")
     print("[DEMO] " + "=" * 74)
 
@@ -384,9 +496,9 @@ def main() -> int:
         if not simulation_app.is_running():
             break
 
-        # 1. Compute cube top center in base frame (we ignore OBB quaternion).
+        # 1. Compute cube top center in base frame + OBB yaw (world Z rotation).
         try:
-            grasp_pos_w, _ = grasp_provider.get_grasp_pose_w(
+            grasp_pos_w, grasp_quat_w = grasp_provider.get_grasp_pose_w(
                 object_prim_path=str(prim_path), robot_prim_path=None
             )
         except Exception as e:
@@ -403,58 +515,90 @@ def main() -> int:
         lift_b = top_b.clone()
         lift_b[2] = top_b[2] + ee_off + float(args.lift_offset_m)
 
+        # 1b. Yaw alignment.
+        # Robot base is gravity-aligned, so world yaw == base yaw. We wrap the
+        # delta from the CURRENT EE yaw to the cube's world yaw into [-pi/4, pi/4]
+        # so a square cube only ever needs <=45 deg of rotation to align.
+        #
+        # IMPORTANT: We read the cube's yaw DIRECTLY from its USD xform, not via
+        # ObbGraspPoseProvider, because for USD shape prims the OBB provider's
+        # bbox-cache path strips the cube's rotation and always returns 0 deg.
+        ee_pos_b_cur, ee_quat_b_cur = _read_ee_pose_b()
+        current_yaw = _quat_to_yaw(ee_quat_b_cur)
+        cube_yaw_w = _read_prim_world_yaw_rad(str(prim_path))
+        if bool(getattr(args, "align_to_obb", True)) and cube_yaw_w is not None:
+            delta_yaw = _wrap_quarter_pi(cube_yaw_w - current_yaw)
+            q_delta = _yaw_quat(delta_yaw, device=sim.device)
+            q_aligned_b = _quat_mul(q_delta, ee_quat_b_cur)
+            aligned_yaw = _quat_to_yaw(q_aligned_b)
+            yaw_log = (f"  cube_yaw_w={math.degrees(cube_yaw_w):+7.2f} deg,"
+                       f" current_yaw={math.degrees(current_yaw):+7.2f} deg,"
+                       f" delta={math.degrees(delta_yaw):+6.2f} deg,"
+                       f" target_yaw={math.degrees(aligned_yaw):+7.2f} deg")
+        else:
+            q_aligned_b = ee_quat_b_cur.clone()  # keep current orientation
+            if cube_yaw_w is None and bool(getattr(args, "align_to_obb", True)):
+                yaw_log = "  (cube yaw unavailable -- keeping current EE orientation)"
+            else:
+                yaw_log = "  (yaw alignment disabled via --no-align-to-obb)"
+
         print(
             f"[DEMO] cube {idx+1}/{len(spawned_paths)}: prim={prim_path}\n"
             f"       top_b      =({float(top_b[0]):+.3f},{float(top_b[1]):+.3f},{float(top_b[2]):+.3f}) m\n"
             f"       pregrasp_b =({float(pregrasp_b[0]):+.3f},{float(pregrasp_b[1]):+.3f},{float(pregrasp_b[2]):+.3f}) m  (top + ee_off + {args.pregrasp_offset_m:+.3f})\n"
             f"       grasp_b    =({float(grasp_b[0]):+.3f},{float(grasp_b[1]):+.3f},{float(grasp_b[2]):+.3f}) m  (top + ee_off + {args.grasp_depth_m:+.3f})\n"
-            f"       lift_b     =({float(lift_b[0]):+.3f},{float(lift_b[1]):+.3f},{float(lift_b[2]):+.3f}) m  (top + ee_off + {args.lift_offset_m:+.3f})"
+            f"       lift_b     =({float(lift_b[0]):+.3f},{float(lift_b[1]):+.3f},{float(lift_b[2]):+.3f}) m  (top + ee_off + {args.lift_offset_m:+.3f})\n"
+            f"       yaw: {yaw_log}"
         )
 
-        # 2. Approach pregrasp (above cube, palm-down home quat).
-        _run_segment("APPROACH_PREGRASP", pregrasp_b, q_home_b, dt)
+        # 2. Approach pregrasp -- SLERPs yaw from current to aligned while moving XY+Z.
+        _run_segment("APPROACH_PREGRASP", pregrasp_b, q_aligned_b, dt, q_start_b=ee_quat_b_cur)
 
-        # 3. Descend to grasp position.
+        # 3. Descend to grasp position (yaw FIXED at q_aligned_b, no rotation).
         #    Note: convergence is best-effort. If the fingers contact the cube/table before the EE
         #    target is reached, the segment will time out with a non-zero error. That is OK --
         #    the arm is at the cube. The pre-close settle below then lets the contact stabilize
         #    so the gripper closes ON the cube, not in mid-air.
-        _run_segment("DESCEND_TO_GRASP", grasp_b, q_home_b, dt)
+        _run_segment("DESCEND_TO_GRASP", grasp_b, q_aligned_b, dt, q_start_b=q_aligned_b)
 
         # 4. Settle at the grasp target so any finger-cube contact stabilizes before we close.
-        _hold_at(grasp_b, q_home_b, float(args.pre_close_settle_s), dt)
-        ee_pos_b_now, _ = _read_ee_pose_b()
+        _hold_at(grasp_b, q_aligned_b, float(args.pre_close_settle_s), dt)
+        ee_pos_b_now, ee_quat_b_now = _read_ee_pose_b()
         dx, dy, dz = (
             float(ee_pos_b_now[0] - grasp_b[0]) * 1000.0,
             float(ee_pos_b_now[1] - grasp_b[1]) * 1000.0,
             float(ee_pos_b_now[2] - grasp_b[2]) * 1000.0,
         )
+        yaw_err_deg = math.degrees(_quat_to_yaw(ee_quat_b_now) - _quat_to_yaw(q_aligned_b))
         print(
             f"[DEMO]   PRE_CLOSE_SETTLE      held {args.pre_close_settle_s:.2f}s  "
-            f"ee-vs-grasp: dx={dx:+.1f} dy={dy:+.1f} dz={dz:+.1f} mm  -> closing gripper NOW"
+            f"ee-vs-grasp: dx={dx:+.1f} dy={dy:+.1f} dz={dz:+.1f} mm  "
+            f"yaw_err={yaw_err_deg:+.2f} deg  -> closing gripper NOW"
         )
 
-        # 5. Close the gripper while holding the grasp target.
+        # 5. Close the gripper while holding the grasp target (yaw fixed).
         try:
             gripper.command_close(robot)
         except Exception:
             pass
-        _hold_at(grasp_b, q_home_b, float(args.gripper_close_s), dt)
+        _hold_at(grasp_b, q_aligned_b, float(args.gripper_close_s), dt)
         print(f"[DEMO]   GRIPPER_CLOSE          held {args.gripper_close_s:.2f}s")
 
-        # 6. Lift (gripper stays closed).
-        _run_segment("LIFT", lift_b, q_home_b, dt)
+        # 6. Lift (gripper stays closed, yaw stays at aligned).
+        _run_segment("LIFT", lift_b, q_aligned_b, dt, q_start_b=q_aligned_b)
 
         # 7. Release the gripper above the cube (drops it back roughly in place).
         try:
             gripper.command_open(robot)
         except Exception:
             pass
-        _hold_at(lift_b, q_home_b, float(args.gripper_open_s), dt)
+        _hold_at(lift_b, q_aligned_b, float(args.gripper_open_s), dt)
         print(f"[DEMO]   GRIPPER_OPEN           held {args.gripper_open_s:.2f}s")
 
-        # 8. Short hold at lift height before heading to the next cube (keeps motion clean).
-        _hold_at(lift_b, q_home_b, 0.2, dt)
+        # 8. Short hold at lift height before heading to the next cube.
+        #    The NEXT APPROACH_PREGRASP will read the current EE quat as its start and
+        #    SLERP toward the next cube's aligned yaw.
+        _hold_at(lift_b, q_aligned_b, 0.2, dt)
 
         print("[DEMO] " + "-" * 74)
 
