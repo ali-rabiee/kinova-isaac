@@ -111,7 +111,7 @@ def main() -> int:
     from isaaclab.utils.math import subtract_frame_transforms, quat_conjugate, quat_apply
 
     from environments.utils.object_loader import ObjectLoader, ObjectLoaderConfig, SpawnBounds
-    from environments.utils.physix import PhysicsConfig, apply_to_simulation_cfg
+    from environments.utils.physix import PhysicsConfig, apply_to_simulation_cfg, object_loader_kwargs_from_physix
     from motion_generation.grasp_estimation.obb import ObbGraspPoseProvider
     from kinova import GripperConfig, GripperController
 
@@ -248,6 +248,7 @@ def main() -> int:
         box_size_max=(float(args.box_size), float(args.box_size), float(args.box_size)),
         box_color_palette=[(0.9, 0.2, 0.2), (0.2, 0.4, 0.9), (0.2, 0.9, 0.3), (0.9, 0.8, 0.2), (0.7, 0.3, 0.8)],
         box_color_names=["red", "blue", "green", "yellow", "purple"],
+        **object_loader_kwargs_from_physix(phys),
     )
     loader = ObjectLoader(loader_cfg)
     spawned_paths = loader.spawn(parent_prim_path="/World/Origin1", num_objects=int(args.num_objects))
