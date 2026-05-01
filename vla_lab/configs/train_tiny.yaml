@@ -1,0 +1,59 @@
+# Training config for TinyVLA on `data_collection.collect_data` outputs.
+# This is the recommended starting point for the CoRL VLA-TTC pipeline.
+
+# Where the collect_data sessions live. You can list multiple roots if you
+# collect across several runs - they will all be merged.
+data:
+  data_roots:
+    - logs/data_collection
+  image_size: 224
+  chunk_len: 8
+  state_dim: 4
+  action_dim: 7
+  drop_no_image: true
+  val_fraction: 0.1
+  split_seed: 0
+  # If non-null, normalize the 6 continuous action dims (delta pose) by
+  # mean/std computed from the training set. Recommended.
+  normalize_actions: true
+
+model:
+  image_size: 224
+  embed_dim: 192
+  vis_channels: [32, 64, 128, 192]
+  vis_strides: [2, 2, 2, 2]
+  lang_layers: 2
+  lang_heads: 4
+  decoder_layers: 2
+  decoder_heads: 4
+  state_dim: 4
+  chunk_len: 8
+  action_dim: 7
+  max_lang_len: 24
+  dropout: 0.05
+  # Set >0 to inject Gaussian noise at the bottleneck during training.
+  # 0.05 is a sane default that lightly regularizes and makes K-sampling at
+  # inference produce diverse candidates.
+  noise_std: 0.05
+
+train:
+  device: cuda
+  num_epochs: 30
+  batch_size: 32
+  num_workers: 4
+  lr: 3.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  warmup_steps: 200
+  log_every: 50
+  ckpt_every_epochs: 5
+  out_dir: vla_lab/checkpoints/tiny_v0
+  seed: 42
+  # Loss weights
+  gripper_weight: 2.0     # up-weight discrete gripper column in MSE
+  feature_alignment:
+    enabled: false        # set true to turn on DINOv2 alignment (needs `transformers`)
+    teacher_name: facebook/dinov2-base
+    teacher_dim: 768
+    pool_to_tokens: 64
+    weight: 0.5

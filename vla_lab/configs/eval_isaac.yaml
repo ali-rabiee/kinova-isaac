@@ -1,0 +1,34 @@
+# Evaluation config for running a trained TinyVLA inside Isaac Lab using
+# the existing `environments/reach_to_grasp_VLA` scene.
+
+ckpt: vla_lab/checkpoints/tiny_v0/last.pt
+
+eval:
+  num_episodes: 10
+  max_steps_per_episode: 4000
+  policy_rate_hz: 5
+  device: cuda:0
+  # Spawn settings (mirrors `vla_v1` defaults so eval matches collection).
+  num_objects: 3
+  spawn_mode: box       # 'usd' for YCB, 'box' for uniform cubes (recommended for eval)
+  box_size: 0.08
+  spawn_min: [0.28, -0.30, 0.90]
+  spawn_max: [0.55, 0.30, 1.05]
+  min_distance: 0.20
+  ee_link: j2n6s300_end_effector
+  workspace_min_z: 0.0
+  workspace_max_z: 1.20
+  # Receding-horizon execution: only consume this many actions of each
+  # predicted chunk before re-querying the model. 1 = pure receding.
+  chunk_consume: 1
+  # Success criterion: lift Z increase (m).
+  lift_success_min_dz_m: 0.06
+  out_dir: vla_lab/eval_results/tiny_v0
+  # Stable per-episode language template selection (matches vla_v1).
+  language_seed: 1337
+
+ttc:
+  k_action_samples: 1   # 1 = no TTC; bump to 4 for K-sample + consensus
+  noise_std: 0.1
+  scoring: consensus    # {"consensus", "first"}
+  log_jsonl: null       # set to a path to log per-step decisions
