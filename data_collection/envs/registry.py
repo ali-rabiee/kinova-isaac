@@ -15,7 +15,6 @@ class EnvSpec:
 def get_envs() -> Dict[str, EnvSpec]:
     # Add new environments here.
     envs = [
-        EnvSpec(name="blocks", module_base="environments.blocks"),
         EnvSpec(name="reach_to_grasp", module_base="environments.reach_to_grasp"),
         EnvSpec(name="reach_to_grasp_VLA", module_base="environments.reach_to_grasp_VLA"),
     ]

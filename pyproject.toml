@@ -22,7 +22,6 @@ packages = [
   "data_collection.profiles",
   "data_collection.samplers",
   "environments",
-  "environments.blocks",
   "environments.reach_to_grasp",
   "environments.reach_to_grasp_VLA",
   "kinova",
