@@ -14,6 +14,10 @@ This is intentionally close to ``motion_generation/demo_scripted_approach.py``:
 Run with a GUI:
     python DEMOS/block_stacking/block_stacking_demo.py --device cuda:0 --num-objects 3
 
+Natural-language order:
+    python DEMOS/block_stacking/block_stacking_demo.py --device cuda:0 --num-objects 3 \
+        --stack-instruction "put the blue box on the red box, then green on blue"
+
 Headless smoke test:
     python DEMOS/block_stacking/block_stacking_demo.py --headless --device cuda:0 --num-objects 1
 """
@@ -25,6 +29,15 @@ import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+
+BOX_COLORS: list[tuple[str, tuple[float, float, float]]] = [
+    ("red", (0.9, 0.2, 0.2)),
+    ("blue", (0.2, 0.4, 0.9)),
+    ("green", (0.2, 0.9, 0.3)),
+    ("yellow", (0.9, 0.8, 0.2)),
+    ("purple", (0.7, 0.3, 0.8)),
+]
 
 
 # --- Path bootstrap (same pattern as vla_v0/v1 to survive Kit side effects) ---
@@ -75,6 +88,20 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--stack-y", type=float, default=0.0, help="Stack center Y in robot base frame (m).")
     parser.add_argument("--table-z-world", type=float, default=0.82, help="Table surface world Z used to initialize stack height.")
     parser.add_argument("--layer-gap-m", type=float, default=0.004, help="Small planned clearance between stacked layers.")
+    parser.add_argument(
+        "--stack-instruction",
+        type=str,
+        default=None,
+        help=(
+            "Natural-language stacking order, e.g. 'red then blue then green', "
+            "'put green on blue on red', 'top to bottom: green, blue, red', or 'tallest to shortest'."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-instruction",
+        action="store_true",
+        help="Prompt in the terminal for a natural-language stacking instruction after blocks are spawned.",
+    )
     parser.add_argument(
         "--stack-order",
         type=str,
@@ -165,6 +192,9 @@ def _parse_args() -> argparse.Namespace:
 @dataclass
 class BlockInfo:
     prim_path: str
+    label: str
+    color_name: str | None
+    box_index: int | None
     height_m: float
     yaw_w_rad: float | None
     top_b: object
@@ -291,6 +321,9 @@ def main() -> int:
     # Build sim + scene + robot.
     # ------------------------------------------------------------------
     phys = PhysicsConfig(device=str(getattr(args, "device", "cuda:0")))
+    # For stacking boxes, keep local Z as world Z so --box-size-min/max Z is the visual/physical height.
+    # The shared PhysicsConfig default tilts imported USD assets, which is not what we want for CuboidCfg blocks.
+    phys.orientation_euler_deg = None
     sim_cfg = sim_utils.SimulationCfg(device=phys.device)
     apply_to_simulation_cfg(sim_cfg, phys)
     sim = sim_utils.SimulationContext(sim_cfg)
@@ -319,8 +352,8 @@ def main() -> int:
         spawn_mode="box",
         box_size_min=box_size_min,
         box_size_max=box_size_max,
-        box_color_palette=[(0.9, 0.2, 0.2), (0.2, 0.4, 0.9), (0.2, 0.9, 0.3), (0.9, 0.8, 0.2), (0.7, 0.3, 0.8)],
-        box_color_names=["red", "blue", "green", "yellow", "purple"],
+        box_color_palette=[rgb for (_name, rgb) in BOX_COLORS],
+        box_color_names=[name for (name, _rgb) in BOX_COLORS],
         **object_loader_kwargs_from_physix(phys),
     )
     loader = ObjectLoader(loader_cfg)
@@ -404,6 +437,24 @@ def main() -> int:
         except Exception as e:
             print(f"[STACK][WARN] could not read height for {prim_path}: {e}; falling back to --box-size.")
             return float(args.box_size)
+
+    def _box_index_from_prim_path(prim_path: str) -> int | None:
+        leaf = str(prim_path).rstrip("/").split("/")[-1]
+        digits = "".join(ch for ch in leaf if ch.isdigit())
+        if not digits:
+            return None
+        try:
+            return int(digits)
+        except Exception:
+            return None
+
+    def _box_label(prim_path: str) -> tuple[str, str | None, int | None]:
+        idx = _box_index_from_prim_path(prim_path)
+        if idx is None or len(BOX_COLORS) == 0:
+            leaf = str(prim_path).rstrip("/").split("/")[-1]
+            return f"box {leaf}", None, idx
+        color_name = BOX_COLORS[(idx - 1) % len(BOX_COLORS)][0]
+        return f"{color_name} box {idx}", color_name, idx
 
     def _read_ee_pose_b() -> tuple[torch.Tensor, torch.Tensor]:
         ee_pose_w = robot.data.body_pose_w[:, ee_body_id]
@@ -536,6 +587,102 @@ def main() -> int:
         f"initial table_top_z_b={stack_top_z_b:+.3f}; order={args.stack_order}; placement_rotation={args.placement_rotation}"
     )
 
+    def _default_order(blocks_in: list[BlockInfo]) -> list[BlockInfo]:
+        out = list(blocks_in)
+        if args.stack_order == "tallest-first":
+            out.sort(key=lambda b: float(b.height_m), reverse=True)
+        elif args.stack_order == "shortest-first":
+            out.sort(key=lambda b: float(b.height_m))
+        return out
+
+    def _block_ref_names(block: BlockInfo) -> list[str]:
+        refs: list[str] = []
+        if block.color_name:
+            refs.extend([str(block.color_name).lower(), f"{block.color_name} box".lower()])
+        if block.box_index is not None:
+            idx = int(block.box_index)
+            refs.extend([f"box {idx}", f"box number {idx}", f"number {idx}", f"obj_{idx:02d}", f"obj {idx:02d}"])
+        refs.append(str(block.label).lower())
+        return refs
+
+    def _referenced_blocks_in_sentence(instruction: str, blocks_in: list[BlockInfo]) -> list[BlockInfo]:
+        text = " ".join(str(instruction).lower().replace("_", " ").replace("-", " ").split())
+        hits: list[tuple[int, int, BlockInfo]] = []
+        for order_idx, block in enumerate(blocks_in):
+            best_pos: int | None = None
+            best_len = 0
+            for ref in _block_ref_names(block):
+                ref_norm = " ".join(str(ref).lower().replace("_", " ").replace("-", " ").split())
+                if not ref_norm:
+                    continue
+                pos = text.find(ref_norm)
+                if pos >= 0 and (best_pos is None or pos < best_pos):
+                    best_pos = pos
+                    best_len = len(ref_norm)
+            if best_pos is not None:
+                hits.append((best_pos, -best_len, block))
+        hits.sort(key=lambda item: (item[0], item[1]))
+
+        seen: set[str] = set()
+        ordered: list[BlockInfo] = []
+        for _pos, _neg_len, block in hits:
+            if block.prim_path in seen:
+                continue
+            seen.add(block.prim_path)
+            ordered.append(block)
+        return ordered
+
+    def _order_from_instruction(instruction: str | None, blocks_in: list[BlockInfo]) -> list[BlockInfo] | None:
+        if instruction is None or not str(instruction).strip():
+            return None
+
+        text = " ".join(str(instruction).strip().lower().replace("-", " ").split())
+        default_remaining = _default_order(blocks_in)
+
+        if (
+            "tallest to shortest" in text
+            or "highest to lowest" in text
+            or "largest to smallest" in text
+            or "biggest to smallest" in text
+            or "biggest first" in text
+            or "bigger first" in text
+        ):
+            return sorted(blocks_in, key=lambda b: float(b.height_m), reverse=True)
+        if "shortest to tallest" in text or "lowest to highest" in text or "smallest to largest" in text:
+            return sorted(blocks_in, key=lambda b: float(b.height_m))
+        if ("tallest" in text or "highest" in text or "largest" in text) and ("bottom" in text or "base" in text or "first" in text):
+            return sorted(blocks_in, key=lambda b: float(b.height_m), reverse=True)
+        if ("shortest" in text or "lowest" in text or "smallest" in text) and ("bottom" in text or "base" in text or "first" in text):
+            return sorted(blocks_in, key=lambda b: float(b.height_m))
+        if ("tallest" in text or "highest" in text or "largest" in text) and "top" in text:
+            return sorted(blocks_in, key=lambda b: float(b.height_m))
+        if ("shortest" in text or "lowest" in text or "smallest" in text) and "top" in text:
+            return sorted(blocks_in, key=lambda b: float(b.height_m), reverse=True)
+
+        refs = _referenced_blocks_in_sentence(text, blocks_in)
+        if len(refs) == 0:
+            print(f"[STACK][WARN] Could not understand stack instruction: {instruction!r}. Using --stack-order.")
+            return None
+
+        top_to_bottom = "top to bottom" in text or "top-to-bottom" in text
+        bottom_to_top = "bottom to top" in text or "bottom-to-top" in text or "base to top" in text
+        uses_on_language = " on " in f" {text} " or " on top of " in text
+
+        # The robot places bottom first. In natural "A on B on C" language, A is topmost,
+        # so reverse the mentioned order unless the user explicitly says bottom-to-top.
+        explicit = list(refs)
+        if top_to_bottom or (uses_on_language and not bottom_to_top):
+            explicit.reverse()
+
+        seen = {b.prim_path for b in explicit}
+        remaining = [b for b in default_remaining if b.prim_path not in seen]
+        if remaining:
+            print(
+                "[STACK][INFO] Instruction mentioned "
+                f"{len(explicit)}/{len(blocks_in)} blocks; appending unmentioned blocks by --stack-order."
+            )
+        return explicit + remaining
+
     blocks: list[BlockInfo] = []
     for prim_path in spawned_paths:
         try:
@@ -544,9 +691,13 @@ def main() -> int:
         except Exception as e:
             print(f"[STACK][WARN] OBB failed for {prim_path}: {e}. Skipping.")
             continue
+        label, color_name, box_index = _box_label(str(prim_path))
         blocks.append(
             BlockInfo(
                 prim_path=str(prim_path),
+                label=label,
+                color_name=color_name,
+                box_index=box_index,
                 height_m=_read_prim_height_m(str(prim_path)),
                 yaw_w_rad=_read_prim_world_yaw_rad(str(prim_path)),
                 top_b=top_b,
@@ -554,15 +705,31 @@ def main() -> int:
             )
         )
 
-    if args.stack_order == "tallest-first":
-        blocks.sort(key=lambda b: float(b.height_m), reverse=True)
-    elif args.stack_order == "shortest-first":
-        blocks.sort(key=lambda b: float(b.height_m))
+    instruction = str(args.stack_instruction).strip() if args.stack_instruction is not None else None
+    if bool(args.prompt_instruction):
+        print("[STACK] Available blocks:")
+        for b in blocks:
+            yaw_txt = "None" if b.yaw_w_rad is None else f"{math.degrees(float(b.yaw_w_rad)):+.1f} deg"
+            print(f"[STACK]   {b.label}: height={float(b.height_m):.3f} m yaw={yaw_txt} prim={b.prim_path}")
+        try:
+            typed = input(
+                "[STACK] Enter stacking instruction "
+                "(examples: 'red on blue on green', 'blue then red then green', 'tallest to shortest'): "
+            ).strip()
+            if typed:
+                instruction = typed
+        except EOFError:
+            print("[STACK][WARN] No terminal input available; using --stack-order.")
 
-    print("[STACK] Planned block order:")
+    instructed_order = _order_from_instruction(instruction, blocks)
+    blocks = instructed_order if instructed_order is not None else _default_order(blocks)
+
+    print("[STACK] Planned placement order (bottom -> top):")
     for i, b in enumerate(blocks):
         yaw_txt = "None" if b.yaw_w_rad is None else f"{math.degrees(float(b.yaw_w_rad)):+.1f} deg"
-        print(f"[STACK]   {i + 1}. {b.prim_path} height={float(b.height_m):.3f} m yaw={yaw_txt}")
+        print(f"[STACK]   {i + 1}. {b.label} height={float(b.height_m):.3f} m yaw={yaw_txt} prim={b.prim_path}")
+    if instruction:
+        print(f"[STACK] Instruction: {instruction!r}")
     print("[STACK] " + "=" * 74)
 
     stack_yaw_rad: float | None = None
