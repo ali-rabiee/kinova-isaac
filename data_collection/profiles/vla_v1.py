@@ -11,7 +11,7 @@ from data_collection.profiles.spec import ProfileSpec
 
 
 def add_cli_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--env", type=str, default="reach_to_grasp_VLA", choices=sorted(get_envs().keys()))
+    parser.add_argument("--env", type=str, default="blocks", choices=sorted(get_envs().keys()))
     parser.add_argument("--logs-root", type=str, default="logs/data_collection")
     # For VLA training, a 5Hz policy/control rate is a good default trade-off between
     # responsiveness and dataset size (and matches common OpenVLA-style datasets).
@@ -383,10 +383,12 @@ def run(args: argparse.Namespace) -> int:
     from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
     from controllers import CartesianVelocityJogConfig, CartesianVelocityJogController
+    from environments.blocks.domain_randomization import BlocksDomainRandomizer
+    from environments.blocks.objects import BlocksObjectManager
     from environments.utils.object_loader import ObjectLoader, ObjectLoaderConfig, SpawnBounds
     from environments.utils.physix import PhysicsConfig, apply_to_simulation_cfg, object_loader_kwargs_from_physix
 
-    env_spec = get_envs()[str(getattr(args, "env", "reach_to_grasp_VLA"))]
+    env_spec = get_envs()[str(getattr(args, "env", "blocks"))]
     env_cfg_mod = importlib.import_module(f"{env_spec.module_base}.config")
     env_utils_mod = importlib.import_module(f"{env_spec.module_base}.utils")
     DEFAULT_SCENE = getattr(env_cfg_mod, "DEFAULT_SCENE")
@@ -573,6 +575,12 @@ def run(args: argparse.Namespace) -> int:
             pass
         return out
 
+    domain_randomizer = BlocksDomainRandomizer(
+        args=args,
+        top_down_camera=DEFAULT_TOP_DOWN_CAMERA,
+        enable_cameras=enable_cameras,
+    )
+
     # Spawn objects (v1 uses helpers so we can respawn per episode)
     spawned_paths: list[str] = []
     id_to_label: Dict[str, str] = {}
@@ -673,8 +681,18 @@ def run(args: argparse.Namespace) -> int:
             pass
         return paths, lbl_map
 
+    object_manager = BlocksObjectManager(
+        args=args,
+        phys=phys,
+        sim=sim,
+        scene_origins=scene_origins,
+        default_scene=DEFAULT_SCENE,
+        isaac_nucleus_dir=ISAAC_NUCLEUS_DIR,
+    )
+
     # IMPORTANT: spawn objects once up-front so planner mode has a loader + targets available.
-    spawned_paths, id_to_label = _spawn_objects()
+    spawned_paths, id_to_label = object_manager.spawn_objects()
+    loader = object_manager.loader
     try:
         print(f"[VLA_V1] Spawned {len(spawned_paths)} objects: {spawned_paths}")
     except Exception:
@@ -1194,7 +1212,7 @@ def run(args: argparse.Namespace) -> int:
     # This is done after sim.reset so camera/light prims exist and are stable.
     try:
         if domain_rand_enabled:
-            _apply_domain_randomization(ep_idx=0, logger=None)
+            domain_randomizer.apply(ep_idx=0, logger=None)
             # If we moved the camera, best-effort reset the camera sensor so render products refresh.
             if camera_sensor is not None:
                 try:
@@ -1597,7 +1615,7 @@ def run(args: argparse.Namespace) -> int:
                         print(
                             f"[VLA_V1][RESPAWN] ep={int(ep)} regenerate=True respawn_every={int(respawn_every)} n_objects={len(spawned_paths)}"
                         )
-                        new_poses = _rerandomize_object_poses(spawned_paths)
+                        new_poses = object_manager.rerandomize_object_poses(spawned_paths)
                         if new_poses is not None:
                             cycle_object_poses = new_poses
                             # Log/print intended new positions for easy verification.
@@ -1647,7 +1665,7 @@ def run(args: argparse.Namespace) -> int:
                                 "Objects may remain at their original locations."
                             )
                     else:
-                        _rerandomize_object_poses(spawned_paths, poses=cycle_object_poses)
+                        object_manager.rerandomize_object_poses(spawned_paths, poses=cycle_object_poses)
 
                 # HARD reset controller + follower per episode to avoid leftover impulses after sim.reset()
                 try:
@@ -1680,7 +1698,7 @@ def run(args: argparse.Namespace) -> int:
 
                 # Apply domain randomization once per episode (after reset/respawn/settle).
                 try:
-                    _apply_domain_randomization(ep_idx=int(ep), logger=session_logger)
+                    domain_randomizer.apply(ep_idx=int(ep), logger=session_logger)
                     if camera_sensor is not None:
                         try:
                             camera_sensor.reset()
@@ -1715,12 +1733,16 @@ def run(args: argparse.Namespace) -> int:
                 except Exception:
                     obj_z_by_leaf = {}
                 # Select target once per episode.
-                _tgt = _select_episode_target_prim(ep, object_z_by_leaf=obj_z_by_leaf, prev_target_prim=prev_target_prim)
+                _tgt = object_manager.select_episode_target_prim(
+                    ep,
+                    object_z_by_leaf=obj_z_by_leaf,
+                    prev_target_prim=prev_target_prim,
+                )
                 # Episode-level language command for VLA training (stored once per episode).
                 lang_cmd, lang_meta = ("", {})
                 try:
                     if _tgt is not None:
-                        lang_cmd, lang_meta = _make_language_command(ep_idx=int(ep), target_prim=str(_tgt))
+                        lang_cmd, lang_meta = object_manager.make_language_command(ep_idx=int(ep), target_prim=str(_tgt))
                 except Exception:
                     lang_cmd, lang_meta = ("", {})
 
@@ -1775,7 +1797,7 @@ def run(args: argparse.Namespace) -> int:
                                 {
                                     "episode_idx": int(ep),
                                     "target_prim": str(_tgt),
-                                    "target_label": _prim_label(str(_tgt or "")),
+                                    "target_label": object_manager.prim_label(str(_tgt or "")),
                                     "language_command": str(lang_cmd),
                                     "language_command_meta": lang_meta,
                                     "created_at": _dt.now().isoformat(timespec="seconds"),
@@ -1796,13 +1818,13 @@ def run(args: argparse.Namespace) -> int:
                     candidates = sorted([str(p) for p in spawned_paths])
                     print(
                         f"[VLA_V1][EP] start ep={ep} target={tgt} "
-                        f"label='{_prim_label(str(tgt or ''))}' n_objects={len(spawned_paths)} "
+                        f"label='{object_manager.prim_label(str(tgt or ''))}' n_objects={len(spawned_paths)} "
                         f"candidates={[c.split('/')[-1] for c in candidates]}"
                     )
                 except Exception:
                     print(
                         f"[VLA_V1][EP] start ep={ep} target={vla_planner_state.get('target_prim')} "
-                        f"label='{_prim_label(str(vla_planner_state.get('target_prim', '')))}'"
+                        f"label='{object_manager.prim_label(str(vla_planner_state.get('target_prim', '')))}'"
                     )
                 session_logger.log_event(
                     "episode_start",
@@ -1810,7 +1832,7 @@ def run(args: argparse.Namespace) -> int:
                         "episode_idx": int(ep),
                         "num_objects": int(len(spawned_paths)),
                         "target_prim": str(vla_planner_state.get("target_prim", None)),
-                        "target_label": _prim_label(str(vla_planner_state.get("target_prim", ""))),
+                        "target_label": object_manager.prim_label(str(vla_planner_state.get("target_prim", ""))),
                         "language_command": str(vla_planner_state.get("language_command", "")),
                         "language_command_meta": vla_planner_state.get("language_command_meta", {}),
                     },
@@ -2342,7 +2364,7 @@ def run(args: argparse.Namespace) -> int:
                                         stride = max(1, int(getattr(args, "lift_success_check_stride", 5)))
                                         if (int(steps) % stride) == 0:
                                             target_prim = str(vla_planner_state.get("target_prim", ""))
-                                            z = _target_z_from_tracker(target_prim) if target_prim else None
+                                            z = object_manager.target_z_from_tracker(tracker, target_prim) if target_prim else None
                                             z0 = vla_planner_state.get("target_z0_w", None)
                                             thresh = float(getattr(args, "lift_success_min_dz_m", 0.06))
                                             dz_from_start = None
@@ -2350,7 +2372,7 @@ def run(args: argparse.Namespace) -> int:
                                             lifted = False
                                             if z is not None:
                                                 try:
-                                                    dz_table = float(z) - float(_table_z())
+                                                    dz_table = float(z) - float(object_manager.table_z())
                                                 except Exception:
                                                     dz_table = None
                                                 if z0 is not None:
@@ -2417,7 +2439,7 @@ def run(args: argparse.Namespace) -> int:
                                 else:
                                     # Check success (target object lifted above table plane and/or above its initial height)
                                     target_prim = str(vla_planner_state.get("target_prim", ""))
-                                    z = _target_z_from_tracker(target_prim) if target_prim else None
+                                    z = object_manager.target_z_from_tracker(tracker, target_prim) if target_prim else None
                                     z0 = vla_planner_state.get("target_z0_w", None)
                                     dz_table = None
                                     dz_from_start = None
@@ -2425,7 +2447,7 @@ def run(args: argparse.Namespace) -> int:
                                     thresh = float(getattr(args, "lift_success_min_dz_m", 0.06))
                                     try:
                                         if z is not None:
-                                            dz_table = float(z) - float(_table_z())
+                                            dz_table = float(z) - float(object_manager.table_z())
                                             ok = bool(dz_table >= thresh)
                                             if z0 is not None:
                                                 dz_from_start = float(z) - float(z0)
