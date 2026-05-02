@@ -55,7 +55,7 @@ def _parse_args() -> argparse.Namespace:
     #   grasp_z    = top_z + ee_z_offset + grasp_depth_m         (palm just above cube top; fingers wrap)
     #   lift_z     = top_z + ee_z_offset + lift_offset_m         (palm well above, object dangling)
     parser.add_argument("--pregrasp-offset-m", type=float, default=0.12, help="Pregrasp palm offset above (top + ee_z_offset) (m).")
-    parser.add_argument("--grasp-depth-m", type=float, default=-0.17,
+    parser.add_argument("--grasp-depth-m", type=float, default=-0.07,
                         help="Grasp palm offset relative to (top + ee_z_offset) (m). Default ~+0.01 m above cube top -- fingers wrap around.")
     parser.add_argument("--lift-offset-m", type=float, default=0.18, help="Lift palm offset above (top + ee_z_offset) (m).")
     # Motion timing
@@ -68,7 +68,7 @@ def _parse_args() -> argparse.Namespace:
     # Gripper timing
     parser.add_argument("--pre-close-settle-s", type=float, default=0.5,
                         help="Hold at the grasp target BEFORE closing the gripper, so the arm has finished descending and fingers are stable around the cube.")
-    parser.add_argument("--gripper-close-s", type=float, default=1.2, help="Time to hold close command before lifting (s).")
+    parser.add_argument("--gripper-close-s", type=float, default=0.8, help="Time to hold close command before lifting (s).")
     parser.add_argument("--gripper-open-s", type=float, default=0.8, help="Time to hold open command before moving on (s).")
     # Robot wiring
     parser.add_argument("--ee-link", type=str, default="j2n6s300_end_effector")
