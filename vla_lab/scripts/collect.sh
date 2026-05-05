@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Collect VLA training data using the existing data_collection package.
-# Defaults match the recommended VLA setup from the repo's top-level README:
-# uniform colored boxes + cuRobo planner + cameras + domain randomization.
+# Uses profile vla_v1 with the scripted planner by default (simple pregrasp /
+# grasp / lift waypoints — no MotionGen/cuRobo). This yields more repeatable
+# episodes than cuRobo, which can stall with "hovering" retries.
 #
 # Override defaults via env vars or CLI args:
 #   NUM_EPISODES=20 ./vla_lab/scripts/collect.sh
+#   PLANNER=curobo_v2 NUM_EPISODES=10 ./vla_lab/scripts/collect.sh   # MotionGen backend
 #   ./vla_lab/scripts/collect.sh --num-objects 4 --spawn-mode usd
 
 set -euo pipefail
@@ -16,12 +18,14 @@ NUM_EPISODES="${NUM_EPISODES:-10}"
 LOGS_ROOT="${LOGS_ROOT:-logs/data_collection}"
 DEVICE="${DEVICE:-cuda:0}"
 SPAWN_MODE="${SPAWN_MODE:-box}"
+# Scripted = deterministic Cartesian waypoints; set PLANNER=curobo_v2 for the old default.
+PLANNER="${PLANNER:-scripted}"
 
 exec python -m data_collection.collect_data \
   --profile vla_v1 \
   --env reach_to_grasp_VLA \
   --control planner \
-  --planner curobo_v2 \
+  --planner "${PLANNER}" \
   --device "${DEVICE}" \
   --enable_cameras \
   --log-rate-hz 5 \

@@ -222,3 +222,84 @@ python -m data_collection.collect_data \
   --respawn-every-n-episodes 1
 ```
 
+## VLA pick-and-place data collection (`vla_v2`)
+
+`vla_v2` is a sibling of `vla_v1` for **scripted pick-and-place** instead of
+just pick-and-lift. It places a cluttered scene of boxes plus three fixed bins,
+deterministically grabs the box closest to the robot, transits over the
+clutter, and drops the grabbed box into one of the three bins. **Motion is
+purely scripted (no cuRobo / MotionGen).**
+
+Scene per episode (defaults, all configurable via CLI):
+
+- 1 **target** box near the robot (close to the base).
+- 6 **obstacle** boxes scattered in the middle of the workspace.
+- 3 **bins** at the far end of the workspace (red, green, blue), each an
+  open-top kinematic cuboid container.
+
+Each episode logs the same artifacts as `vla_v1`:
+
+- `images/image_NNNNNN.png` — per-tick top-down camera frames (when
+  `--enable_cameras` is on).
+- `ticks.jsonl`, `events.jsonl`, `metadata.json` — same schema as `vla_v1`.
+- `instruction.json` — natural-language command, target metadata, and the
+  destination bin (color + index).
+
+Run from repo root:
+
+```bash
+NUM_EPISODES=10 ./vla_lab/scripts/collect_v2.sh
+```
+
+Useful overrides (all forwarded as `--`-style flags or env vars to the
+underlying `data_collection.collect_data`):
+
+```bash
+# More clutter, headless on a chosen GPU
+NUM_OBSTACLE_BOXES=8 DEVICE=cuda:0 NUM_EPISODES=20 ./vla_lab/scripts/collect_v2.sh --headless
+
+# Random bin selection per episode (instead of cycling 1, 2, 3, 1, 2, 3...)
+BIN_SELECTION=random NUM_EPISODES=20 ./vla_lab/scripts/collect_v2.sh
+```
+
+Underneath, the wrapper expands to:
+
+```bash
+python -m data_collection.collect_data \
+  --profile vla_v2 \
+  --env reach_to_grasp_VLA \
+  --control planner \
+  --device cuda:0 \
+  --enable_cameras \
+  --log-rate-hz 5 \
+  --num-episodes 10 \
+  --num-obstacle-boxes 6 \
+  --bin-selection cycle \
+  --planner-speed-mps 0.4 \
+  --planner-waypoint-max-seg-m 0.01 \
+  --max-steps-per-episode 10000 \
+  --domain-rand \
+  --domain-rand-seed 0 \
+  --logs-root logs/data_collection
+```
+
+**vla_v2 specific knobs** (see `data_collection/profiles/vla_v2.py` for the
+full list):
+
+| Argument | Default | Description |
+| :--- | :--- | :--- |
+| `--num-obstacle-boxes` | `6` | Boxes scattered in the mid workspace. |
+| `--target-spawn-min/max` | tight band near base | AABB for the close target box. |
+| `--obstacle-spawn-min/max` | mid-workspace AABB | AABB for obstacle boxes. |
+| `--num-bins` | `3` | Number of destination bins (typically 3). |
+| `--bin-center-x` | `0.70` | Bin-row X center (m) in `/World/Origin1` frame. |
+| `--bin-y-spacing` | `0.25` | Y-distance between adjacent bins. |
+| `--bin-footprint` | `[0.20, 0.20]` | Bin inner XY footprint (m). |
+| `--bin-wall-height` | `0.06` | Bin wall height (m). |
+| `--bin-selection` | `cycle` | `cycle` / `random` / `fixed` (`--bin-index`). |
+| `--transit-clearance-m` | `0.30` | EE Z above table during transit (m). |
+| `--drop-clearance-m` | `0.18` | EE Z above the bin floor when releasing (m). |
+| `--pregrasp-offset-m` | `0.10` | Pregrasp height above the box top (m). |
+| `--grasp-depth-m` | `-0.04` | Grasp depth into the box (m, negative = down). |
+| `--home-pose-b` | `[0.30, 0, 1.10]` | Home EE position to retreat to between phases (m, base frame). |
+

@@ -81,9 +81,12 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--planner",
         type=str,
-        default="curobo_v2",
+        default="scripted",
         choices=["curobo_v2", "curobo", "lula", "rmpflow", "scripted"],
-        help="Planner backend for --control planner (default: curobo_v2)",
+        help=(
+            "Planner backend for --control planner (default: scripted). "
+            "Use scripted for repeatable straight-line grasp waypoints; curobo_v2 for MotionGen."
+        ),
     )
     parser.add_argument("--target-label", type=str, default=None, help="Optional target object label filter")
     parser.add_argument(
@@ -1281,7 +1284,7 @@ def run(args: argparse.Namespace) -> int:
 
         cfg_dir = str((_Path(__file__).resolve().parents[2] / "motion_generation" / "planners" / "planners_config").resolve())
         planner = create_planner(
-            str(getattr(args, "planner", "curobo_v2")),
+            str(getattr(args, "planner", "scripted")),
             ctx=PlannerContext(
                 base_frame="base_link",
                 ee_link_name=str(getattr(args, "ee_link", "j2n6s300_end_effector")),
@@ -1289,7 +1292,7 @@ def run(args: argparse.Namespace) -> int:
                 config_dir=cfg_dir,
             ),
         )
-        print(f"[VLA_V1][PLANNER] Control enabled. planner={getattr(args, 'planner', 'curobo_v2')} cfg_dir={cfg_dir}")
+        print(f"[VLA_V1][PLANNER] Control enabled. planner={getattr(args, 'planner', 'scripted')} cfg_dir={cfg_dir}")
         grasp_provider = ObbGraspPoseProvider(align_to_min_width=True)
 
         robot_prim_path: Optional[str] = None
@@ -1952,7 +1955,7 @@ def run(args: argparse.Namespace) -> int:
                                             "action_start",
                                             {
                                                 "action": "PLAN_TO_PREGRASP",
-                                                "planner": str(getattr(args, "planner", "curobo_v2")),
+                                                "planner": str(getattr(args, "planner", "scripted")),
                                                 "target_prim": str(target_prim),
                                                 "episode_idx": int(ep),
                                             },

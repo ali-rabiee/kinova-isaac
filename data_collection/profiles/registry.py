@@ -39,10 +39,21 @@ def get_profiles() -> Dict[str, ProfileSpec]:
 
         return vla_v1.run(args)
 
+    def _vla_v2_add_args(parser) -> None:
+        from . import vla_v2
+
+        vla_v2.add_cli_args(parser)
+
+    def _vla_v2_run(args) -> int:
+        from . import vla_v2
+
+        return vla_v2.run(args)
+
     return {
         "ticks_v0": ProfileSpec(name="ticks_v0", add_cli_args=_ticks_v0_add_args, run=_ticks_v0_run),
         "vla_v0": ProfileSpec(name="vla_v0", add_cli_args=_vla_v0_add_args, run=_vla_v0_run),
         "vla_v1": ProfileSpec(name="vla_v1", add_cli_args=_vla_v1_add_args, run=_vla_v1_run),
+        "vla_v2": ProfileSpec(name="vla_v2", add_cli_args=_vla_v2_add_args, run=_vla_v2_run),
     }
 
 

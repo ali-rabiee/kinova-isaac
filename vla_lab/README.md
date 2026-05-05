@@ -81,7 +81,8 @@ vla_lab/
 ├── dryrun.py                       <- VRAM / latency dry-fit
 ├── inspect_data.py                 <- session sanity tool
 └── scripts/
-    ├── collect.sh                  <- wrapper around `data_collection.collect_data`
+    ├── collect.sh                  <- wrapper around `data_collection.collect_data --profile vla_v1`
+    ├── collect_v2.sh               <- wrapper around `data_collection.collect_data --profile vla_v2` (pick-and-place)
     ├── train.sh                    <- wrapper around `vla_lab.train`
     ├── eval.sh                     <- wrapper around `vla_lab.eval_isaaclab`
     └── dryrun.sh                   <- wrapper around `vla_lab.dryrun`
@@ -121,7 +122,7 @@ written under `logs/data_collection/session_<TIMESTAMP>/` with one
 `episode_NNNN/` folder per attempt.
 
 ```bash
-# Recommended: uniform colored boxes + cuRobo planner + cameras (10 episodes)
+# Recommended: uniform colored boxes + scripted planner + cameras (10 episodes)
 NUM_EPISODES=10 ./vla_lab/scripts/collect.sh
 
 # YCB objects instead of boxes
@@ -136,7 +137,7 @@ Underneath, the wrapper expands to:
 ```bash
 python -m data_collection.collect_data \
   --profile vla_v1 --env reach_to_grasp_VLA --control planner \
-  --planner curobo_v2 --device cuda:0 --enable_cameras \
+  --planner scripted --device cuda:0 --enable_cameras \
   --log-rate-hz 5 --num-episodes ${NUM_EPISODES} \
   --spawn-mode box --domain-rand --domain-rand-seed 0 \
   --logs-root logs/data_collection \
@@ -146,6 +147,31 @@ python -m data_collection.collect_data \
 You can also call `data_collection.collect_data` directly with any flags you
 want — see the top-level `README.md`. Just make sure `--enable_cameras` is
 set; `vla_lab` requires the per-tick PNGs to train.
+
+#### 5.1.1 Pick-and-place (`vla_v2`)
+
+`vla_v2` is a richer scene with **clutter + 3 bins** and a fully scripted
+**pick-and-place** routine: grab the box closest to the robot, transit over
+the clutter, drop into one of three colored bins. Motion is purely scripted
+(no cuRobo / MotionGen). Logging format and on-disk layout are identical to
+`vla_v1`, so the same `vla_lab.dataset` reader works without changes.
+
+```bash
+# Default: 6 clutter boxes + 1 close target + 3 bins, 10 episodes
+NUM_EPISODES=10 ./vla_lab/scripts/collect_v2.sh
+
+# More clutter, headless
+NUM_OBSTACLE_BOXES=8 NUM_EPISODES=20 ./vla_lab/scripts/collect_v2.sh --headless
+
+# Random bin selection per episode
+BIN_SELECTION=random NUM_EPISODES=20 ./vla_lab/scripts/collect_v2.sh
+```
+
+Each episode writes the same `instruction.json`, `images/`, `ticks.jsonl`,
+and `events.jsonl` artifacts as `vla_v1`, plus a `drop_result` event with the
+final box pose vs. the chosen bin's footprint. See the top-level `README.md`
+for the full list of `vla_v2` knobs (target / bin layout, transit clearance,
+etc.).
 
 ### 5.2 Inspect what was collected
 
