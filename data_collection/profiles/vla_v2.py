@@ -73,10 +73,11 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--domain-rand-light-color-jitter", type=float, default=0.15)
 
     # Workspace safety bounds. Wider than vla_v1 because the bins live near x=0.7m.
+    # The Z ceiling stays well below typical singularity altitudes for the Jaco2 Kinova.
     parser.add_argument("--workspace-min-z", type=float, default=0.0)
-    parser.add_argument("--workspace-max-z", type=float, default=1.30)
+    parser.add_argument("--workspace-max-z", type=float, default=1.10)
     parser.add_argument("--workspace-min-x", type=float, default=0.10)
-    parser.add_argument("--workspace-max-x", type=float, default=0.90)
+    parser.add_argument("--workspace-max-x", type=float, default=0.85)
     parser.add_argument("--workspace-min-y", type=float, default=-0.55)
     parser.add_argument("--workspace-max-y", type=float, default=0.55)
 
@@ -162,9 +163,9 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--bin-selection",
         type=str,
-        default="cycle",
+        default="random",
         choices=["cycle", "random", "fixed"],
-        help="How to choose the destination bin per episode.",
+        help="How to choose the destination bin per episode (default: random).",
     )
     parser.add_argument(
         "--bin-index",
@@ -174,13 +175,24 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     )
 
     # Pick / transit / place tuning
-    parser.add_argument("--pregrasp-offset-m", type=float, default=0.10, help="Pregrasp offset above the target box top (m).")
+    parser.add_argument("--pregrasp-offset-m", type=float, default=0.08, help="Pregrasp offset above the target box top (m).")
     parser.add_argument("--grasp-depth-m", type=float, default=-0.04, help="Grasp depth relative to the box top (m).")
-    parser.add_argument("--transit-clearance-m", type=float, default=0.30, help="EE Z above table during transit (m).")
+    parser.add_argument(
+        "--approach-clearance-m",
+        type=float,
+        default=0.18,
+        help="Initial pre-pick altitude above the table (m). EE flies to (target_x, target_y, table_z + this) before descending.",
+    )
+    parser.add_argument(
+        "--transit-clearance-m",
+        type=float,
+        default=0.22,
+        help="EE Z above table during the transit-over-clutter phase (m). Must clear all obstacle boxes.",
+    )
     parser.add_argument(
         "--drop-clearance-m",
         type=float,
-        default=0.22,
+        default=0.20,
         help=(
             "EE Z above the bin floor when releasing (m). "
             "Should be at least ~bin-wall-height + ee-z-offset-m + 0.5 * box-size + a small margin "
@@ -197,7 +209,7 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
         "--home-pose-b",
         type=float,
         nargs=3,
-        default=[0.30, 0.0, 1.10],
+        default=[0.30, 0.0, 1.00],
         help="Robot home EE position (base frame) used for retreat between episodes.",
     )
 
@@ -210,16 +222,45 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--settle-steps", type=int, default=180)
 
     # Waypoint follower / gripper tuning
-    parser.add_argument("--planner-speed-mps", type=float, default=0.4, help="EE linear speed during scripted execution (m/s).")
-    parser.add_argument("--planner-waypoint-max-seg-m", type=float, default=0.01)
-    parser.add_argument("--tolerance", type=float, default=0.005, help="Waypoint convergence tolerance (m).")
-    parser.add_argument("--stabilize-steps", type=int, default=180)
-    parser.add_argument("--gripper-open-steps", type=int, default=20)
+    parser.add_argument("--planner-speed-mps", type=float, default=0.30, help="EE linear speed during scripted execution (m/s).")
+    parser.add_argument(
+        "--planner-waypoint-max-seg-m",
+        type=float,
+        default=0.005,
+        help="Max segment length after waypoint densification. Smaller = smoother + slower per step.",
+    )
+    parser.add_argument(
+        "--tolerance",
+        type=float,
+        default=0.012,
+        help="Waypoint convergence tolerance (m). Larger values make the follower pop waypoints sooner = more fluid.",
+    )
+    parser.add_argument("--stabilize-steps", type=int, default=120)
+    parser.add_argument("--gripper-open-steps", type=int, default=24)
     parser.add_argument("--gripper-close-steps", type=int, default=60)
-    parser.add_argument("--hold-after-close-steps", type=int, default=30)
-    parser.add_argument("--hold-after-release-steps", type=int, default=30)
-    parser.add_argument("--wp-max-steps-per-waypoint", type=int, default=2400)
-    parser.add_argument("--phase-timeout-steps", type=int, default=2400)
+    parser.add_argument("--hold-after-close-steps", type=int, default=20)
+    parser.add_argument("--hold-after-release-steps", type=int, default=24)
+    parser.add_argument(
+        "--wp-max-steps-per-waypoint",
+        type=int,
+        default=480,
+        help=(
+            "Per-sub-waypoint watchdog. After N steps the follower drops the current waypoint "
+            "even if it didn't fully converge. Smaller = more responsive, less hover-time."
+        ),
+    )
+    parser.add_argument(
+        "--phase-timeout-steps",
+        type=int,
+        default=3600,
+        help="Hard cap (physics steps) per top-level motion phase before forcing advancement (~15s at 240Hz).",
+    )
+    parser.add_argument(
+        "--progress-print-stride",
+        type=int,
+        default=240,
+        help="Print a [VLA_V2][EP][PROGRESS] line every N physics steps during a phase. ~1s at 240Hz.",
+    )
 
     # Bin success tuning
     parser.add_argument(
@@ -492,18 +533,25 @@ def run(args: argparse.Namespace) -> int:
         return paths, leaf_to_label, leaf_to_color
 
     def _spawn_bins() -> List[Dict[str, object]]:
-        """Spawn three open-top kinematic bins along the far end of the workspace.
+        """Spawn three open-top **static** bins along the far end of the workspace.
 
-        Each bin = base + 4 thin walls, all kinematic with disable_gravity=True,
-        so the bins hold their position and the dropped boxes settle inside.
-        Returns a list of bin descriptors:
-            {idx: int, name: str, color_name: str, color_rgb: (r,g,b),
-             center_xy: (x, y), top_z: float, bin_floor_z: float,
-             inner_xy: (lx, ly), prim_paths: List[str]}.
+        Bins are spawned as plain cuboid geometry with collision but **no rigid
+        body API** (``rigid_props=None``). This is the same pattern the codebase
+        uses for collision proxies in ``environments/utils/object_loader.py``.
+
+        Static-only spawning avoids two problems we saw earlier:
+
+        1. Kinematic rigid bodies could be reset away from their authored pose
+           on ``sim.reset()``, making the bins "appear briefly then disappear".
+        2. Kinematic bodies briefly intersecting the table on the first physics
+           tick can be ejected by the contact solver.
+
+        Each bin = 1 base + 4 thin walls, all static.
+
+        Returns a list of bin descriptors.
         """
         from isaaclab.sim.spawners.shapes.shapes_cfg import CuboidCfg
         from isaaclab.sim.spawners.materials.visual_materials_cfg import PreviewSurfaceCfg
-        from isaaclab.sim.spawners.materials.physics_materials_cfg import RigidBodyMaterialCfg
 
         prim_utils = importlib.import_module("isaacsim.core.utils.prims")
         try:
@@ -519,13 +567,30 @@ def run(args: argparse.Namespace) -> int:
         wall_t = float(getattr(args, "bin_wall_thickness", 0.012))
         base_t = float(getattr(args, "bin_base_thickness", 0.012))
 
-        # Top of bin walls (world Z); base sits on the table.
-        bin_floor_z = float(table_z) + 0.5 * base_t
-        wall_center_z = float(table_z) + base_t + 0.5 * wall_h
-        bin_top_z = float(table_z) + base_t + wall_h
+        # Add a small clearance so the bin's base bottom never coincides with the
+        # table surface (avoids any first-tick contact resolution surprises).
+        bin_floor_clearance = 0.005
+        base_bottom_z = float(table_z) + bin_floor_clearance
+        base_center_z = base_bottom_z + 0.5 * base_t
+        bin_floor_z = base_bottom_z + base_t  # interior floor (top surface of base)
+        wall_center_z = bin_floor_z + 0.5 * wall_h
+        bin_top_z = bin_floor_z + wall_h
 
         # Center each bin along the y-axis evenly: y in {-spacing, 0, +spacing} for n_bins=3.
         y_centers = [(i - (n_bins - 1) / 2.0) * spacing for i in range(n_bins)]
+
+        def _static_cuboid_cfg(rgb: Tuple[float, float, float], size: Tuple[float, float, float]) -> "CuboidCfg":
+            return CuboidCfg(
+                size=size,
+                visual_material=PreviewSurfaceCfg(diffuse_color=rgb),
+                rigid_props=None,  # static (no rigid body API)
+                mass_props=None,
+                collision_props=sim_utils.CollisionPropertiesCfg(
+                    collision_enabled=True,
+                    contact_offset=phys.contact_offset,
+                    rest_offset=phys.rest_offset,
+                ),
+            )
 
         out: List[Dict[str, object]] = []
         for i, y in enumerate(y_centers, start=0):
@@ -538,26 +603,11 @@ def run(args: argparse.Namespace) -> int:
 
             paths_for_bin: List[str] = []
 
-            base_cfg = CuboidCfg(
-                size=(inner_lx + 2 * wall_t, inner_ly + 2 * wall_t, base_t),
-                visual_material=PreviewSurfaceCfg(diffuse_color=rgb),
-                rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                    rigid_body_enabled=True,
-                    kinematic_enabled=True,
-                    disable_gravity=True,
-                ),
-                mass_props=sim_utils.MassPropertiesCfg(mass=10.0),
-                collision_props=sim_utils.CollisionPropertiesCfg(
-                    collision_enabled=True,
-                    contact_offset=phys.contact_offset,
-                    rest_offset=phys.rest_offset,
-                ),
-            )
+            base_cfg = _static_cuboid_cfg(rgb, (inner_lx + 2 * wall_t, inner_ly + 2 * wall_t, base_t))
             base_path = f"{bin_root}/base"
-            base_cfg.func(base_path, base_cfg, translation=(cx, y, bin_floor_z), orientation=(1.0, 0.0, 0.0, 0.0))
+            base_cfg.func(base_path, base_cfg, translation=(cx, y, base_center_z), orientation=(1.0, 0.0, 0.0, 0.0))
             paths_for_bin.append(base_path)
 
-            # Walls: +X / -X / +Y / -Y.
             walls = [
                 ("wall_px", (wall_t, inner_ly + 2 * wall_t, wall_h), (cx + 0.5 * inner_lx + 0.5 * wall_t, y, wall_center_z)),
                 ("wall_nx", (wall_t, inner_ly + 2 * wall_t, wall_h), (cx - 0.5 * inner_lx - 0.5 * wall_t, y, wall_center_z)),
@@ -565,39 +615,10 @@ def run(args: argparse.Namespace) -> int:
                 ("wall_ny", (inner_lx, wall_t, wall_h), (cx, y - 0.5 * inner_ly - 0.5 * wall_t, wall_center_z)),
             ]
             for wname, wsize, wpos in walls:
-                wcfg = CuboidCfg(
-                    size=wsize,
-                    visual_material=PreviewSurfaceCfg(diffuse_color=rgb),
-                    rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                        rigid_body_enabled=True,
-                        kinematic_enabled=True,
-                        disable_gravity=True,
-                    ),
-                    mass_props=sim_utils.MassPropertiesCfg(mass=5.0),
-                    collision_props=sim_utils.CollisionPropertiesCfg(
-                        collision_enabled=True,
-                        contact_offset=phys.contact_offset,
-                        rest_offset=phys.rest_offset,
-                    ),
-                )
+                wcfg = _static_cuboid_cfg(rgb, wsize)
                 wpath = f"{bin_root}/{wname}"
                 wcfg.func(wpath, wcfg, translation=tuple(wpos), orientation=(1.0, 0.0, 0.0, 0.0))
                 paths_for_bin.append(wpath)
-
-            # Bind a higher-friction material so dropped boxes don't slide out.
-            try:
-                mat_cfg = RigidBodyMaterialCfg(
-                    static_friction=2.0,
-                    dynamic_friction=2.0,
-                    restitution=0.0,
-                    friction_combine_mode="max",
-                )
-                mat_prim = f"{bin_root}/BinFrictionMaterial"
-                mat_cfg.func(mat_prim, mat_cfg)
-                for p in paths_for_bin:
-                    sim_utils.bind_physics_material(p, mat_prim)
-            except Exception:
-                pass
 
             out.append(
                 {
@@ -607,7 +628,7 @@ def run(args: argparse.Namespace) -> int:
                     "color_rgb": rgb,
                     "center_xy": (float(cx), float(y)),
                     "top_z": float(bin_top_z),
-                    "bin_floor_z": float(bin_floor_z + 0.5 * base_t),  # top surface of base
+                    "bin_floor_z": float(bin_floor_z),
                     "inner_xy": (float(inner_lx), float(inner_ly)),
                     "prim_paths": paths_for_bin,
                 }
@@ -617,6 +638,14 @@ def run(args: argparse.Namespace) -> int:
     spawned_paths, id_to_label, id_to_color = _spawn_boxes()
     bins_meta = _spawn_bins()
     print(f"[VLA_V2] Spawned {len(spawned_paths)} boxes and {len(bins_meta)} bins.")
+    for _b in bins_meta:
+        cx_, cy_ = _b["center_xy"]  # type: ignore[index]
+        print(
+            f"[VLA_V2]   bin {int(_b['idx']) + 1} ({_b['color_name']}): "
+            f"center_xy=({float(cx_):.3f}, {float(cy_):.3f}) "
+            f"floor_z={float(_b['bin_floor_z']):.3f} "
+            f"top_z={float(_b['top_z']):.3f}"
+        )
 
     target_leaf = "Obj_01"
     target_prim = f"{BOXES_PARENT}/{target_leaf}"
@@ -798,8 +827,8 @@ def run(args: argparse.Namespace) -> int:
     dt = float(sim.get_physics_dt())
     wp = WaypointFollowerInput(
         step_pos_m=float(ctrl_cfg.linear_speed_mps) * dt,
-        tol_m=float(getattr(args, "tolerance", 0.005)),
-        max_steps_per_waypoint=int(getattr(args, "wp_max_steps_per_waypoint", 2400)),
+        tol_m=float(getattr(args, "tolerance", 0.012)),
+        max_steps_per_waypoint=int(getattr(args, "wp_max_steps_per_waypoint", 480)),
         stagnation_steps=int(10**9),
         device=str(sim.device),
     )
@@ -1137,71 +1166,127 @@ def run(args: argparse.Namespace) -> int:
             )
 
             # ----------------------------------------------------------------
-            # Scripted state machine
+            # Scripted state machine (fluid, grouped waypoints)
             # ----------------------------------------------------------------
             #
-            # Phases (deterministic, with timeouts that just advance to the next
-            # phase if the controller can't fully converge):
+            # Top-level phases. Motion phases queue *multiple* sub-waypoints in
+            # a single ``wp.set_waypoints_b(...)`` call, which makes the
+            # controller flow continuously through them with no pauses
+            # in between (the only stops are at gripper / hold phases).
             #
-            #   1. open_gripper        — open before the approach
-            #   2. approach_above      — fly to (target_x, target_y, transit_z)
-            #   3. descend_pregrasp    — straight down to pregrasp_z_b
-            #   4. descend_grasp       — straight down to grasp_z_b
-            #   5. close_gripper       — close fingers
-            #   6. lift_to_transit     — straight up to transit_z (clears clutter)
-            #   7. transit_to_bin      — XY to (bin_x, bin_y, transit_z)
-            #   8. descend_to_drop     — straight down to drop_z_b
-            #   9. open_gripper_drop   — release grip
-            #  10. retreat_up          — straight up to transit_z
-            #  11. retreat_home        — XY to home_pose_b
-            #  12. done
+            #   1. OPEN_GRIPPER       — open fingers, no motion.
+            #   2. PICK               — fly above target → pregrasp → grasp Z.
+            #   3. CLOSE_GRIPPER      — close fingers around the box.
+            #   4. POST_CLOSE_HOLD    — short hold so contacts settle.
+            #   5. TRANSIT_AND_DROP   — lift → transit XY over clutter → descend
+            #                           into bin (one continuous trajectory).
+            #   6. RELEASE_GRIPPER    — open fingers (drop).
+            #   7. POST_RELEASE_HOLD  — short hold.
+            #   8. RETREAT            — retreat up + back to home XY (continuous).
+            #   9. DONE.
+            #
+            # PICK: always go to a moderate "approach" altitude above the target
+            # first, then descend through pregrasp to grasp.
+            #
+            # We deliberately do NOT command the high transit altitude before
+            # grasping — that was the original "lift the arm to its ceiling and
+            # freeze" failure mode. ``approach_z_b`` is the table top plus
+            # ``--approach-clearance-m`` (default 0.18 m → 0.98 m world Z), well
+            # above any obstacle box top (~0.85 m world Z) but well below the
+            # workspace ceiling so the IK is always solvable.
+            approach_z_b = float(table_z) + float(getattr(args, "approach_clearance_m", 0.18))
+
+            pick_points = [
+                (float(tx_b), float(ty_b), float(approach_z_b)),
+                (float(tx_b), float(ty_b), float(max(pregrasp_z_b, grasp_z_b + 0.015))),
+                (float(tx_b), float(ty_b), float(grasp_z_b)),
+            ]
+            transit_points = [
+                (float(tx_b), float(ty_b), float(transit_z)),
+                (float(bin_drop_x_b), float(bin_drop_y_b), float(transit_z)),
+                (float(bin_drop_x_b), float(bin_drop_y_b), float(drop_z_b)),
+            ]
+            retreat_points = [
+                (float(bin_drop_x_b), float(bin_drop_y_b), float(transit_z)),
+                (float(home_b[0]), float(home_b[1]), float(home_b[2])),
+            ]
 
             phases: List[Tuple[str, Dict[str, object]]] = [
-                ("open_gripper", {"steps": int(getattr(args, "gripper_open_steps", 20)), "value": +1.0}),
-                ("waypoint", {
-                    "name": "approach_above",
-                    "points": [(tx_b, ty_b, transit_z)],
-                }),
-                ("waypoint", {
-                    "name": "descend_pregrasp",
-                    "points": [(tx_b, ty_b, max(pregrasp_z_b, grasp_z_b + 0.02))],
-                }),
-                ("waypoint", {
-                    "name": "descend_grasp",
-                    "points": [(tx_b, ty_b, grasp_z_b)],
-                }),
-                ("close_gripper", {"steps": int(getattr(args, "gripper_close_steps", 60)), "value": -1.0}),
-                ("hold", {"name": "post_close_hold", "steps": int(getattr(args, "hold_after_close_steps", 30))}),
-                ("waypoint", {
-                    "name": "lift_to_transit",
-                    "points": [(tx_b, ty_b, transit_z)],
-                }),
-                ("waypoint", {
-                    "name": "transit_to_bin",
-                    "points": [(bin_drop_x_b, bin_drop_y_b, transit_z)],
-                }),
-                ("waypoint", {
-                    "name": "descend_to_drop",
-                    "points": [(bin_drop_x_b, bin_drop_y_b, drop_z_b)],
-                }),
-                ("open_gripper", {"steps": int(getattr(args, "gripper_open_steps", 20)), "value": +1.0, "name": "release"}),
-                ("hold", {"name": "post_release_hold", "steps": int(getattr(args, "hold_after_release_steps", 30))}),
-                ("waypoint", {
-                    "name": "retreat_up",
-                    "points": [(bin_drop_x_b, bin_drop_y_b, transit_z)],
-                }),
-                ("waypoint", {
-                    "name": "retreat_home",
-                    "points": [(home_b[0], home_b[1], home_b[2])],
-                }),
+                ("open_gripper", {"steps": int(getattr(args, "gripper_open_steps", 24)), "value": +1.0, "name": "OPEN_GRIPPER"}),
+                ("waypoint", {"name": "PICK", "points": pick_points,
+                              "log": {"target_xy_b": [float(tx_b), float(ty_b)],
+                                      "grasp_z_b": float(grasp_z_b)}}),
+                ("close_gripper", {"steps": int(getattr(args, "gripper_close_steps", 60)), "value": -1.0, "name": "CLOSE_GRIPPER"}),
+                ("hold", {"name": "POST_CLOSE_HOLD", "steps": int(getattr(args, "hold_after_close_steps", 20))}),
+                ("waypoint", {"name": "TRANSIT_AND_DROP", "points": transit_points,
+                              "log": {"transit_z_b": float(transit_z),
+                                      "bin_xy_b": [float(bin_drop_x_b), float(bin_drop_y_b)],
+                                      "drop_z_b": float(drop_z_b),
+                                      "bin_idx": int(lang_meta.get("bin_idx", 0))}}),
+                ("open_gripper", {"steps": int(getattr(args, "gripper_open_steps", 24)), "value": +1.0, "name": "RELEASE_GRIPPER"}),
+                ("hold", {"name": "POST_RELEASE_HOLD", "steps": int(getattr(args, "hold_after_release_steps", 24))}),
+                ("waypoint", {"name": "RETREAT", "points": retreat_points,
+                              "log": {"home_xy_b": [float(home_b[0]), float(home_b[1])],
+                                      "home_z_b": float(home_b[2])}}),
                 ("done", {}),
             ]
+
+            print(
+                f"[VLA_V2][EP {int(ep)+1}/{num_episodes}] target_pos_b=({float(tx_b):.3f}, {float(ty_b):.3f}, {float(tz_b):.3f}) "
+                f"-> bin {int(lang_meta.get('bin_idx', 0))} ({lang_meta.get('bin_color')}) @ "
+                f"({float(bin_drop_x_b):.3f}, {float(bin_drop_y_b):.3f}) "
+                f"| grasp_z={float(grasp_z_b):.3f}m transit_z={float(transit_z):.3f}m drop_z={float(drop_z_b):.3f}m"
+            )
+            print(f"[VLA_V2][EP {int(ep)+1}/{num_episodes}] instruction: \"{lang_cmd}\"")
 
             phase_idx = 0
             phase_step_count = 0
             phase_state: Dict[str, object] = {}
-            phase_timeout = int(getattr(args, "phase_timeout_steps", 2400))
-            stabilize_left = int(getattr(args, "stabilize_steps", 180))
+            phase_timeout = int(getattr(args, "phase_timeout_steps", 4800))
+            progress_stride = max(1, int(getattr(args, "progress_print_stride", 240)))
+            stabilize_left = int(getattr(args, "stabilize_steps", 120))
+
+            def _phase_name(idx: int) -> str:
+                if idx >= len(phases):
+                    return "DONE"
+                _kind, _params = phases[idx]
+                return str(_params.get("name", _kind)).upper()
+
+            def _print_phase_start(name: str) -> None:
+                ee = _ee_pos_b()
+                if ee is None:
+                    print(f"[VLA_V2][EP {int(ep)+1}/{num_episodes}] PHASE {name} start (EE pose unavailable)")
+                else:
+                    print(
+                        f"[VLA_V2][EP {int(ep)+1}/{num_episodes}] PHASE {name} start "
+                        f"EE_b=({ee[0]:.3f}, {ee[1]:.3f}, {ee[2]:.3f})"
+                    )
+
+            def _print_progress(name: str, *, goal: Optional[Tuple[float, float, float]] = None,
+                                wp_left: Optional[int] = None) -> None:
+                ee = _ee_pos_b()
+                if ee is None:
+                    return
+                if goal is not None:
+                    dx = ee[0] - goal[0]
+                    dy = ee[1] - goal[1]
+                    dz = ee[2] - goal[2]
+                    dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+                    extra = f" goal=({goal[0]:.3f},{goal[1]:.3f},{goal[2]:.3f}) dist={dist:.3f}m"
+                else:
+                    extra = ""
+                wp_str = f" wp_left={wp_left}" if wp_left is not None else ""
+                print(
+                    f"[VLA_V2][EP {int(ep)+1}/{num_episodes}] PHASE {name}{wp_str} "
+                    f"step={int(steps)} EE_b=({ee[0]:.3f}, {ee[1]:.3f}, {ee[2]:.3f}){extra}"
+                )
+
+            def _phase_final_goal(params: Dict[str, object]) -> Optional[Tuple[float, float, float]]:
+                pts = list(params.get("points", []))
+                if not pts:
+                    return None
+                p = pts[-1]
+                return (float(p[0]), float(p[1]), float(p[2]))
 
             accum = 0.0
             steps = 0
@@ -1220,10 +1305,16 @@ def run(args: argparse.Namespace) -> int:
 
                 if stabilize_left > 0:
                     stabilize_left -= 1
-                    # Just hold while physics settles after reset
-                    pass
+                    if stabilize_left == 0:
+                        ee = _ee_pos_b()
+                        if ee is not None:
+                            print(
+                                f"[VLA_V2][EP {int(ep)+1}/{num_episodes}] settled. "
+                                f"EE_b=({ee[0]:.3f}, {ee[1]:.3f}, {ee[2]:.3f})"
+                            )
                 else:
                     name, params = phases[phase_idx]
+                    log_name = str(params.get("name", name)).upper()
 
                     if name == "done":
                         episode_done = True
@@ -1232,7 +1323,7 @@ def run(args: argparse.Namespace) -> int:
                         steps_total = int(params.get("steps", 30))
                         value = float(params.get("value", +1.0))
                         if not phase_state.get("queued", False):
-                            log_name = str(params.get("name", name)).upper()
+                            _print_phase_start(log_name)
                             session_logger.log_event(
                                 "action_start",
                                 {"action": log_name, "steps": int(steps_total), "value": float(value),
@@ -1249,9 +1340,7 @@ def run(args: argparse.Namespace) -> int:
                         if int(phase_state.get("wait_left", 0)) > 0:
                             phase_state["wait_left"] = int(phase_state["wait_left"]) - 1
                         else:
-                            session_logger.log_event(
-                                "action_end", {"action": str(params.get("name", name)).upper(), "episode_idx": int(ep)},
-                            )
+                            session_logger.log_event("action_end", {"action": log_name, "episode_idx": int(ep)})
                             phase_idx += 1
                             phase_step_count = 0
                             phase_state = {}
@@ -1260,10 +1349,10 @@ def run(args: argparse.Namespace) -> int:
                     elif name == "hold":
                         steps_total = int(params.get("steps", 30))
                         if not phase_state.get("started", False):
+                            _print_phase_start(log_name)
                             session_logger.log_event(
                                 "action_start",
-                                {"action": str(params.get("name", "HOLD")).upper(), "steps": int(steps_total),
-                                 "episode_idx": int(ep)},
+                                {"action": log_name, "steps": int(steps_total), "episode_idx": int(ep)},
                             )
                             phase_state["started"] = True
                             phase_state["left"] = int(steps_total)
@@ -1271,9 +1360,7 @@ def run(args: argparse.Namespace) -> int:
                         if int(phase_state.get("left", 0)) > 0:
                             phase_state["left"] = int(phase_state["left"]) - 1
                         else:
-                            session_logger.log_event(
-                                "action_end", {"action": str(params.get("name", "HOLD")).upper(), "episode_idx": int(ep)},
-                            )
+                            session_logger.log_event("action_end", {"action": log_name, "episode_idx": int(ep)})
                             phase_idx += 1
                             phase_step_count = 0
                             phase_state = {}
@@ -1285,27 +1372,47 @@ def run(args: argparse.Namespace) -> int:
                                 [(float(p[0]), float(p[1]), float(p[2])) for p in pts],
                                 max_seg_m=float(getattr(args, "planner_waypoint_max_seg_m", 0.01)),
                             )
-                            session_logger.log_event(
-                                "action_start",
-                                {"action": str(params.get("name", "WAYPOINT")).upper(), "n_waypoints": int(len(dense)),
-                                 "points": [[float(p[0]), float(p[1]), float(p[2])] for p in pts],
-                                 "episode_idx": int(ep)},
+                            _print_phase_start(log_name)
+                            log_extra = dict(params.get("log", {}) or {})
+                            log_extra.update(
+                                {
+                                    "action": log_name,
+                                    "n_subgoals": int(len(pts)),
+                                    "n_waypoints_dense": int(len(dense)),
+                                    "subgoals": [[float(p[0]), float(p[1]), float(p[2])] for p in pts],
+                                    "episode_idx": int(ep),
+                                }
                             )
+                            session_logger.log_event("action_start", log_extra)
                             controller.set_mode("translate")
                             wp.set_waypoints_b(dense)
                             phase_state["queued"] = True
                             phase_state["start_step"] = int(steps)
+                            phase_state["last_progress_step"] = int(steps)
+                            phase_state["final_goal"] = _phase_final_goal(params)
 
-                        # Advance when waypoints are consumed OR when we've spent too long.
                         spent = int(steps) - int(phase_state.get("start_step", steps))
                         wp_left = len(getattr(wp, "_waypoints_b", []))
+
+                        if (int(steps) - int(phase_state.get("last_progress_step", steps))) >= progress_stride:
+                            _print_progress(log_name, goal=phase_state.get("final_goal"), wp_left=int(wp_left))
+                            phase_state["last_progress_step"] = int(steps)
+
                         if wp_left == 0 or spent >= phase_timeout:
+                            timed_out = bool(spent >= phase_timeout and wp_left > 0)
+                            ee = _ee_pos_b()
+                            print(
+                                f"[VLA_V2][EP {int(ep)+1}/{num_episodes}] PHASE {log_name} done "
+                                f"spent={spent}st wp_left={wp_left}{' (TIMED_OUT)' if timed_out else ''} "
+                                f"EE_b=({ee[0]:.3f}, {ee[1]:.3f}, {ee[2]:.3f})" if ee is not None
+                                else f"[VLA_V2][EP {int(ep)+1}/{num_episodes}] PHASE {log_name} done"
+                            )
                             session_logger.log_event(
                                 "action_end",
-                                {"action": str(params.get("name", "WAYPOINT")).upper(),
+                                {"action": log_name,
                                  "n_remaining_waypoints": int(wp_left),
                                  "spent_steps": int(spent),
-                                 "timed_out": bool(spent >= phase_timeout and wp_left > 0),
+                                 "timed_out": bool(timed_out),
                                  "episode_idx": int(ep)},
                             )
                             try:
@@ -1436,9 +1543,16 @@ def run(args: argparse.Namespace) -> int:
                 "episode_end",
                 {"episode_idx": int(ep), "steps": int(steps), "truncated": not bool(episode_done), "ok": bool(ok)},
             )
+            final_pos_str = (
+                f"({final_state['pos'][0]:.3f}, {final_state['pos'][1]:.3f}, {final_state['pos'][2]:.3f})"
+                if final_state and "pos" in final_state
+                else "n/a"
+            )
             print(
-                f"[VLA_V2][EP] end ep={ep} ok={ok} steps={steps} "
-                f"ticks={session_logger.tick_idx} images={images_captured_episode}"
+                f"[VLA_V2][EP {int(ep)+1}/{num_episodes}] end "
+                f"ok={ok} steps={steps} ticks={session_logger.tick_idx} images={images_captured_episode} "
+                f"final_box_pos={final_pos_str} "
+                f"bin {int(lang_meta.get('bin_idx', 0))} ({lang_meta.get('bin_color')})"
             )
 
             total_ticks += session_logger.tick_idx
