@@ -7,6 +7,7 @@ Scene-environment packages for the Kinova Jaco2 demos.
 - `base.py` — shared `BaseSceneEnv`, `SceneConfig`, `CameraConfig`, `TopDownCameraConfig`, and the `design_scene` helper used by every concrete environment.
 - `ycb_reach_to_grasp/` — reach-to-grasp scene with YCB objects loaded from Isaac Nucleus. Provides `YCBReachToGraspEnv` plus module-level `DEFAULT_SCENE` / `DEFAULT_CAMERA` / `DEFAULT_TOP_DOWN_CAMERA`. Top-down camera is opt-in via `env.attach_top_down_camera()`.
 - `cubes/` — block-stacking scene with uniform colored cubes. Provides `CubesEnv`, the `BOX_COLORS` palette, and per-prim helpers (`label_for_prim`, `read_prim_world_yaw_rad`, `read_prim_height_m`).
+- `pouring/` — pouring task: YCB pitcher + YCB mug/glass + N small dynamic-sphere "pellets" pre-filled inside the pitcher. Both containers use **SDF mesh collision** so their hollow interiors are preserved on dynamic rigid bodies (convex hull would seal the openings). Provides `PouringEnv` plus `count_pellets_in_glass()` / `amount_poured_grams()` volume sensors.
 - `utils/object_loader.py` — generic object loader (USD or `box` mode).
 - `utils/physix.py` — physics configuration (sim dt, substeps, friction, etc.).
 - `utils/camera/` — top-down camera prim creation.
@@ -50,4 +51,5 @@ for p in spawned:
 ```bash
 ./IsaacLab/isaaclab.sh -p kinova-isaac/environments/ycb_reach_to_grasp/demo.py --device cuda
 ./IsaacLab/isaaclab.sh -p kinova-isaac/environments/cubes/demo.py --device cuda --num-objects 3
+./IsaacLab/isaaclab.sh -p kinova-isaac/environments/pouring/demo.py --device cuda --num-pellets 30
 ```

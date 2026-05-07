@@ -17,6 +17,7 @@ def get_envs() -> Dict[str, EnvSpec]:
     envs = [
         EnvSpec(name="ycb_reach_to_grasp", module_base="environments.ycb_reach_to_grasp"),
         EnvSpec(name="cubes", module_base="environments.cubes"),
+        EnvSpec(name="pouring", module_base="environments.pouring"),
         # Backwards-compatible aliases for older profile/CLI names.
         EnvSpec(name="reach_to_grasp", module_base="environments.ycb_reach_to_grasp"),
         EnvSpec(name="reach_to_grasp_VLA", module_base="environments.ycb_reach_to_grasp"),
