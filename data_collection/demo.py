@@ -18,7 +18,6 @@ _env_mod = sys.modules.get("environments")
 if _env_mod is not None and not hasattr(_env_mod, "__path__"):
     del sys.modules["environments"]
 
-import torch
 from isaaclab.app import AppLauncher
 
 from controllers import (  # noqa: E402
@@ -52,73 +51,49 @@ def run_data_collection(args: argparse.Namespace) -> int:
     if _env_mod is not None and not hasattr(_env_mod, "__path__"):
         del sys.modules["environments"]
 
-    import isaaclab.sim as sim_utils  # noqa: E402
-    from environments.reach_to_grasp.utils import design_scene  # noqa: E402
-    from environments.reach_to_grasp.config import (  # noqa: E402
-        DEFAULT_SCENE,
-        DEFAULT_CAMERA,
-    )
-    from environments.utils.object_loader import (  # noqa: E402
-        ObjectLoader,
-        ObjectLoaderConfig,
-        SpawnBounds,
-    )
-    from environments.utils.physix import (  # noqa: E402
-        PhysicsConfig,
-        apply_to_simulation_cfg,
-        object_loader_kwargs_from_physix,
-    )
+    from environments.ycb_reach_to_grasp import YCBReachToGraspEnv  # noqa: E402
     from data_collection.engine.episode_runner import EpisodeRunner  # noqa: E402
 
-    # Setup simulation
-    phys = PhysicsConfig(device=args.device)
-    sim_cfg = sim_utils.SimulationCfg(device=phys.device)
-    apply_to_simulation_cfg(sim_cfg, phys)
-    sim = sim_utils.SimulationContext(sim_cfg)
+    scale_range = None
+    if getattr(args, "scale_min", None) is not None and getattr(args, "scale_max", None) is not None:
+        scale_range = (float(args.scale_min), float(args.scale_max))
+        print(f"[DATA] Uniform scale range: {scale_range}")
+
+    env = YCBReachToGraspEnv(device=args.device, scale_range=scale_range)
+    sim = env.build_simulation()
     if not args.headless:
-        sim.set_camera_view(DEFAULT_CAMERA.eye, DEFAULT_CAMERA.target)
+        env.set_default_camera_view()
 
     print("[DATA] App launched; building scene...")
-    # Build scene
-    scene_entities, scene_origins = design_scene(DEFAULT_SCENE)
-    robot = scene_entities["kinova_j2n6s300"]
+    env.design_scene()
+    robot = env.robot
 
     # Spawn objects (default to Nucleus YCB if not provided)
     id_to_label: Dict[str, str] = {}
-    prim_paths = []
+    prim_paths: list[str] = []
     dataset_dirs = [str(d) for d in getattr(args, "objects_dataset", [])]
     if len(dataset_dirs) == 0:
-        try:
-            from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR  # type: ignore  # noqa: E402
-
-            ycb_dir = f"{ISAAC_NUCLEUS_DIR}/Props/YCB"
-        except Exception:
-            ycb_dir = (
-                "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.0/Isaac/Props/YCB"
-            )
-        dataset_dirs = [ycb_dir]
+        dataset_dirs = [env.ycb_dir]
         print(f"[DATA] Using default YCB dataset: {dataset_dirs[0]}")
     else:
         print(f"[DATA] Using custom object datasets: {dataset_dirs}")
+
     if (not getattr(args, "no_objects", False)) and int(args.num_objects) > 0:
-        scale_range = None
-        if getattr(args, "scale_min", None) is not None and getattr(args, "scale_max", None) is not None:
-            scale_range = (float(args.scale_min), float(args.scale_max))
-            print(f"[DATA] Uniform scale range: {scale_range}")
-        phys_loader_kwargs = object_loader_kwargs_from_physix(phys)
-        loader_cfg = ObjectLoaderConfig(
-            dataset_dirs=dataset_dirs,
-            bounds=SpawnBounds(min_xyz=tuple(args.spawn_min), max_xyz=tuple(args.spawn_max)),
+        loader = env.build_object_loader(
+            spawn_min=tuple(args.spawn_min),
+            spawn_max=tuple(args.spawn_max),
             min_distance=float(getattr(args, "min_distance", 0.1)),
-            uniform_scale_range=scale_range,
-            **phys_loader_kwargs,
+            dataset_dirs=dataset_dirs,
         )
         print(
-            f"[DATA] Spawning {int(args.num_objects)} objects in AABB min={tuple(args.spawn_min)} max={tuple(args.spawn_max)}"
+            f"[DATA] Spawning {int(args.num_objects)} objects in AABB "
+            f"min={tuple(args.spawn_min)} max={tuple(args.spawn_max)}"
         )
-        loader = ObjectLoader(loader_cfg)
         try:
-            prim_paths = loader.spawn(parent_prim_path="/World/Origin1", num_objects=int(args.num_objects))
+            prim_paths = loader.spawn(
+                parent_prim_path="/World/Origin1",
+                num_objects=int(args.num_objects),
+            )
         except Exception as e:
             print(f"[DATA][WARN] Object spawn failed: {e}")
             prim_paths = []
@@ -131,14 +106,7 @@ def run_data_collection(args: argparse.Namespace) -> int:
             print("[DATA][WARN] Could not build id->label map; labels may default to 'object'.")
 
     # Reset sim and robot
-    sim.reset()
-    origin0 = torch.tensor(scene_origins[0], device=sim.device)
-    root_state = robot.data.default_root_state.clone()
-    root_state[:, :3] += origin0
-    robot.write_root_pose_to_sim(root_state[:, :7])
-    robot.write_root_velocity_to_sim(root_state[:, 7:])
-    robot.write_joint_state_to_sim(robot.data.default_joint_pos, robot.data.default_joint_vel)
-    robot.reset()
+    env.reset()
 
     # Controller
     ctrl_cfg = CartesianVelocityJogConfig(

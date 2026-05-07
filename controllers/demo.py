@@ -3,7 +3,6 @@ import argparse
 import sys
 from pathlib import Path
 
-import torch
 from isaaclab.app import AppLauncher
 from controllers import ModeManager
 
@@ -48,32 +47,15 @@ def main():
     simulation_app = app_launcher.app
 
     # Import modules that require an active Omniverse app after AppLauncher
-    import isaaclab.sim as sim_utils
-    try:
-        from environments.reach_to_grasp.config import DEFAULT_SCENE, DEFAULT_CAMERA
-        from environments.reach_to_grasp.utils import design_scene
-    except Exception:
-        from environments.reach_to_grasp.config import DEFAULT_SCENE, DEFAULT_CAMERA  # type: ignore
-        from environments.reach_to_grasp.utils import design_scene  # type: ignore
+    from environments.ycb_reach_to_grasp import YCBReachToGraspEnv
 
-    sim_cfg = sim_utils.SimulationCfg(device=args_cli.device)
-    sim = sim_utils.SimulationContext(sim_cfg)
+    env = YCBReachToGraspEnv(device=args_cli.device)
+    sim = env.build_simulation()
     if not args_cli.headless:
-        sim.set_camera_view(DEFAULT_CAMERA.eye, DEFAULT_CAMERA.target)
-
-    # Build scene and fetch robot
-    scene_entities, scene_origins = design_scene(DEFAULT_SCENE)
-    robot = scene_entities["kinova_j2n6s300"]
-
-    # Reset sim and robot state at origin 0
-    sim.reset()
-    origin0 = torch.tensor(scene_origins[0], device=sim.device)
-    root_state = robot.data.default_root_state.clone()
-    root_state[:, :3] += origin0
-    robot.write_root_pose_to_sim(root_state[:, :7])
-    robot.write_root_velocity_to_sim(root_state[:, 7:])
-    robot.write_joint_state_to_sim(robot.data.default_joint_pos, robot.data.default_joint_vel)
-    robot.reset()
+        env.set_default_camera_view()
+    env.design_scene()
+    robot = env.robot
+    env.reset()
 
     # Controller setup
     ctrl_cfg = CartesianVelocityJogConfig(

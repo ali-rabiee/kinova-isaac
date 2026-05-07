@@ -31,15 +31,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-BOX_COLORS: list[tuple[str, tuple[float, float, float]]] = [
-    ("red", (0.9, 0.2, 0.2)),
-    ("blue", (0.2, 0.4, 0.9)),
-    ("green", (0.2, 0.9, 0.3)),
-    ("yellow", (0.9, 0.8, 0.2)),
-    ("purple", (0.7, 0.3, 0.8)),
-]
-
-
 # --- Path bootstrap (same pattern as vla_v0/v1 to survive Kit side effects) ---
 ROOT = Path(__file__).resolve().parents[2]
 root_str = str(ROOT)
@@ -209,24 +200,15 @@ def main() -> int:
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
 
-    import importlib
     import random
 
-    import isaaclab.sim as sim_utils
     import torch
     from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
     from isaaclab.utils.math import quat_apply, quat_conjugate, subtract_frame_transforms
 
-    from environments.utils.object_loader import ObjectLoader, ObjectLoaderConfig, SpawnBounds
-    from environments.utils.physix import PhysicsConfig, apply_to_simulation_cfg, object_loader_kwargs_from_physix
+    from environments.cubes import CubesEnv
     from kinova import GripperConfig, GripperController
     from motion_generation.grasp_estimation.obb import ObbGraspPoseProvider
-
-    env_cfg_mod = importlib.import_module("environments.reach_to_grasp_VLA.config")
-    env_utils_mod = importlib.import_module("environments.reach_to_grasp_VLA.utils")
-    DEFAULT_SCENE = getattr(env_cfg_mod, "DEFAULT_SCENE")
-    DEFAULT_CAMERA = getattr(env_cfg_mod, "DEFAULT_CAMERA", None)
-    design_scene = getattr(env_utils_mod, "design_scene")
 
     if int(args.seed) >= 0:
         random.seed(int(args.seed))
@@ -318,59 +300,33 @@ def main() -> int:
             return self.t_elapsed >= self.min_duration_s
 
     # ------------------------------------------------------------------
-    # Build sim + scene + robot.
+    # Build sim + scene + robot via the cubes environment.
     # ------------------------------------------------------------------
-    phys = PhysicsConfig(device=str(getattr(args, "device", "cuda:0")))
-    # For stacking boxes, keep local Z as world Z so --box-size-min/max Z is the visual/physical height.
-    # The shared PhysicsConfig default tilts imported USD assets, which is not what we want for CuboidCfg blocks.
-    phys.orientation_euler_deg = None
-    sim_cfg = sim_utils.SimulationCfg(device=phys.device)
-    apply_to_simulation_cfg(sim_cfg, phys)
-    sim = sim_utils.SimulationContext(sim_cfg)
-    if (not getattr(args, "headless", False)) and DEFAULT_CAMERA is not None:
-        sim.set_camera_view(DEFAULT_CAMERA.eye, DEFAULT_CAMERA.target)
-
-    scene_entities, scene_origins = design_scene(DEFAULT_SCENE)
-    robot = scene_entities["kinova_j2n6s300"]
-
-    if args.box_size_min is not None or args.box_size_max is not None:
-        if args.box_size_min is None or args.box_size_max is None:
-            print("[STACK][ERROR] Provide both --box-size-min and --box-size-max, or neither.")
-            simulation_app.close()
-            return 2
-        box_size_min = tuple(float(v) for v in args.box_size_min)
-        box_size_max = tuple(float(v) for v in args.box_size_max)
-    else:
-        side = float(args.box_size)
-        box_size_min = (side, side, side)
-        box_size_max = (side, side, side)
-
-    loader_cfg = ObjectLoaderConfig(
-        dataset_dirs=[],
-        bounds=SpawnBounds(min_xyz=tuple(args.spawn_min), max_xyz=tuple(args.spawn_max)),
-        min_distance=float(args.min_distance),
-        spawn_mode="box",
-        box_size_min=box_size_min,
-        box_size_max=box_size_max,
-        box_color_palette=[rgb for (_name, rgb) in BOX_COLORS],
-        box_color_names=[name for (name, _rgb) in BOX_COLORS],
-        **object_loader_kwargs_from_physix(phys),
+    env = CubesEnv(
+        device=str(getattr(args, "device", "cuda:0")),
+        box_size=float(args.box_size),
+        box_size_min=args.box_size_min,
+        box_size_max=args.box_size_max,
     )
-    loader = ObjectLoader(loader_cfg)
+    sim = env.build_simulation()
+    if not getattr(args, "headless", False):
+        env.set_default_camera_view()
+
+    env.design_scene()
+    robot = env.robot
+
+    loader = env.build_object_loader(
+        spawn_min=tuple(args.spawn_min),
+        spawn_max=tuple(args.spawn_max),
+        min_distance=float(args.min_distance),
+    )
     spawned_paths = loader.spawn(parent_prim_path="/World/Origin1", num_objects=int(args.num_objects))
     if len(spawned_paths) == 0:
         print("[STACK][ERROR] No objects spawned. Aborting.")
         simulation_app.close()
         return 2
 
-    sim.reset()
-    origin0 = torch.tensor(scene_origins[0], device=sim.device)
-    root_state = robot.data.default_root_state.clone()
-    root_state[:, :3] += origin0
-    robot.write_root_pose_to_sim(root_state[:, :7])
-    robot.write_root_velocity_to_sim(root_state[:, 7:])
-    robot.write_joint_state_to_sim(robot.data.default_joint_pos, robot.data.default_joint_vel)
-    robot.reset()
+    env.reset()
 
     arm_joint_ids_t, _ = robot.find_joints(str(args.arm_joint_regex))
     if hasattr(arm_joint_ids_t, "view"):
@@ -406,55 +362,8 @@ def main() -> int:
 
     grasp_provider = ObbGraspPoseProvider(align_to_min_width=False)
 
-    import importlib as _importlib_for_usd
-
-    _pxr_usd = _importlib_for_usd.import_module("pxr.Usd")
-    _pxr_usdgeom = _importlib_for_usd.import_module("pxr.UsdGeom")
-    _omni_usd = _importlib_for_usd.import_module("omni.usd")
-    _usd_stage = _omni_usd.get_context().get_stage()
-    _bbox_cache = _pxr_usdgeom.BBoxCache(_pxr_usd.TimeCode.Default(), [_pxr_usdgeom.Tokens.default_])
-
-    def _read_prim_world_yaw_rad(prim_path: str) -> float | None:
-        try:
-            prim = _usd_stage.GetPrimAtPath(str(prim_path))
-            if not prim.IsValid():
-                return None
-            xformable = _pxr_usdgeom.Xformable(prim)
-            M = xformable.ComputeLocalToWorldTransform(_pxr_usd.TimeCode.Default())
-            return math.atan2(float(M[0][1]), float(M[0][0]))
-        except Exception as e:
-            print(f"[STACK][WARN] could not read world yaw for {prim_path}: {e}")
-            return None
-
     def _read_prim_height_m(prim_path: str) -> float:
-        try:
-            prim = _usd_stage.GetPrimAtPath(str(prim_path))
-            if not prim.IsValid():
-                raise RuntimeError("invalid prim")
-            world_bound = _bbox_cache.ComputeWorldBound(prim)
-            r = world_bound.ComputeAlignedRange()
-            return max(1e-4, float(r.GetMax()[2]) - float(r.GetMin()[2]))
-        except Exception as e:
-            print(f"[STACK][WARN] could not read height for {prim_path}: {e}; falling back to --box-size.")
-            return float(args.box_size)
-
-    def _box_index_from_prim_path(prim_path: str) -> int | None:
-        leaf = str(prim_path).rstrip("/").split("/")[-1]
-        digits = "".join(ch for ch in leaf if ch.isdigit())
-        if not digits:
-            return None
-        try:
-            return int(digits)
-        except Exception:
-            return None
-
-    def _box_label(prim_path: str) -> tuple[str, str | None, int | None]:
-        idx = _box_index_from_prim_path(prim_path)
-        if idx is None or len(BOX_COLORS) == 0:
-            leaf = str(prim_path).rstrip("/").split("/")[-1]
-            return f"box {leaf}", None, idx
-        color_name = BOX_COLORS[(idx - 1) % len(BOX_COLORS)][0]
-        return f"{color_name} box {idx}", color_name, idx
+        return env.read_prim_height_m(str(prim_path), default=float(args.box_size))
 
     def _read_ee_pose_b() -> tuple[torch.Tensor, torch.Tensor]:
         ee_pose_w = robot.data.body_pose_w[:, ee_body_id]
@@ -691,7 +600,7 @@ def main() -> int:
         except Exception as e:
             print(f"[STACK][WARN] OBB failed for {prim_path}: {e}. Skipping.")
             continue
-        label, color_name, box_index = _box_label(str(prim_path))
+        label, color_name, box_index = env.label_for_prim(str(prim_path))
         blocks.append(
             BlockInfo(
                 prim_path=str(prim_path),
@@ -699,7 +608,7 @@ def main() -> int:
                 color_name=color_name,
                 box_index=box_index,
                 height_m=_read_prim_height_m(str(prim_path)),
-                yaw_w_rad=_read_prim_world_yaw_rad(str(prim_path)),
+                yaw_w_rad=env.read_prim_world_yaw_rad(str(prim_path)),
                 top_b=top_b,
                 grasp_quat_w=grasp_quat_w,
             )

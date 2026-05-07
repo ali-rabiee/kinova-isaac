@@ -10,7 +10,7 @@ from data_collection.profiles.spec import ProfileSpec
 
 
 def add_cli_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--env", type=str, default="reach_to_grasp", choices=sorted(get_envs().keys()))
+    parser.add_argument("--env", type=str, default="ycb_reach_to_grasp", choices=sorted(get_envs().keys()))
     parser.add_argument("--logs-root", type=str, default="logs/data_collection")
     parser.add_argument("--log-rate-hz", type=int, default=10)
     parser.add_argument("--duration-s", type=float, default=30.0)
@@ -30,8 +30,7 @@ def run(args: argparse.Namespace) -> int:
     if _env_mod is not None and not hasattr(_env_mod, "__path__"):
         del sys.modules["environments"]
 
-    # Heavy imports (torch / isaaclab / omni) must happen only after Kit is started.
-    import torch
+    # Heavy imports (isaaclab / omni) must happen only after Kit is started.
     from isaaclab.app import AppLauncher
     from data_collection.core.input_mux import CommandMuxInputProvider
     from data_collection.core.logger import SessionLogWriter, TickLoggingConfig
@@ -41,73 +40,44 @@ def run(args: argparse.Namespace) -> int:
     simulation_app = app_launcher.app
 
     # Imports requiring active app
-    import importlib
-    import isaaclab.sim as sim_utils
-
     from controllers import CartesianVelocityJogConfig, CartesianVelocityJogController
+    from environments.ycb_reach_to_grasp import YCBReachToGraspEnv
 
-    from environments.utils.object_loader import ObjectLoader, ObjectLoaderConfig, SpawnBounds
-    from environments.utils.physix import PhysicsConfig, apply_to_simulation_cfg, object_loader_kwargs_from_physix
+    scale_range = None
+    if getattr(args, "scale_min", None) is not None and getattr(args, "scale_max", None) is not None:
+        scale_range = (float(args.scale_min), float(args.scale_max))
 
-    env_spec = get_envs()[str(getattr(args, "env", "reach_to_grasp"))]
-    env_cfg_mod = importlib.import_module(f"{env_spec.module_base}.config")
-    env_utils_mod = importlib.import_module(f"{env_spec.module_base}.utils")
-    DEFAULT_SCENE = getattr(env_cfg_mod, "DEFAULT_SCENE")
-    DEFAULT_CAMERA = getattr(env_cfg_mod, "DEFAULT_CAMERA", None)
-    design_scene = getattr(env_utils_mod, "design_scene")
+    env = YCBReachToGraspEnv(
+        device=str(getattr(args, "device", "cuda:0")),
+        scale_range=scale_range,
+    )
+    sim = env.build_simulation()
+    if not getattr(args, "headless", False):
+        env.set_default_camera_view()
 
-    # Setup sim
-    phys = PhysicsConfig(device=str(getattr(args, "device", "cuda:0")))
-    sim_cfg = sim_utils.SimulationCfg(device=phys.device)
-    apply_to_simulation_cfg(sim_cfg, phys)
-    sim = sim_utils.SimulationContext(sim_cfg)
-    if (not getattr(args, "headless", False)) and DEFAULT_CAMERA is not None:
-        sim.set_camera_view(DEFAULT_CAMERA.eye, DEFAULT_CAMERA.target)
-
-    # Build scene and robot
-    scene_entities, scene_origins = design_scene(DEFAULT_SCENE)
-    robot = scene_entities["kinova_j2n6s300"]
+    env.design_scene()
+    robot = env.robot
 
     # Spawn objects
     spawned_paths = []
     id_to_label: Dict[str, str] = {}
     if not getattr(args, "no_objects", False):
-        try:
-            from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR  # type: ignore
-
-            ycb_dir = f"{ISAAC_NUCLEUS_DIR}/Props/YCB"
-        except Exception:
-            ycb_dir = "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.0/Isaac/Props/YCB"
-
-        scale_range = None
-        if getattr(args, "scale_min", None) is not None and getattr(args, "scale_max", None) is not None:
-            scale_range = (float(args.scale_min), float(args.scale_max))
-
-        phys_loader_kwargs = object_loader_kwargs_from_physix(phys)
-        loader_cfg = ObjectLoaderConfig(
-            dataset_dirs=[ycb_dir],
-            bounds=SpawnBounds(min_xyz=tuple(args.spawn_min), max_xyz=tuple(args.spawn_max)),
+        loader = env.build_object_loader(
+            spawn_min=tuple(args.spawn_min),
+            spawn_max=tuple(args.spawn_max),
             min_distance=float(getattr(args, "min_distance", 0.1)),
-            uniform_scale_range=scale_range,
-            **phys_loader_kwargs,
         )
-        loader = ObjectLoader(loader_cfg)
-        spawned_paths = loader.spawn(parent_prim_path="/World/Origin1", num_objects=int(getattr(args, "num_objects", 0)))
+        spawned_paths = loader.spawn(
+            parent_prim_path="/World/Origin1",
+            num_objects=int(getattr(args, "num_objects", 0)),
+        )
         try:
             prim_to_label = loader.get_last_spawn_labels()
             id_to_label = {str(p).split("/")[-1]: str(lbl) for p, lbl in prim_to_label.items()}
         except Exception:
             id_to_label = {}
 
-    # Reset sim and robot
-    sim.reset()
-    origin0 = torch.tensor(scene_origins[0], device=sim.device)
-    root_state = robot.data.default_root_state.clone()
-    root_state[:, :3] += origin0
-    robot.write_root_pose_to_sim(root_state[:, :7])
-    robot.write_root_velocity_to_sim(root_state[:, 7:])
-    robot.write_joint_state_to_sim(robot.data.default_joint_pos, robot.data.default_joint_vel)
-    robot.reset()
+    env.reset()
 
     # Controller
     ctrl_cfg = CartesianVelocityJogConfig(
