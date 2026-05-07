@@ -24,6 +24,8 @@ class WaypointFollowerInput(InputProvider):
 		max_steps_per_waypoint: int = 600,
 		stagnation_steps: int = 60,
 		stagnation_eps_m: float = 5e-4,
+		settle_hits_within_tol: int = 1,
+		approach_ramp_tol_mult: float = 0.0,
 		device: str = "cpu",
 	) -> None:
 		self.step_pos_m = float(step_pos_m)
@@ -31,6 +33,8 @@ class WaypointFollowerInput(InputProvider):
 		self.max_steps_per_waypoint = max(1, int(max_steps_per_waypoint))
 		self.stagnation_steps = max(1, int(stagnation_steps))
 		self.stagnation_eps_m = float(stagnation_eps_m)
+		self.settle_hits_within_tol = max(1, int(settle_hits_within_tol))
+		self.approach_ramp_tol_mult = float(max(0.0, approach_ramp_tol_mult))
 		self.device = torch.device(device)
 		self._waypoints_b: List[torch.Tensor] = []
 		self._current_ee_pos_b: Optional[torch.Tensor] = None
@@ -43,6 +47,7 @@ class WaypointFollowerInput(InputProvider):
 		self._wp_steps_on_current: int = 0
 		self._wp_last_dist_m: Optional[float] = None
 		self._wp_stagnant_steps: int = 0
+		self._wp_consec_within_tol: int = 0
 
 	def reset(self) -> None:
 		self._waypoints_b = []
@@ -53,6 +58,7 @@ class WaypointFollowerInput(InputProvider):
 		self._wp_steps_on_current = 0
 		self._wp_last_dist_m = None
 		self._wp_stagnant_steps = 0
+		self._wp_consec_within_tol = 0
 
 	def set_tolerance_m(self, tol_m: float) -> None:
 		"""Change position convergence radius (meters) for subsequent waypoints."""
@@ -73,6 +79,7 @@ class WaypointFollowerInput(InputProvider):
 		self._wp_steps_on_current = 0
 		self._wp_last_dist_m = None
 		self._wp_stagnant_steps = 0
+		self._wp_consec_within_tol = 0
 
 	def queue_gripper(self, g_value: float, steps: int) -> None:
 		self._gripper_value = float(g_value)
@@ -131,14 +138,22 @@ class WaypointFollowerInput(InputProvider):
 		self._wp_last_dist_m = float(dist)
 
 		if dist <= self.tol_m:
+			self._wp_consec_within_tol += 1
+			if self._wp_consec_within_tol < self.settle_hits_within_tol:
+				# Hold briefly so Diff IK / safety clamp noise does not pop waypoints on a single lucky step.
+				cmd = torch.zeros(1, 6, dtype=torch.float32, device=self.device)
+				self._last_cmd = cmd
+				return cmd
 			# Reached; pop and output zero
 			self._waypoints_b.pop(0)
 			self._wp_steps_on_current = 0
 			self._wp_last_dist_m = None
 			self._wp_stagnant_steps = 0
+			self._wp_consec_within_tol = 0
 			cmd = torch.zeros(1, 6, dtype=torch.float32, device=self.device)
 			self._last_cmd = cmd
 			return cmd
+		self._wp_consec_within_tol = 0
 
 		# If we spend too long on a waypoint or stagnate, give up and pop it.
 		if self._wp_steps_on_current >= self.max_steps_per_waypoint or self._wp_stagnant_steps >= self.stagnation_steps:
@@ -146,11 +161,16 @@ class WaypointFollowerInput(InputProvider):
 			self._wp_steps_on_current = 0
 			self._wp_last_dist_m = None
 			self._wp_stagnant_steps = 0
+			self._wp_consec_within_tol = 0
 			cmd = torch.zeros(1, 6, dtype=torch.float32, device=self.device)
 			self._last_cmd = cmd
 			return cmd
 
-		step = self.step_pos_m
+		step = float(self.step_pos_m)
+		if self.approach_ramp_tol_mult > 1e-9:
+			ramp_end = max(float(self.tol_m) * float(self.approach_ramp_tol_mult), step * 2.0)
+			if dist < ramp_end:
+				step *= float(dist / max(ramp_end, 1e-9))
 		d = (diff / (dist + 1e-9)) * min(step, dist)
 		cmd6 = torch.zeros(1, 6, dtype=torch.float32, device=self.device)
 		cmd6[0, 0:3] = d

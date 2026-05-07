@@ -104,6 +104,25 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
         help="Stagnation improvement threshold in meters (only used if wp-stagnation-steps is finite).",
     )
     parser.add_argument(
+        "--wp-settle-hits-within-tol",
+        type=int,
+        default=1,
+        help=(
+            "Consecutive physics steps inside waypoint tolerance before advancing. "
+            "Values >1 reduce chatter but can stall the final pregrasp→grasp descent if distance hovers near tol. "
+            "Try 2–3 only if you see waypoint popping noise, not descent stalls."
+        ),
+    )
+    parser.add_argument(
+        "--wp-approach-ramp-tol-mult",
+        type=float,
+        default=0.0,
+        help=(
+            "Scale tolerance by this factor to ramp down per-step motion near each waypoint (0=off, legacy). "
+            "Non-zero can slow or stall vertical grasp segments; use 4–8 only if testing smoothing."
+        ),
+    )
+    parser.add_argument(
         "--replan-cooldown-steps",
         type=int,
         default=120,
@@ -138,11 +157,13 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
         "--target-selection",
         type=str,
         default="first",
-        choices=["first", "random", "farthest"],
+        choices=["first", "random", "farthest", "farthest_no_repeat"],
         help=(
             "How to choose the target when no --target-prim/--target-index is provided. "
             "'farthest' = among objects inside the workspace XY box (see --workspace-min/max-x/y and "
-            "--target-reach-margin-m), pick the largest base-frame XY distance from the robot base."
+            "--target-reach-margin-m), pick the largest base-frame XY distance from the robot base. "
+            "'farthest_no_repeat' = same, but after a successful lift the next episode cannot pick "
+            "the same object again (when at least two candidates exist)."
         ),
     )
     parser.add_argument(
@@ -773,6 +794,7 @@ def run(args: argparse.Namespace) -> int:
         object_z_by_leaf: dict[str, float] | None = None,
         object_pos_b_by_leaf: dict[str, tuple[float, float, float]] | None = None,
         prev_target_prim: str | None = None,
+        avoid_repeat_after_success_prim: str | None = None,
     ) -> str | None:
         """Select exactly ONE target prim for an episode (stable for that episode)."""
         if not spawned_paths:
@@ -833,7 +855,7 @@ def run(args: argparse.Namespace) -> int:
 
         # Fallback selection policy
         sel = str(getattr(args, "target_selection", "first"))
-        if sel == "farthest":
+        if sel in ("farthest", "farthest_no_repeat"):
             if object_pos_b_by_leaf and len(candidates) > 0:
                 margin = float(getattr(args, "target_reach_margin_m", 0.03))
                 margin = float(max(0.0, margin))
@@ -865,6 +887,16 @@ def run(args: argparse.Namespace) -> int:
                     except Exception:
                         pass
                     pool = list(candidates)
+
+                if sel == "farthest_no_repeat" and avoid_repeat_after_success_prim:
+                    try:
+                        av = str(avoid_repeat_after_success_prim)
+                        if len(pool) > 1 and any(str(p) == av for p in pool):
+                            pool_ex = [p for p in pool if str(p) != av]
+                            if pool_ex:
+                                pool = pool_ex
+                    except Exception:
+                        pass
 
                 scored: list[tuple[float, str]] = []
                 for p in pool:
@@ -1196,7 +1228,8 @@ def run(args: argparse.Namespace) -> int:
                 except Exception:
                     rb_path = str(prim_path)
 
-                # For box mode, prefer physics-aware RigidPrim teleport (more reliable across sim.reset()).
+                # Box mode: RigidPrim can report success but not commit poses after sim.reset(); never skip
+                # the tensor-view path below (that was leaving objects frozen across episodes).
                 try:
                     if str(getattr(args, "spawn_mode", "usd")) == "box":
                         qw, qx, qy, qz = _yaw_quat_wxyz(yaw)
@@ -1205,12 +1238,11 @@ def run(args: argparse.Namespace) -> int:
                             px += float(origin0[0].item())
                             py += float(origin0[1].item())
                             pz += float(origin0[2].item())
-                        if _teleport_via_rigidprim(
+                        _teleport_via_rigidprim(
                             rb_prim_path=str(rb_path),
                             pos_xyz=(float(px), float(py), float(pz)),
                             quat_wxyz=(float(qw), float(qx), float(qy), float(qz)),
-                        ):
-                            continue
+                        )
                 except Exception:
                     pass
 
@@ -1477,6 +1509,8 @@ def run(args: argparse.Namespace) -> int:
             max_steps_per_waypoint=int(getattr(args, "wp_max_steps_per_waypoint", 2400)),
             stagnation_steps=int(getattr(args, "wp_stagnation_steps", 10**9)),
             stagnation_eps_m=float(getattr(args, "wp_stagnation_eps_m", 5e-4)),
+            settle_hits_within_tol=int(getattr(args, "wp_settle_hits_within_tol", 1)),
+            approach_ramp_tol_mult=float(getattr(args, "wp_approach_ramp_tol_mult", 0.0)),
             device=str(sim.device),
         )
         mux_input.set_base(wp)
@@ -1686,6 +1720,8 @@ def run(args: argparse.Namespace) -> int:
         # Persist target choice across episodes so we can enforce "different target after reset"
         # when multiple objects exist.
         prev_target_prim: str | None = None
+        # After a successful lift, `farthest_no_repeat` will not pick this prim again (when possible).
+        avoid_repeat_after_success_prim: str | None = None
         
         # Keep a per-cycle object layout so episodes 0..N-1 share poses, then we reshuffle.
         cycle_object_poses: Optional[list[tuple[tuple[float, float, float], float]]] = None
@@ -1889,6 +1925,7 @@ def run(args: argparse.Namespace) -> int:
                     object_z_by_leaf=obj_z_by_leaf,
                     object_pos_b_by_leaf=object_pos_b_by_leaf,
                     prev_target_prim=prev_target_prim,
+                    avoid_repeat_after_success_prim=avoid_repeat_after_success_prim,
                 )
                 # Episode-level language command for VLA training (stored once per episode).
                 lang_cmd, lang_meta = ("", {})
@@ -1947,6 +1984,7 @@ def run(args: argparse.Namespace) -> int:
                         "approach_stall_steps": 0,
                         "approach_start_step": None,
                         "obstacle_xy_b": obstacle_xy_b,
+                        "episode_lift_success": False,
                     }
                 )
 
@@ -2620,6 +2658,7 @@ def run(args: argparse.Namespace) -> int:
                                                     "action_end",
                                                     {"action": "LIFT", "episode_idx": int(ep), "early_success": True},
                                                 )
+                                                vla_planner_state["episode_lift_success"] = True
                                                 vla_planner_state["stage"] = "done"
                                                 # Skip the rest of lift handling this step.
                                                 continue
@@ -2671,6 +2710,7 @@ def run(args: argparse.Namespace) -> int:
                                         },
                                     )
                                     if ok:
+                                        vla_planner_state["episode_lift_success"] = True
                                         vla_planner_state["stage"] = "done"
                                     else:
                                         # Retry: reopen and replan (within the same episode)
@@ -2816,6 +2856,13 @@ def run(args: argparse.Namespace) -> int:
                         session_logger.close()
                     except Exception:
                         pass
+                try:
+                    if bool(vla_planner_state.get("episode_lift_success", False)):
+                        avoid_repeat_after_success_prim = str(vla_planner_state.get("target_prim", "") or "") or None
+                    else:
+                        avoid_repeat_after_success_prim = None
+                except Exception:
+                    avoid_repeat_after_success_prim = None
             except Exception as ep_error:
                 # Catch any episode-level errors and continue to next episode
                 import traceback

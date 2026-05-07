@@ -117,14 +117,56 @@ All commands assume you run them from the **repo root**
 
 ### 5.1 Collect data (`vla_v1`)
 
+**Recommendation (current setup):** Prefer **colored boxes** — default `collect_v3.sh` uses `--spawn-mode box` unless you override it. Training uses a **fixed top-down camera only** (no wrist / eye-in-hand camera yet). YCB assets are more diverse in shape and appearance; without a wrist view, policies have a harder time from a single overhead view, so **boxes are the safer default** until wrist cameras are added. YCB commands below are still documented for later or for experiments.
+
+**Command to run (from the repo root `kinova-isaac/`, in your Isaac Lab / Isaac Sim Python env):**
+
+```bash
+# Recommended default: boxes, scripted planner, top-down images
+NUM_EPISODES=20 ./vla_lab/scripts/collect_v3.sh
+```
+
+**Other useful invocations (same repo root):**
+
+```bash
+# cuRobo MotionGen instead of scripted straight-line waypoints
+PLANNER=curobo_v2 NUM_EPISODES=20 ./vla_lab/scripts/collect_v3.sh
+
+# More / fewer objects (default in script is 11)
+NUM_OBJECTS=8 NUM_EPISODES=20 ./vla_lab/scripts/collect_v3.sh
+
+# Headless + GPU
+DEVICE=cuda:0 NUM_EPISODES=20 ./vla_lab/scripts/collect_v3.sh --headless
+
+# --- YCB / USD props (optional; prefer boxes until wrist camera exists) ---
+
+# YCB via convenience flag: adds --use-ycb, which forces spawn_mode=usd inside the profile
+# (even if SPAWN_MODE=box were set on the wrapper)
+USE_YCB=1 NUM_EPISODES=20 ./vla_lab/scripts/collect_v3.sh
+
+# Same outcome for assets: pass USD spawn explicitly (no --use-ycb)
+SPAWN_MODE=usd NUM_EPISODES=20 ./vla_lab/scripts/collect_v3.sh
+
+# Local YCB (or any USD prop folders) instead of Nucleus default
+NUM_EPISODES=20 ./vla_lab/scripts/collect_v3.sh --use-ycb --objects-dataset /path/to/YCB
+
+# Original thin wrapper (simpler defaults than collect_v3)
+NUM_EPISODES=10 ./vla_lab/scripts/collect.sh
+```
+
+**`USE_YCB=1` vs `SPAWN_MODE=usd`:** For `collect_v3.sh`, both end up spawning **USD props** from the **same default YCB location** when `--objects-dataset` is empty. The difference: `--use-ycb` forces **`spawn_mode=usd` in Python** after argparse, so it **overrides** a conflicting `--spawn-mode box` on the command line. `SPAWN_MODE=usd` only sets `--spawn-mode usd`; `--use-ycb` is not set.
+
+- Uses **scripted** straight-line waypoints + Diff IK (default `PLANNER=scripted`).
+- Logs go to `logs/data_collection/session_<timestamp>/episode_####/`.
+- Ensure **`--enable_cameras`** stays on for `vla_lab` training data (already in `collect_v3.sh`).
+
 **There is no `collect_v1.sh`.** The stable profile is `vla_v1`, and it is what
-`collect.sh` runs. `collect_v3.sh` uses the same profile but adds **curriculum
-defaults**: more objects (`NUM_OBJECTS`, default 8), a wider spawn AABB,
-`--target-selection farthest`, and `--approach-detour-m` for the **scripted**
-planner path to bias around clutter (XY detour using non-target object
-centroids). For Isaac Nucleus YCB props instead of cubes, set `USE_YCB=1`
-(equivalent to `--use-ycb`, which forces `--spawn-mode usd`) or pass
-`--spawn-mode usd` yourself.
+`collect.sh` runs. `collect_v3.sh` adds **curriculum defaults**: more objects
+(default **`NUM_OBJECTS=11`** in the script), a spawn AABB **pulled a bit toward the robot**,
+`--target-selection farthest_no_repeat` (farthest reachable object, not the same as the
+previous episode’s target after a **successful** lift), **straight scripted
+approach** (`--approach-detour-m 0` by default). Optional detour: e.g. `--approach-detour-m 0.08 --approach-detour-safe-z-margin-m 0.04`.
+For YCB props, use **`USE_YCB=1`** or **`--spawn-mode usd`** as above.
 
 This calls `data_collection.collect_data` with the `vla_v1` profile + planner +
 cameras + domain randomization. Each session is written under
@@ -132,34 +174,25 @@ cameras + domain randomization. Each session is written under
 attempt.
 
 ```bash
-# collect_v3: farthest target + detour + 8 objects (boxes unless USE_YCB=1)
+# collect_v3: boxes recommended; ~11 objects by default; farthest_no_repeat target selection
 NUM_EPISODES=10 ./vla_lab/scripts/collect_v3.sh
 
 # Original wrapper — simpler defaults than collect_v3 (see vla_lab/scripts/collect.sh)
 NUM_EPISODES=10 ./vla_lab/scripts/collect.sh
-
-# YCB props (Nucleus default, or add --objects-dataset /path/to/YCB)
-USE_YCB=1 NUM_EPISODES=10 ./vla_lab/scripts/collect_v3.sh
-
-# Explicit usd mode (same asset source as USE_YCB=1 when using default datasets)
-SPAWN_MODE=usd NUM_EPISODES=10 ./vla_lab/scripts/collect_v3.sh
-
-# Headless on a chosen GPU
-DEVICE=cuda:0 NUM_EPISODES=20 ./vla_lab/scripts/collect_v3.sh --headless
 
 # Pick-and-place (`vla_v2`) — see §5.1.1
 NUM_EPISODES=10 ./vla_lab/scripts/collect_v2.sh
 ```
 
 `collect_v3.sh` forwards extra flags; see the script for the full default list
-(farthest target, detour, spawn AABB, `NUM_OBJECTS`). Minimal mental model:
+(farthest target, spawn AABB, speeds, `NUM_OBJECTS`). Minimal mental model:
 
 ```bash
 python -m data_collection.collect_data \
   --profile vla_v1 --env reach_to_grasp_VLA --control planner \
   --planner scripted --device cuda:0 --enable_cameras \
   --log-rate-hz 5 --num-episodes ${NUM_EPISODES} \
-  --target-selection farthest --approach-detour-m 0.10 \
+  --target-selection farthest_no_repeat --approach-detour-m 0 \
   --spawn-mode box --domain-rand --domain-rand-seed 0 \
   --logs-root logs/data_collection \
   ...
@@ -170,6 +203,9 @@ want — see the top-level `README.md`. Just make sure `--enable_cameras` is
 set; `vla_lab` requires the per-tick PNGs to train.
 
 #### 5.1.1 Pick-and-place (`vla_v2`)
+
+For the same **top-down-only** setup as `vla_v1`, **colored cubes remain the
+recommended default** until a wrist camera exists; YCB is optional below.
 
 `vla_v2` is a richer scene with **clutter + 3 bins** and a fully scripted
 **pick-and-place** routine. Each episode, the grasp target is the object
