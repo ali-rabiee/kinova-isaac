@@ -209,5 +209,10 @@ __marimo__/
 # Project logs
 /logs/
 
+# vla_lab — checkpoints, exported datasets, eval JSON (large / regenerable)
+vla_lab/checkpoints/
+vla_lab/datasets/
+vla_lab/eval_results/
+
 # python cache
 __pycache__/
