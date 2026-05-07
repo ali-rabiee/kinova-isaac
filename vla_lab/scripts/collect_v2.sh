@@ -15,6 +15,8 @@
 #   NUM_OBSTACLE_BOXES=8 ./vla_lab/scripts/collect_v2.sh
 #   BIN_SELECTION=random NUM_EPISODES=10 ./vla_lab/scripts/collect_v2.sh
 #   ./vla_lab/scripts/collect_v2.sh --headless
+#   NUM_EPISODES=10 ./vla_lab/scripts/collect_v2.sh --spawn-mode usd
+#   ./vla_lab/scripts/collect_v2.sh --spawn-mode usd --objects-dataset /path/to/YCB
 #
 # Outputs:
 #   logs/data_collection/session_<TS>/episode_NNNN/{ticks.jsonl,events.jsonl,instruction.json,images/}

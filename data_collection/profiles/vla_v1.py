@@ -51,6 +51,39 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     # Default was previously 0.35m, which is below the tabletop in this scene (~0.8-0.9m),
     # causing the controller to clamp Z and the arm to jitter/oscillate near the clamp.
     parser.add_argument("--workspace-max-z", type=float, default=1.20, help="Maximum EE z in base frame (m).")
+    parser.add_argument(
+        "--workspace-min-x",
+        type=float,
+        default=0.20,
+        help="Minimum EE x in base frame (m). Also used to filter --target-selection farthest to reachable poses.",
+    )
+    parser.add_argument(
+        "--workspace-max-x",
+        type=float,
+        default=0.60,
+        help="Maximum EE x in base frame (m). Also used for farthest-target reach filtering.",
+    )
+    parser.add_argument(
+        "--workspace-min-y",
+        type=float,
+        default=-0.45,
+        help="Minimum EE y in base frame (m). Also used for farthest-target reach filtering.",
+    )
+    parser.add_argument(
+        "--workspace-max-y",
+        type=float,
+        default=0.45,
+        help="Maximum EE y in base frame (m). Also used for farthest-target reach filtering.",
+    )
+    parser.add_argument(
+        "--target-reach-margin-m",
+        type=float,
+        default=0.03,
+        help=(
+            "Inset (m) applied to workspace XY when filtering candidates for --target-selection farthest "
+            "(object COM can sit slightly outside the EE box)."
+        ),
+    )
     # Waypoint follower tuning (planner execution)
     parser.add_argument(
         "--wp-max-steps-per-waypoint",
@@ -105,8 +138,39 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
         "--target-selection",
         type=str,
         default="first",
-        choices=["first", "random"],
-        help="How to choose the target object when no --target-prim/--target-index is provided.",
+        choices=["first", "random", "farthest"],
+        help=(
+            "How to choose the target when no --target-prim/--target-index is provided. "
+            "'farthest' = among objects inside the workspace XY box (see --workspace-min/max-x/y and "
+            "--target-reach-margin-m), pick the largest base-frame XY distance from the robot base."
+        ),
+    )
+    parser.add_argument(
+        "--objects-dataset",
+        type=str,
+        nargs="*",
+        default=[],
+        help="Optional USD directory path(s) for --spawn-mode=usd (YCB). Default: Isaac Nucleus YCB.",
+    )
+    parser.add_argument(
+        "--use-ycb",
+        action="store_true",
+        help="Convenience: force --spawn-mode=usd so Isaac Nucleus (or --objects-dataset) YCB props are used instead of boxes.",
+    )
+    parser.add_argument(
+        "--approach-detour-m",
+        type=float,
+        default=0.0,
+        help=(
+            "When --planner scripted, insert a lateral waypoint (m) mid-approach to bias around clutter. "
+            "0 disables. Typical: 0.08-0.12."
+        ),
+    )
+    parser.add_argument(
+        "--approach-detour-safe-z-margin-m",
+        type=float,
+        default=0.04,
+        help="Extra Z margin (m) above the first pregrasp waypoint height when using --approach-detour-m.",
     )
     parser.add_argument(
         "--ee-z-offset-m",
@@ -331,6 +395,12 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
 def run(args: argparse.Namespace) -> int:
     # Ensure kinova-isaac root is first on sys.path (Kit may mutate sys.path).
     from pathlib import Path as _Path
+
+    if bool(getattr(args, "use_ycb", False)):
+        try:
+            setattr(args, "spawn_mode", "usd")
+        except Exception:
+            pass
 
     ROOT = _Path(__file__).resolve().parents[2]
     root_str = str(ROOT)
@@ -625,6 +695,9 @@ def run(args: argparse.Namespace) -> int:
         except Exception:
             ycb_dir = "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.0/Isaac/Props/YCB"
 
+        custom_ds = [str(d) for d in (getattr(args, "objects_dataset", None) or []) if str(d)]
+        dataset_dirs = list(custom_ds) if custom_ds else [ycb_dir]
+
         scale_range = None
         if getattr(args, "scale_min", None) is not None and getattr(args, "scale_max", None) is not None:
             scale_range = (float(args.scale_min), float(args.scale_max))
@@ -642,7 +715,7 @@ def run(args: argparse.Namespace) -> int:
             if _min_dist_xy_only:
                 _min_dist = max(_min_dist, 0.20)
             loader_cfg = ObjectLoaderConfig(
-                dataset_dirs=[ycb_dir],
+                dataset_dirs=dataset_dirs,
                 bounds=SpawnBounds(min_xyz=tuple(args.spawn_min), max_xyz=tuple(args.spawn_max)),
                 min_distance=float(_min_dist),
                 min_distance_xy_only=bool(_min_dist_xy_only),
@@ -698,6 +771,7 @@ def run(args: argparse.Namespace) -> int:
         ep_idx: int,
         *,
         object_z_by_leaf: dict[str, float] | None = None,
+        object_pos_b_by_leaf: dict[str, tuple[float, float, float]] | None = None,
         prev_target_prim: str | None = None,
     ) -> str | None:
         """Select exactly ONE target prim for an episode (stable for that episode)."""
@@ -759,6 +833,51 @@ def run(args: argparse.Namespace) -> int:
 
         # Fallback selection policy
         sel = str(getattr(args, "target_selection", "first"))
+        if sel == "farthest":
+            if object_pos_b_by_leaf and len(candidates) > 0:
+                margin = float(getattr(args, "target_reach_margin_m", 0.03))
+                margin = float(max(0.0, margin))
+                wx0 = float(getattr(args, "workspace_min_x", 0.20)) + margin
+                wx1 = float(getattr(args, "workspace_max_x", 0.60)) - margin
+                wy0 = float(getattr(args, "workspace_min_y", -0.45)) + margin
+                wy1 = float(getattr(args, "workspace_max_y", 0.45)) - margin
+                if wx1 < wx0:
+                    wx0, wx1 = float(getattr(args, "workspace_min_x", 0.20)), float(getattr(args, "workspace_max_x", 0.60))
+                if wy1 < wy0:
+                    wy0, wy1 = float(getattr(args, "workspace_min_y", -0.45)), float(getattr(args, "workspace_max_y", 0.45))
+
+                def _xy_reachable(pos: tuple[float, float, float]) -> bool:
+                    x, y = float(pos[0]), float(pos[1])
+                    return bool(wx0 <= x <= wx1 and wy0 <= y <= wy1)
+
+                pool: list[str] = []
+                for p in candidates:
+                    leaf = str(p).split("/")[-1]
+                    pos = object_pos_b_by_leaf.get(leaf)
+                    if pos is not None and _xy_reachable(pos):
+                        pool.append(str(p))
+                if not pool:
+                    try:
+                        print(
+                            "[VLA_V1][TARGET] farthest: no objects inside workspace XY reach box "
+                            f"([{wx0:.3f},{wx1:.3f}]×[{wy0:.3f},{wy1:.3f}] m); using full candidate list."
+                        )
+                    except Exception:
+                        pass
+                    pool = list(candidates)
+
+                scored: list[tuple[float, str]] = []
+                for p in pool:
+                    leaf = str(p).split("/")[-1]
+                    pos = object_pos_b_by_leaf.get(leaf)
+                    if pos is None:
+                        continue
+                    d2 = float(pos[0]) ** 2 + float(pos[1]) ** 2
+                    scored.append((d2, str(p)))
+                if scored:
+                    scored.sort(key=lambda t: (-t[0], t[1]))
+                    return scored[0][1]
+            return candidates[-1] if candidates else None
         if sel == "random":
             try:
                 import random
@@ -1174,6 +1293,12 @@ def run(args: argparse.Namespace) -> int:
 
     # Reset sim and robot
     def _reset_sim_and_robot() -> None:
+        # Cached `isaacsim.core.prims.RigidPrim` instances go stale across `sim.reset()`; reusing them
+        # makes respawn teleports silently fail so objects (and grasp OBB poses) freeze between episodes.
+        try:
+            _respawn_rigidprims.clear()
+        except Exception:
+            pass
         sim.reset()
         origin0 = torch.tensor(scene_origins[0], device=sim.device)
         root_state = robot.data.default_root_state.clone()
@@ -1220,8 +1345,16 @@ def run(args: argparse.Namespace) -> int:
         device=str(sim.device),
         use_relative_mode=True,
         linear_speed_mps=float(linear_speed_mps),
-        workspace_min=(0.20, -0.45, float(getattr(args, "workspace_min_z", 0.0))),
-        workspace_max=(0.6, 0.45, float(getattr(args, "workspace_max_z", 1.20))),
+        workspace_min=(
+            float(getattr(args, "workspace_min_x", 0.20)),
+            float(getattr(args, "workspace_min_y", -0.45)),
+            float(getattr(args, "workspace_min_z", 0.0)),
+        ),
+        workspace_max=(
+            float(getattr(args, "workspace_max_x", 0.60)),
+            float(getattr(args, "workspace_max_y", 0.45)),
+            float(getattr(args, "workspace_max_z", 1.20)),
+        ),
         log_ee_pos=bool(getattr(args, "print_ee", False)),
         log_ee_frame=str(getattr(args, "ee_frame", "world")),
         log_every_n_steps=int(getattr(args, "print_interval", 1)),
@@ -1248,7 +1381,7 @@ def run(args: argparse.Namespace) -> int:
         from motion_generation.grasp_estimation.obb import ObbGraspPoseProvider
         from motion_generation.mogen import MotionGenerationAgent
         from motion_generation.planners import PlannerContext, create_planner
-        from utilities import get_ee_pos_base_frame
+        from utilities import get_ee_pos_base_frame, world_to_base_pos
 
         def _densify_waypoints_b(
             pts: list[tuple[float, float, float]],
@@ -1275,6 +1408,27 @@ def run(args: argparse.Namespace) -> int:
                     t = float(i) / float(n)
                     out.append((float(x0 + t * dx), float(y0 + t * dy), float(z0 + t * dz)))
             return out
+
+        def _clamp_waypoint_b(pt: tuple[float, float, float]) -> tuple[float, float, float]:
+            """Clamp a base-frame position to the same workspace box the velocity controller uses."""
+            smin = getattr(ctrl_cfg, "safety_cfg", None)
+            smin = getattr(smin, "workspace_min", None) if smin is not None else None
+            smax = getattr(ctrl_cfg, "safety_cfg", None)
+            smax = getattr(smax, "workspace_max", None) if smax is not None else None
+            x, y, z = float(pt[0]), float(pt[1]), float(pt[2])
+
+            def _axis(v: float, lo: float | None, hi: float | None) -> float:
+                if lo is not None:
+                    v = max(float(v), float(lo))
+                if hi is not None:
+                    v = min(float(v), float(hi))
+                return float(v)
+
+            if smin is not None and smax is not None:
+                x = _axis(x, smin[0], smax[0])
+                y = _axis(y, smin[1], smax[1])
+                z = _axis(z, smin[2], smax[2])
+            return (x, y, z)
 
         if loader is None or len(spawned_paths) == 0:
             print("[VLA_V1][PLANNER] ERROR: planner control requires spawned objects to grasp.")
@@ -1709,16 +1863,33 @@ def run(args: argparse.Namespace) -> int:
                     pass
 
                 obj_z_by_leaf: dict[str, float] = {}
+                object_pos_b_by_leaf: dict[str, tuple[float, float, float]] = {}
                 try:
                     for o in tracker.snapshot():
+                        leaf = str(o.id)
                         try:
-                            obj_z_by_leaf[str(o.id)] = float(o.pose.position_m[2])
+                            obj_z_by_leaf[leaf] = float(o.pose.position_m[2])
                         except Exception:
-                            continue
+                            pass
+                        try:
+                            pw = (
+                                float(o.pose.position_m[0]),
+                                float(o.pose.position_m[1]),
+                                float(o.pose.position_m[2]),
+                            )
+                            object_pos_b_by_leaf[leaf] = world_to_base_pos(sim, robot, pw)
+                        except Exception:
+                            pass
                 except Exception:
                     obj_z_by_leaf = {}
+                    object_pos_b_by_leaf = {}
                 # Select target once per episode.
-                _tgt = _select_episode_target_prim(ep, object_z_by_leaf=obj_z_by_leaf, prev_target_prim=prev_target_prim)
+                _tgt = _select_episode_target_prim(
+                    ep,
+                    object_z_by_leaf=obj_z_by_leaf,
+                    object_pos_b_by_leaf=object_pos_b_by_leaf,
+                    prev_target_prim=prev_target_prim,
+                )
                 # Episode-level language command for VLA training (stored once per episode).
                 lang_cmd, lang_meta = ("", {})
                 try:
@@ -1735,6 +1906,17 @@ def run(args: argparse.Namespace) -> int:
                         z0 = obj_z_by_leaf.get(str(leaf), None)
                 except Exception:
                     z0 = None
+
+                obstacle_xy_b: list[tuple[float, float]] = []
+                try:
+                    if _tgt is not None:
+                        tl = str(_tgt).split("/")[-1]
+                        for leaf, pos in object_pos_b_by_leaf.items():
+                            if leaf == tl:
+                                continue
+                            obstacle_xy_b.append((float(pos[0]), float(pos[1])))
+                except Exception:
+                    obstacle_xy_b = []
 
                 vla_planner_state.update(
                     {
@@ -1764,6 +1946,7 @@ def run(args: argparse.Namespace) -> int:
                         "approach_last_dist_m": None,
                         "approach_stall_steps": 0,
                         "approach_start_step": None,
+                        "obstacle_xy_b": obstacle_xy_b,
                     }
                 )
 
@@ -1975,14 +2158,55 @@ def run(args: argparse.Namespace) -> int:
 
                                         if len(waypoints) >= 2:
                                             lift_pt = waypoints[-1]
-                                            approach_pts = waypoints[:-1]
+                                            approach_pts = list(waypoints[:-1])
                                         else:
                                             lift_pt = (
                                                 float(pos_b[0]),
                                                 float(pos_b[1]),
                                                 float(pos_b[2] + float(getattr(args, "lift", 0.15))),
                                             )
-                                            approach_pts = waypoints
+                                            approach_pts = list(waypoints)
+
+                                        detour_m = float(getattr(args, "approach_detour_m", 0.0))
+                                        if (
+                                            detour_m > 1e-6
+                                            and str(getattr(args, "planner", "scripted")) == "scripted"
+                                            and len(approach_pts) > 0
+                                        ):
+                                            import math
+
+                                            ee_pos_b = get_ee_pos_base_frame(
+                                                robot, str(getattr(args, "ee_link", "j2n6s300_end_effector"))
+                                            )
+                                            if ee_pos_b is not None:
+                                                p0 = (float(ee_pos_b[0]), float(ee_pos_b[1]), float(ee_pos_b[2]))
+                                                p1 = (
+                                                    float(approach_pts[0][0]),
+                                                    float(approach_pts[0][1]),
+                                                    float(approach_pts[0][2]),
+                                                )
+                                                vx = float(p1[0] - p0[0])
+                                                vy = float(p1[1] - p0[1])
+                                                nlen = math.hypot(vx, vy)
+                                                if nlen > 1e-6:
+                                                    tx, ty = vx / nlen, vy / nlen
+                                                    nx, ny = -ty, tx
+                                                    mx = 0.5 * (p0[0] + p1[0])
+                                                    my = 0.5 * (p0[1] + p1[1])
+                                                    margin = float(getattr(args, "approach_detour_safe_z_margin_m", 0.04))
+                                                    safe_z = max(float(p0[2]), float(p1[2]) + margin)
+                                                    sign = 1.0
+                                                    obs = vla_planner_state.get("obstacle_xy_b") or []
+                                                    if len(obs) > 0:
+                                                        cx = sum(float(o[0]) for o in obs) / float(len(obs))
+                                                        cy = sum(float(o[1]) for o in obs) / float(len(obs))
+                                                        cxm, cym = cx - mx, cy - my
+                                                        dot_plus = nx * cxm + ny * cym
+                                                        sign = -1.0 if dot_plus > 0 else 1.0
+                                                    det_x = mx + sign * nx * detour_m
+                                                    det_y = my + sign * ny * detour_m
+                                                    det_pt = _clamp_waypoint_b((det_x, det_y, safe_z))
+                                                    approach_pts = [det_pt] + approach_pts
 
                                         vla_planner_state["lift_pt"] = lift_pt
                                         try:

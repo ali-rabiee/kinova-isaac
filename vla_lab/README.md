@@ -81,8 +81,9 @@ vla_lab/
 ├── dryrun.py                       <- VRAM / latency dry-fit
 ├── inspect_data.py                 <- session sanity tool
 └── scripts/
-    ├── collect.sh                  <- wrapper around `data_collection.collect_data --profile vla_v1`
-    ├── collect_v2.sh               <- wrapper around `data_collection.collect_data --profile vla_v2` (pick-and-place)
+    ├── collect.sh                  <- **vla_v1** stable reach/grasp/lift (default data collection)
+    ├── collect_v3.sh               <- same as collect.sh (--profile vla_v1); numbered alias for clarity
+    ├── collect_v2.sh               <- **vla_v2** pick-and-place + bins
     ├── train.sh                    <- wrapper around `vla_lab.train`
     ├── eval.sh                     <- wrapper around `vla_lab.eval_isaaclab`
     └── dryrun.sh                   <- wrapper around `vla_lab.dryrun`
@@ -114,31 +115,51 @@ Optional dependencies (only if you want to enable specific features):
 All commands assume you run them from the **repo root**
 (`kinova-isaac/`), not from inside `vla_lab/`.
 
-### 5.1 Collect data
+### 5.1 Collect data (`vla_v1`)
 
-This calls the existing `data_collection.collect_data` with the recommended
-`vla_v1` profile + planner + cameras + domain randomization. Each session is
-written under `logs/data_collection/session_<TIMESTAMP>/` with one
-`episode_NNNN/` folder per attempt.
+**There is no `collect_v1.sh`.** The stable profile is `vla_v1`, and it is what
+`collect.sh` runs. `collect_v3.sh` uses the same profile but adds **curriculum
+defaults**: more objects (`NUM_OBJECTS`, default 8), a wider spawn AABB,
+`--target-selection farthest`, and `--approach-detour-m` for the **scripted**
+planner path to bias around clutter (XY detour using non-target object
+centroids). For Isaac Nucleus YCB props instead of cubes, set `USE_YCB=1`
+(equivalent to `--use-ycb`, which forces `--spawn-mode usd`) or pass
+`--spawn-mode usd` yourself.
+
+This calls `data_collection.collect_data` with the `vla_v1` profile + planner +
+cameras + domain randomization. Each session is written under
+`logs/data_collection/session_<TIMESTAMP>/` with one `episode_NNNN/` folder per
+attempt.
 
 ```bash
-# Recommended: uniform colored boxes + scripted planner + cameras (10 episodes)
+# collect_v3: farthest target + detour + 8 objects (boxes unless USE_YCB=1)
+NUM_EPISODES=10 ./vla_lab/scripts/collect_v3.sh
+
+# Original wrapper — simpler defaults than collect_v3 (see vla_lab/scripts/collect.sh)
 NUM_EPISODES=10 ./vla_lab/scripts/collect.sh
 
-# YCB objects instead of boxes
-SPAWN_MODE=usd NUM_EPISODES=10 ./vla_lab/scripts/collect.sh
+# YCB props (Nucleus default, or add --objects-dataset /path/to/YCB)
+USE_YCB=1 NUM_EPISODES=10 ./vla_lab/scripts/collect_v3.sh
+
+# Explicit usd mode (same asset source as USE_YCB=1 when using default datasets)
+SPAWN_MODE=usd NUM_EPISODES=10 ./vla_lab/scripts/collect_v3.sh
 
 # Headless on a chosen GPU
-DEVICE=cuda:0 NUM_EPISODES=20 ./vla_lab/scripts/collect.sh --headless
+DEVICE=cuda:0 NUM_EPISODES=20 ./vla_lab/scripts/collect_v3.sh --headless
+
+# Pick-and-place (`vla_v2`) — see §5.1.1
+NUM_EPISODES=10 ./vla_lab/scripts/collect_v2.sh
 ```
 
-Underneath, the wrapper expands to:
+`collect_v3.sh` forwards extra flags; see the script for the full default list
+(farthest target, detour, spawn AABB, `NUM_OBJECTS`). Minimal mental model:
 
 ```bash
 python -m data_collection.collect_data \
   --profile vla_v1 --env reach_to_grasp_VLA --control planner \
   --planner scripted --device cuda:0 --enable_cameras \
   --log-rate-hz 5 --num-episodes ${NUM_EPISODES} \
+  --target-selection farthest --approach-detour-m 0.10 \
   --spawn-mode box --domain-rand --domain-rand-seed 0 \
   --logs-root logs/data_collection \
   ...
@@ -151,10 +172,22 @@ set; `vla_lab` requires the per-tick PNGs to train.
 #### 5.1.1 Pick-and-place (`vla_v2`)
 
 `vla_v2` is a richer scene with **clutter + 3 bins** and a fully scripted
-**pick-and-place** routine: grab the box closest to the robot, transit over
-the clutter, drop into one of three colored bins. Motion is purely scripted
-(no cuRobo / MotionGen). Logging format and on-disk layout are identical to
-`vla_v1`, so the same `vla_lab.dataset` reader works without changes.
+**pick-and-place** routine. Each episode, the grasp target is the object
+**closest to the robot in XY** (base frame), skipping anything too close to a
+bin so the arm does not fight bin geometry; clutter is also respawned with
+its X range capped **in front of** the bins. You can use **colored cubes**
+(default) or **YCB USD props** from Isaac Nucleus via `--spawn-mode usd`.
+Motion is purely scripted (no cuRobo / MotionGen). Logging format and on-disk
+layout match `vla_v1`, so the same `vla_lab.dataset` reader works without changes.
+
+**Command to run (from the repo root, with a Python that has Isaac Lab /
+`isaaclab` on the path — e.g. your usual Isaac conda env):**
+
+```bash
+NUM_EPISODES=10 ./vla_lab/scripts/collect_v2.sh
+```
+
+Common variations:
 
 ```bash
 # Default: 6 clutter boxes + 1 close target + 3 bins, 10 episodes
@@ -165,6 +198,50 @@ NUM_OBSTACLE_BOXES=8 NUM_EPISODES=20 ./vla_lab/scripts/collect_v2.sh --headless
 
 # Random bin selection per episode
 BIN_SELECTION=random NUM_EPISODES=20 ./vla_lab/scripts/collect_v2.sh
+
+# YCB objects (USD from Isaac Nucleus default path) instead of cubes
+NUM_EPISODES=10 ./vla_lab/scripts/collect_v2.sh --spawn-mode usd
+
+# YCB with an explicit asset folder (optional)
+NUM_EPISODES=10 ./vla_lab/scripts/collect_v2.sh \
+  --spawn-mode usd \
+  --objects-dataset /path/to/YCB
+```
+
+Underneath, the wrapper runs `python -m data_collection.collect_data` with
+`--profile vla_v2`. Equivalent explicit invocation (same defaults as the
+script; add or override flags as needed):
+
+```bash
+python -m data_collection.collect_data \
+  --profile vla_v2 \
+  --env reach_to_grasp_VLA \
+  --control planner \
+  --device cuda:0 \
+  --enable_cameras \
+  --log-rate-hz 5 \
+  --num-episodes 10 \
+  --num-obstacle-boxes 6 \
+  --bin-selection cycle \
+  --planner-speed-mps 0.4 \
+  --planner-waypoint-max-seg-m 0.01 \
+  --max-steps-per-episode 10000 \
+  --domain-rand \
+  --domain-rand-seed 0 \
+  --logs-root logs/data_collection
+
+# Same with YCB / USD props:
+python -m data_collection.collect_data \
+  --profile vla_v2 \
+  --env reach_to_grasp_VLA \
+  --control planner \
+  --device cuda:0 \
+  --enable_cameras \
+  --spawn-mode usd \
+  --log-rate-hz 5 \
+  --num-episodes 10 \
+  --domain-rand \
+  --logs-root logs/data_collection
 ```
 
 Each episode writes the same `instruction.json`, `images/`, `ticks.jsonl`,

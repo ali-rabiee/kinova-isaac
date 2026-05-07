@@ -8,19 +8,26 @@ session layout (per-tick PNGs, ``ticks.jsonl``, ``events.jsonl``,
 What's different from vla_v1:
 
 * **Scene**
-  - One *target* box spawned very close to the robot.
-  - Several *obstacle* boxes scattered in the middle of the workspace.
+  - Several objects (boxes or YCB USDs) scattered in the workspace **in front of the bins**
+    (spawn X is capped so nothing is sampled in the bin zone).
   - Three fixed *bins* at the far end of the workspace.
+
+* **Target choice**
+  - Each episode, the **grasp target** is the object **closest to the robot base in XY**
+    (base frame), among objects outside a bin-clearance disc — so the arm does not pick
+    clutter sitting next to bin geometry.
 
 * **Behavior** (purely scripted, no cuRobo / MotionGen):
 
   1. Open gripper.
-  2. Move above the target box at a high transit Z, then descend to grasp.
-  3. Close gripper.
-  4. Lift straight up to the transit Z (clears the obstacle boxes).
-  5. Translate over the clutter to the chosen bin's XY.
-  6. Descend to the drop height, then release the gripper.
-  7. Retreat upward.
+  2. Approach the grasp XY at a safe altitude, then descend to a pre-grasp height.
+  3. Final descent to a grasp Z computed from the object's **world AABB** (works for YCB meshes,
+     not only uniform cubes), using a **tight position tolerance** so the gripper does not close early.
+  4. Close gripper.
+  5. Lift straight up to the transit Z (clears the obstacle boxes).
+  6. Translate over the clutter to the chosen bin's XY.
+  7. Descend to the drop height, then release the gripper.
+  8. Retreat upward.
 
 * **Logging** is identical to vla_v1 in format. Every episode writes:
 
@@ -83,6 +90,32 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
 
     # Box appearance / sizing
     parser.add_argument("--box-size", type=float, default=0.05, help="Side length for uniform boxes (m).")
+    parser.add_argument(
+        "--spawn-mode",
+        type=str,
+        default="box",
+        choices=["box", "usd"],
+        help="Object source: 'box' for uniform cubes; 'usd' for YCB (Isaac Nucleus) or paths from --objects-dataset.",
+    )
+    parser.add_argument(
+        "--objects-dataset",
+        type=str,
+        nargs="*",
+        default=[],
+        help="Optional USD directory path(s) when --spawn-mode=usd. If empty, uses Isaac Nucleus YCB (see vla_v1).",
+    )
+    parser.add_argument(
+        "--spawn-bin-clearance-m",
+        type=float,
+        default=0.24,
+        help="When respawning clutter, spawn X is capped to bin_center_x minus this (m). Keeps objects away from the bin fence.",
+    )
+    parser.add_argument(
+        "--target-bin-clearance-xy-m",
+        type=float,
+        default=0.26,
+        help="Ignore objects whose XY is closer than this to any bin center when choosing the grasp target; if all fail, falls back.",
+    )
 
     # Scene layout (vla_v2-specific)
     parser.add_argument("--num-obstacle-boxes", type=int, default=6, help="Boxes scattered in the middle of the workspace.")
@@ -175,8 +208,34 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     )
 
     # Pick / transit / place tuning
-    parser.add_argument("--pregrasp-offset-m", type=float, default=0.08, help="Pregrasp offset above the target box top (m).")
-    parser.add_argument("--grasp-depth-m", type=float, default=-0.04, help="Grasp depth relative to the box top (m).")
+    parser.add_argument("--pregrasp-offset-m", type=float, default=0.06, help="Pregrasp offset above the target top surface (m), after AABB top + TCP offset.")
+    parser.add_argument(
+        "--grasp-depth-m",
+        type=float,
+        default=-0.028,
+        help="Added to (AABB top + --ee-z-offset-m) for final pre-close EE Z; more negative = deeper (risk: unreachable poses).",
+    )
+    parser.add_argument(
+        "--grasp-depth-extra-per-height",
+        type=float,
+        default=0.12,
+        help="Extra downward shift scaled by object AABB height (m per m). Keep small to avoid commanding below the arm's workspace.",
+    )
+    parser.add_argument(
+        "--max-grasp-drop-below-touch-m",
+        type=float,
+        default=0.032,
+        help=(
+            "Safety clamp: grasp Z in base (m) will not be lower than "
+            "(AABB top + --ee-z-offset-m) minus this value. Prevents unreachable deep grasps."
+        ),
+    )
+    parser.add_argument(
+        "--min-grasp-clearance-above-table-m",
+        type=float,
+        default=0.042,
+        help="Grasp Z in base must be at least this far above the tabletop (world table_z) at the target XY.",
+    )
     parser.add_argument(
         "--approach-clearance-m",
         type=float,
@@ -261,6 +320,18 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
         default=240,
         help="Print a [VLA_V2][EP][PROGRESS] line every N physics steps during a phase. ~1s at 240Hz.",
     )
+    parser.add_argument(
+        "--pick-grasp-tol-m",
+        type=float,
+        default=0.004,
+        help="Tighter EE position tolerance (m) for the final pre-grasp waypoint only; avoids closing while still above the object.",
+    )
+    parser.add_argument(
+        "--pick-grasp-max-steps-per-waypoint",
+        type=int,
+        default=3200,
+        help="Step budget for the final pre-grasp waypoint (Physics steps).",
+    )
 
     # Bin success tuning
     parser.add_argument(
@@ -334,13 +405,14 @@ def run(args: argparse.Namespace) -> int:
     import math
     import random
     import isaaclab.sim as sim_utils
+    from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
     from isaaclab.sensors import Camera, CameraCfg
 
     from controllers import CartesianVelocityJogConfig, CartesianVelocityJogController
     from environments.utils.object_loader import ObjectLoader, ObjectLoaderConfig, SpawnBounds
     from environments.utils.physix import PhysicsConfig, apply_to_simulation_cfg, object_loader_kwargs_from_physix
     from controllers.input.waypoint_follower import WaypointFollowerInput
-    from utilities import get_ee_pos_base_frame
+    from utilities import get_ee_pos_base_frame, world_to_base_pos
 
     env_spec = get_envs()[str(getattr(args, "env", "reach_to_grasp_VLA"))]
     env_cfg_mod = importlib.import_module(f"{env_spec.module_base}.config")
@@ -487,25 +559,40 @@ def run(args: argparse.Namespace) -> int:
         half = 0.5 * float(yaw_rad)
         return (math.cos(half), 0.0, 0.0, math.sin(half))
 
-    def _spawn_boxes() -> Tuple[List[str], Dict[str, str], Dict[str, Optional[str]]]:
-        """Spawn (1 target + N obstacles) uniform-colored cubes via ObjectLoader.
+    def _spawn_objects() -> Tuple[List[str], Dict[str, str], Dict[str, Optional[str]]]:
+        """Spawn N objects (uniform cubes or YCB USD). Target is chosen per-episode."""
 
-        Initial layout is unimportant; we explicitly re-randomize each episode.
-        Returns (prim_paths, leaf_to_label, leaf_to_color_name).
-        """
         n_obstacles = int(getattr(args, "num_obstacle_boxes", 6))
         n_objects = 1 + max(0, n_obstacles)
         box_size = float(getattr(args, "box_size", 0.05))
+        spawn_mode = str(getattr(args, "spawn_mode", "box"))
         phys_loader_kwargs = object_loader_kwargs_from_physix(phys)
 
-        # NOTE: we pass tabletop bounds here only as a fallback; the per-episode
-        # re-randomization fully controls placement.
+        dataset_dirs: List[str] = []
+        if spawn_mode == "usd":
+            custom = [str(d) for d in (getattr(args, "objects_dataset", None) or []) if str(d)]
+            if custom:
+                dataset_dirs = custom
+            else:
+                try:
+                    dataset_dirs = [f"{ISAAC_NUCLEUS_DIR}/Props/YCB"]
+                except Exception:
+                    dataset_dirs = [
+                        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/"
+                        "Assets/Isaac/5.0/Isaac/Props/YCB"
+                    ]
+
+        _min_dist = float(getattr(args, "min_distance", 0.10))
+        _min_dist_xy_only = spawn_mode == "box"
+        if _min_dist_xy_only:
+            _min_dist = max(_min_dist, 0.08)
+
         loader_cfg = ObjectLoaderConfig(
-            dataset_dirs=[],
+            dataset_dirs=dataset_dirs,
             bounds=SpawnBounds(min_xyz=tuple(args.spawn_min), max_xyz=tuple(args.spawn_max)),
-            min_distance=float(getattr(args, "min_distance", 0.10)),
-            min_distance_xy_only=True,
-            spawn_mode="box",
+            min_distance=float(_min_dist),
+            min_distance_xy_only=bool(_min_dist_xy_only),
+            spawn_mode=str(spawn_mode),
             box_size_min=(box_size, box_size, box_size),
             box_size_max=(box_size, box_size, box_size),
             box_color_palette=[rgb for (_n, rgb) in BOX_COLORS],
@@ -517,19 +604,26 @@ def run(args: argparse.Namespace) -> int:
 
         leaf_to_label: Dict[str, str] = {}
         leaf_to_color: Dict[str, Optional[str]] = {}
+        try:
+            prim_to_label = loader.get_last_spawn_labels()
+            lbl_map = {str(p).split("/")[-1]: str(lbl) for p, lbl in prim_to_label.items()}
+        except Exception:
+            lbl_map = {}
+
         for p in paths:
             leaf = str(p).split("/")[-1]
-            try:
-                idx = int(leaf.split("_")[-1])
-            except Exception:
-                idx = 1
-            color_name, _rgb = BOX_COLORS[(idx - 1) % len(BOX_COLORS)]
-            leaf_to_color[leaf] = color_name
-            # idx=1 is the "close" target; everything else is an obstacle.
-            if idx == 1:
-                leaf_to_label[leaf] = f"target ({color_name} box)"
-            else:
+            if spawn_mode == "box":
+                try:
+                    idx = int(leaf.split("_")[-1])
+                except Exception:
+                    idx = 1
+                color_name, _rgb = BOX_COLORS[(idx - 1) % len(BOX_COLORS)]
+                leaf_to_color[leaf] = color_name
                 leaf_to_label[leaf] = f"{color_name} box {idx}"
+            else:
+                leaf_to_color[leaf] = None
+                leaf_to_label[leaf] = str(lbl_map.get(leaf, leaf))
+
         return paths, leaf_to_label, leaf_to_color
 
     def _spawn_bins() -> List[Dict[str, object]]:
@@ -635,9 +729,12 @@ def run(args: argparse.Namespace) -> int:
             )
         return out
 
-    spawned_paths, id_to_label, id_to_color = _spawn_boxes()
+    spawned_paths, id_to_label, id_to_color = _spawn_objects()
     bins_meta = _spawn_bins()
-    print(f"[VLA_V2] Spawned {len(spawned_paths)} boxes and {len(bins_meta)} bins.")
+    print(
+        f"[VLA_V2] Spawned {len(spawned_paths)} objects (spawn_mode={getattr(args, 'spawn_mode', 'box')!r}) "
+        f"and {len(bins_meta)} bins."
+    )
     for _b in bins_meta:
         cx_, cy_ = _b["center_xy"]  # type: ignore[index]
         print(
@@ -647,9 +744,7 @@ def run(args: argparse.Namespace) -> int:
             f"top_z={float(_b['top_z']):.3f}"
         )
 
-    target_leaf = "Obj_01"
-    target_prim = f"{BOXES_PARENT}/{target_leaf}"
-    target_color_name = id_to_color.get(target_leaf, None)
+    # Grasp target is chosen per-episode (closest to robot in XY); see episode loop.
 
     # -----------------------------------------------------------------------
     # Camera sensor
@@ -697,49 +792,49 @@ def run(args: argparse.Namespace) -> int:
     def _sample_episode_box_poses(
         rng: random.Random,
     ) -> Dict[str, Tuple[Tuple[float, float, float], float]]:
-        """Sample a position+yaw for every box.
+        """Sample pose+yaw for every spawned object in a merged clutter AABB.
 
-        - The target box (leaf=Obj_01) is sampled inside the *target* AABB
-          (close to the robot).
-        - All remaining boxes are sampled inside the *obstacle* AABB
-          (mid workspace), with a minimum spacing constraint.
-
-        Z values come straight from the AABB; we don't snap to table_z because
-        we want the boxes to drop a couple cm and settle naturally.
+        X max is capped at ``bin_center_x - spawn_bin_clearance_m`` so nothing
+        respawns against the bin fence. Minimum XY spacing matches
+        ``--obstacle-min-distance``. The grasp target is chosen after settle as
+        the object closest to the robot in base XY.
         """
         out: Dict[str, Tuple[Tuple[float, float, float], float]] = {}
 
         tmin = tuple(float(v) for v in getattr(args, "target_spawn_min", [0.20, -0.08, 0.83]))
         tmax = tuple(float(v) for v in getattr(args, "target_spawn_max", [0.28, 0.08, 0.83]))
-        tx = rng.uniform(tmin[0], tmax[0])
-        ty = rng.uniform(tmin[1], tmax[1])
-        tz = rng.uniform(tmin[2], tmax[2])
-        out[target_leaf] = ((tx, ty, tz), rng.uniform(-math.pi, math.pi))
-
         omin = tuple(float(v) for v in getattr(args, "obstacle_spawn_min", [0.34, -0.30, 0.83]))
         omax = tuple(float(v) for v in getattr(args, "obstacle_spawn_max", [0.55, 0.30, 0.83]))
+        bcx = float(getattr(args, "bin_center_x", 0.70))
+        clear = float(getattr(args, "spawn_bin_clearance_m", 0.24))
+
+        xmin = min(float(tmin[0]), float(omin[0]))
+        xmax_cap = float(bcx) - float(clear)
+        xmax_raw = max(float(tmax[0]), float(omax[0]))
+        xmax = max(float(xmin) + 0.02, min(xmax_raw, xmax_cap))
+        ymin = min(float(tmin[1]), float(omin[1]))
+        ymax = max(float(tmax[1]), float(omax[1]))
+        zmin = min(float(tmin[2]), float(omin[2]))
+        zmax = max(float(tmax[2]), float(omax[2]))
         min_dist = float(getattr(args, "obstacle_min_distance", 0.12))
 
-        existing_xy: List[Tuple[float, float]] = [(tx, ty)]
+        existing_xy: List[Tuple[float, float]] = []
         for p in spawned_paths:
             leaf = str(p).split("/")[-1]
-            if leaf == target_leaf:
-                continue
             placed = False
             for _ in range(500):
-                ox = rng.uniform(omin[0], omax[0])
-                oy = rng.uniform(omin[1], omax[1])
-                oz = rng.uniform(omin[2], omax[2])
+                ox = rng.uniform(xmin, xmax)
+                oy = rng.uniform(ymin, ymax)
+                oz = rng.uniform(zmin, zmax)
                 if all(math.hypot(ox - x, oy - y) >= min_dist for (x, y) in existing_xy):
                     existing_xy.append((ox, oy))
                     out[leaf] = ((ox, oy, oz), rng.uniform(-math.pi, math.pi))
                     placed = True
                     break
             if not placed:
-                # Fallback: place anywhere inside the obstacle AABB.
-                ox = rng.uniform(omin[0], omax[0])
-                oy = rng.uniform(omin[1], omax[1])
-                oz = rng.uniform(omin[2], omax[2])
+                ox = rng.uniform(xmin, xmax)
+                oy = rng.uniform(ymin, ymax)
+                oz = rng.uniform(zmin, zmax)
                 out[leaf] = ((ox, oy, oz), rng.uniform(-math.pi, math.pi))
         return out
 
@@ -811,9 +906,9 @@ def run(args: argparse.Namespace) -> int:
             float(getattr(args, "workspace_min_z", 0.0)),
         ),
         workspace_max=(
-            float(getattr(args, "workspace_max_x", 0.90)),
+            float(getattr(args, "workspace_max_x", 0.85)),
             float(getattr(args, "workspace_max_y", 0.55)),
-            float(getattr(args, "workspace_max_z", 1.30)),
+            float(getattr(args, "workspace_max_z", 1.10)),
         ),
         log_ee_pos=bool(getattr(args, "print_ee", False)),
         log_ee_frame=str(getattr(args, "ee_frame", "world")),
@@ -868,11 +963,19 @@ def run(args: argparse.Namespace) -> int:
     # -----------------------------------------------------------------------
     # Language commands
     # -----------------------------------------------------------------------
-    def _make_language_command(*, ep_idx: int, bin_meta: Dict[str, object]) -> Tuple[str, dict]:
+    def _make_language_command(
+        *, ep_idx: int, bin_meta: Dict[str, object], target_leaf: str
+    ) -> Tuple[str, dict]:
         bin_color = str(bin_meta.get("color_name", "?"))
         bin_idx = int(bin_meta.get("idx", 0)) + 1  # 1-based for humans
-        target_color = str(target_color_name or "")
-        target_phrase = f"the {target_color} box" if target_color else "the box"
+        tc = id_to_color.get(target_leaf)
+        human = str(id_to_label.get(target_leaf, "") or "")
+        if tc:
+            target_phrase = f"the {tc} box"
+        elif human:
+            target_phrase = f"the {human}"
+        else:
+            target_phrase = "the object closest to the robot"
         bin_phrase_color = f"the {bin_color} bin"
         bin_phrase_idx = f"bin {bin_idx}"
 
@@ -882,7 +985,7 @@ def run(args: argparse.Namespace) -> int:
             "Move {target} into {bin_color}.",
             "Pick up {target} and put it in {bin_idx}.",
             "Take {target} and place it in {bin_idx} ({bin_color}).",
-            "Pick up the box closest to the robot and put it in {bin_color}.",
+            "Pick up the object closest to the robot and put it in {bin_color}.",
         ]
 
         rng = random.Random(int(ep_idx) + 4242)
@@ -890,7 +993,8 @@ def run(args: argparse.Namespace) -> int:
         cmd = tmpl.format(target=target_phrase, bin_color=bin_phrase_color, bin_idx=bin_phrase_idx)
         meta = {
             "target_leaf": target_leaf,
-            "target_color": target_color,
+            "target_color": tc,
+            "target_label": human,
             "bin_idx": int(bin_idx),  # 1-based
             "bin_idx0": int(bin_meta.get("idx", 0)),  # 0-based
             "bin_color": bin_color,
@@ -901,10 +1005,10 @@ def run(args: argparse.Namespace) -> int:
     # -----------------------------------------------------------------------
     # Helpers shared by the state machine
     # -----------------------------------------------------------------------
-    def _read_target_state() -> Optional[Dict[str, object]]:
+    def _read_target_state(for_leaf: str) -> Optional[Dict[str, object]]:
         try:
             for o in tracker.snapshot():
-                if str(o.id) == target_leaf:
+                if str(o.id) == str(for_leaf):
                     return {
                         "pos": tuple(float(v) for v in o.pose.position_m),
                         "ori_wxyz": tuple(float(v) for v in o.pose.orientation_wxyz),
@@ -922,13 +1026,36 @@ def run(args: argparse.Namespace) -> int:
         except Exception:
             return None
 
-    def _world_to_base_xy(pos_w: Tuple[float, float, float]) -> Tuple[float, float, float]:
-        # Origin1 is the robot's parent; we treat parent-relative coords as base coords.
+    def _world_to_base_xyz(pos_w: Tuple[float, float, float]) -> Tuple[float, float, float]:
+        """Convert world XYZ to robot base-frame XYZ."""
         try:
-            origin0 = scene_origins[0]
-            return (float(pos_w[0] - origin0[0]), float(pos_w[1] - origin0[1]), float(pos_w[2] - origin0[2]))
+            p_b = world_to_base_pos(sim, robot, (float(pos_w[0]), float(pos_w[1]), float(pos_w[2])))
+            return (float(p_b[0]), float(p_b[1]), float(p_b[2]))
         except Exception:
             return (float(pos_w[0]), float(pos_w[1]), float(pos_w[2]))
+
+    def _target_world_aabb_top_height_w(prim_path: str) -> Optional[Tuple[float, float, float, float]]:
+        """World AABB for ``prim_path`` (includes mesh children). Returns (top_z, height, cx, cy)."""
+        try:
+            Usd = importlib.import_module("pxr.Usd").Usd
+            UsdGeom = importlib.import_module("pxr.UsdGeom").UsdGeom
+            omni_usd = importlib.import_module("omni.usd")
+            stage = omni_usd.get_context().get_stage()
+            prim = stage.GetPrimAtPath(str(prim_path))
+            if not prim.IsValid():
+                return None
+            bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default"], useExtentsHint=True)
+            bbox = bbox_cache.ComputeWorldBound(prim)
+            rng = bbox.ComputeAlignedRange()
+            mn = rng.GetMin()
+            mx = rng.GetMax()
+            cx = 0.5 * (float(mn[0]) + float(mx[0]))
+            cy = 0.5 * (float(mn[1]) + float(mx[1]))
+            top_z = float(mx[2])
+            height = max(1e-6, float(mx[2]) - float(mn[2]))
+            return (top_z, height, cx, cy)
+        except Exception:
+            return None
 
     def _select_bin(ep_idx: int, n_bins: int) -> Dict[str, object]:
         sel = str(getattr(args, "bin_selection", "cycle"))
@@ -962,6 +1089,59 @@ def run(args: argparse.Namespace) -> int:
         max_floor_dz = float(getattr(args, "bin_wall_height", 0.06)) + 0.05
         return abs(float(pos[2]) - bin_floor_z) <= max_floor_dz
 
+    def _nearest_bin_xy_dist_w(wx: float, wy: float) -> float:
+        dmin = float("inf")
+        for b in bins_meta:
+            cx, cy = b["center_xy"]  # type: ignore[index]
+            dmin = min(dmin, math.hypot(float(wx) - float(cx), float(wy) - float(cy)))
+        return float(dmin)
+
+    def _select_closest_target_leaf(*, ep_idx: int) -> Optional[Tuple[str, float, bool]]:
+        """Pick object with smallest base-frame XY distance to robot origin.
+
+        Skips objects inside ``--target-bin-clearance-xy-m`` of any bin center unless
+        that would eliminate every object (then falls back with a warning).
+
+        Returns:
+            ``(leaf_name, dist_xy_m, used_bin_clearance_filter)`` or ``None``.
+        """
+        clear_xy = float(getattr(args, "target_bin_clearance_xy_m", 0.26))
+
+        def _candidates(filter_bins: bool) -> List[Tuple[float, str]]:
+            scored: List[Tuple[float, str]] = []
+            try:
+                snaps = list(tracker.snapshot())
+            except Exception:
+                return []
+            for o in snaps:
+                wx = float(o.pose.position_m[0])
+                wy = float(o.pose.position_m[1])
+                wz = float(o.pose.position_m[2])
+                if filter_bins and _nearest_bin_xy_dist_w(wx, wy) < clear_xy:
+                    continue
+                pos_b = _world_to_base_xyz((wx, wy, wz))
+                d = math.hypot(float(pos_b[0]), float(pos_b[1]))
+                scored.append((d, str(o.id)))
+            return scored
+
+        scored = _candidates(True)
+        used_filter = True
+        if not scored:
+            scored = _candidates(False)
+            used_filter = False
+            if scored:
+                print(
+                    f"[VLA_V2][EP {int(ep_idx) + 1}] WARN: all objects inside bin-clearance XY disc; "
+                    "choosing closest to robot anyway."
+                )
+        if not scored:
+            return None
+        scored.sort(key=lambda t: t[0])
+        dist0, leaf0 = scored[0][0], scored[0][1]
+        filt = "bin-clearance filter" if used_filter else "no bin filter (fallback)"
+        print(f"[VLA_V2][EP {int(ep_idx) + 1}] target={leaf0} closest XY to base d={dist0:.3f}m ({filt})")
+        return (leaf0, dist0, used_filter)
+
     # -----------------------------------------------------------------------
     # Episode loop
     # -----------------------------------------------------------------------
@@ -987,16 +1167,16 @@ def run(args: argparse.Namespace) -> int:
     total_ticks = 0
     total_images = 0
 
-    # Phase parameters
-    pregrasp_offset = float(getattr(args, "pregrasp_offset_m", 0.10))
-    grasp_depth = float(getattr(args, "grasp_depth_m", -0.04))
-    transit_clearance = float(getattr(args, "transit_clearance_m", 0.30))
-    drop_clearance = float(getattr(args, "drop_clearance_m", 0.18))
+    # Phase parameters (defaults match add_cli_args; getattr is for older pickled args).
+    pregrasp_offset = float(getattr(args, "pregrasp_offset_m", 0.06))
+    grasp_depth = float(getattr(args, "grasp_depth_m", -0.055))
+    grasp_depth_extra_per_h = float(getattr(args, "grasp_depth_extra_per_height", 0.35))
+    approach_clearance = float(getattr(args, "approach_clearance_m", 0.18))
+    transit_clearance = float(getattr(args, "transit_clearance_m", 0.22))
+    drop_clearance = float(getattr(args, "drop_clearance_m", 0.20))
     ee_z_offset = float(getattr(args, "ee_z_offset_m", 0.08))
-    home_b = tuple(float(v) for v in getattr(args, "home_pose_b", [0.30, 0.0, 1.10]))
+    home_b = tuple(float(v) for v in getattr(args, "home_pose_b", [0.30, 0.0, 1.00]))
     box_size = float(getattr(args, "box_size", 0.05))
-
-    transit_z = float(table_z) + transit_clearance
 
     for ep in range(num_episodes):
         if not simulation_app.is_running():
@@ -1058,6 +1238,8 @@ def run(args: argparse.Namespace) -> int:
                 pass
             try:
                 wp.reset()
+                wp.set_tolerance_m(float(getattr(args, "tolerance", 0.012)))
+                wp.set_max_steps_per_waypoint(int(getattr(args, "wp_max_steps_per_waypoint", 480)))
             except Exception:
                 pass
             try:
@@ -1095,9 +1277,25 @@ def run(args: argparse.Namespace) -> int:
             except Exception:
                 pass
 
-            # Pick a destination bin + language command
+            # Grasp target: closest object to robot base in XY (see profile docs).
+            sel = _select_closest_target_leaf(ep_idx=int(ep))
+            if sel is None:
+                session_logger.log_event(
+                    "episode_skipped", {"episode_idx": int(ep), "reason": "no_object_poses"}
+                )
+                try:
+                    session_logger.close()
+                except Exception:
+                    pass
+                continue
+            target_leaf, target_dist_xy_b, target_bin_filter = sel
+            target_prim = f"{BOXES_PARENT}/{target_leaf}"
+            target_color_name = id_to_color.get(target_leaf)
+
             bin_meta = _select_bin(int(ep), len(bins_meta))
-            lang_cmd, lang_meta = _make_language_command(ep_idx=int(ep), bin_meta=bin_meta)
+            lang_cmd, lang_meta = _make_language_command(
+                ep_idx=int(ep), bin_meta=bin_meta, target_leaf=target_leaf
+            )
             try:
                 import json as _json
 
@@ -1107,7 +1305,11 @@ def run(args: argparse.Namespace) -> int:
                             "episode_idx": int(ep),
                             "target_prim": str(target_prim),
                             "target_leaf": target_leaf,
-                            "target_color": target_color_name,
+                            "target_color": lang_meta.get("target_color"),
+                            "target_label": lang_meta.get("target_label", ""),
+                            "target_dist_xy_to_base_m": float(target_dist_xy_b),
+                            "target_pick_used_bin_clearance": bool(target_bin_filter),
+                            "spawn_mode": str(getattr(args, "spawn_mode", "box")),
                             "bin_idx": int(lang_meta.get("bin_idx", 0)),  # 1-based
                             "bin_idx0": int(lang_meta.get("bin_idx0", 0)),
                             "bin_color": lang_meta.get("bin_color"),
@@ -1121,10 +1323,8 @@ def run(args: argparse.Namespace) -> int:
             except Exception:
                 pass
 
-            # Read the target object's current world XY (after settle) so the
-            # gripper can lock onto the actual settled position, not the
-            # intended pre-settle one.
-            target_state = _read_target_state()
+            # Read the target object's current world pose (after settle).
+            target_state = _read_target_state(target_leaf)
             if target_state is None:
                 session_logger.log_event(
                     "episode_skipped", {"episode_idx": int(ep), "reason": "no_target_pose"}
@@ -1135,16 +1335,45 @@ def run(args: argparse.Namespace) -> int:
                     pass
                 continue
             tx_w, ty_w, tz_w = target_state["pos"]  # type: ignore[index]
-            tx_b, ty_b, tz_b = _world_to_base_xy((tx_w, ty_w, tz_w))
+            tx_b, ty_b, tz_b = _world_to_base_xyz((tx_w, ty_w, tz_w))
+
+            aabb_metrics = _target_world_aabb_top_height_w(target_prim)
+            if aabb_metrics is not None:
+                top_z_w, height_w, _aabb_cx, _aabb_cy = aabb_metrics
+            else:
+                top_z_w = float(tz_w) + 0.5 * box_size
+                height_w = float(box_size)
+
+            top_z_b = _world_to_base_xyz((float(tx_w), float(ty_w), float(top_z_w)))[2]
+            depth_scale = float(grasp_depth_extra_per_h) * float(height_w)
+            touch_z_b = float(top_z_b) + ee_z_offset
+            grasp_z_b = float(touch_z_b) + float(grasp_depth) - depth_scale
+            pregrasp_z_b = float(top_z_b) + ee_z_offset + float(pregrasp_offset)
+
+            # --- Grasp Z clamps: avoid unreachable / table-scraping goals (stuck follower, open gripper) ---
+            max_drop = float(getattr(args, "max_grasp_drop_below_touch_m", 0.032))
+            floor_touch_b = float(touch_z_b) - float(max_drop)
+            tbl_z_b = _world_to_base_xyz((float(tx_w), float(ty_w), float(table_z)))[2]
+            floor_table_b = float(tbl_z_b) + float(getattr(args, "min_grasp_clearance_above_table_m", 0.042))
+            grasp_z_raw = float(grasp_z_b)
+            grasp_z_b = max(float(grasp_z_b), floor_touch_b, floor_table_b)
+            if abs(float(grasp_z_b) - float(grasp_z_raw)) > 1e-4:
+                print(
+                    f"[VLA_V2][EP {int(ep)+1}] grasp_z clamp: raw={grasp_z_raw:.3f}m -> {grasp_z_b:.3f}m "
+                    f"(touch_floor={floor_touch_b:.3f} table_floor={floor_table_b:.3f})"
+                )
+            pregrasp_z_b = max(float(pregrasp_z_b), float(grasp_z_b) + 0.022)
 
             # Bin XY in base frame (origin1 == base for our setup).
             bcx, bcy = bin_meta["center_xy"]  # type: ignore[index]
-            bin_drop_x_b, bin_drop_y_b, _ = _world_to_base_xy((float(bcx), float(bcy), 0.0))
+            bin_drop_x_b, bin_drop_y_b, _ = _world_to_base_xyz((float(bcx), float(bcy), float(tz_w)))
 
-            box_top_z_b = float(tz_b) + 0.5 * box_size
-            grasp_z_b = float(box_top_z_b) + ee_z_offset + grasp_depth
-            pregrasp_z_b = float(box_top_z_b) + ee_z_offset + pregrasp_offset
-            drop_z_b = float(bin_meta["bin_floor_z"]) - float(scene_origins[0][2]) + drop_clearance  # base z
+            approach_z_b = _world_to_base_xyz((float(tx_w), float(ty_w), float(table_z) + approach_clearance))[2]
+            transit_z_b = _world_to_base_xyz((float(tx_w), float(ty_w), float(table_z) + transit_clearance))[2]
+            bin_floor_z_w = float(bin_meta["bin_floor_z"])
+            drop_floor_z_b = _world_to_base_xyz((float(bcx), float(bcy), bin_floor_z_w))[2]
+
+            drop_z_b = float(drop_floor_z_b) + drop_clearance
 
             # Episode start event
             session_logger.log_event(
@@ -1154,13 +1383,22 @@ def run(args: argparse.Namespace) -> int:
                     "target_prim": str(target_prim),
                     "target_leaf": target_leaf,
                     "target_color": target_color_name,
+                    "target_label": lang_meta.get("target_label", ""),
+                    "target_dist_xy_to_base_m": float(target_dist_xy_b),
+                    "target_pick_used_bin_clearance": bool(target_bin_filter),
+                    "spawn_mode": str(getattr(args, "spawn_mode", "box")),
                     "target_pos_b": [float(tx_b), float(ty_b), float(tz_b)],
+                    "target_top_z_w": float(top_z_w),
+                    "target_aabb_height_m": float(height_w),
+                    "grasp_z_b_raw": float(grasp_z_raw),
+                    "grasp_z_b": float(grasp_z_b),
+                    "pregrasp_z_b": float(pregrasp_z_b),
                     "bin_idx": int(lang_meta.get("bin_idx", 0)),
                     "bin_color": lang_meta.get("bin_color"),
                     "bin_center_xy_b": [float(bin_drop_x_b), float(bin_drop_y_b)],
                     "language_command": str(lang_cmd),
                     "language_command_meta": lang_meta,
-                    "transit_z_b": float(transit_z),
+                    "transit_z_b": float(transit_z_b),
                     "drop_z_b": float(drop_z_b),
                 },
             )
@@ -1175,51 +1413,70 @@ def run(args: argparse.Namespace) -> int:
             # in between (the only stops are at gripper / hold phases).
             #
             #   1. OPEN_GRIPPER       — open fingers, no motion.
-            #   2. PICK               — fly above target → pregrasp → grasp Z.
-            #   3. CLOSE_GRIPPER      — close fingers around the box.
-            #   4. POST_CLOSE_HOLD    — short hold so contacts settle.
-            #   5. TRANSIT_AND_DROP   — lift → transit XY over clutter → descend
+            #   2. PICK_APPROACH      — approach XY → pregrasp height (coarse tolerance).
+            #   3. PICK_GRASP         — final descent to grasp Z (tight tolerance, long step budget).
+            #   4. CLOSE_GRIPPER      — close fingers around the object.
+            #   5. POST_CLOSE_HOLD    — short hold so contacts settle.
+            #   6. TRANSIT_AND_DROP   — lift → transit XY over clutter → descend
             #                           into bin (one continuous trajectory).
-            #   6. RELEASE_GRIPPER    — open fingers (drop).
-            #   7. POST_RELEASE_HOLD  — short hold.
-            #   8. RETREAT            — retreat up + back to home XY (continuous).
-            #   9. DONE.
+            #   7. RELEASE_GRIPPER    — open fingers (drop).
+            #   8. POST_RELEASE_HOLD  — short hold.
+            #   9. RETREAT            — retreat up + back to home XY (continuous).
+            #   10. DONE.
             #
-            # PICK: always go to a moderate "approach" altitude above the target
-            # first, then descend through pregrasp to grasp.
-            #
-            # We deliberately do NOT command the high transit altitude before
-            # grasping — that was the original "lift the arm to its ceiling and
-            # freeze" failure mode. ``approach_z_b`` is the table top plus
-            # ``--approach-clearance-m`` (default 0.18 m → 0.98 m world Z), well
-            # above any obstacle box top (~0.85 m world Z) but well below the
-            # workspace ceiling so the IK is always solvable.
-            approach_z_b = float(table_z) + float(getattr(args, "approach_clearance_m", 0.18))
-
-            pick_points = [
+            # We deliberately split the pick so the gripper cannot close until the
+            # arm has converged within ``--pick-grasp-tol-m`` of the final grasp
+            # point; the coarse ``--tolerance`` alone can clear the queue while
+            # the EE is still several mm high.  Grasp height uses the USD world
+            # AABB (``top_z``, ``height``) so YCB meshes work, not just cubes.
+            approaching_pregrasp_z = float(max(pregrasp_z_b, grasp_z_b + 0.012))
+            pick_approach_points = [
                 (float(tx_b), float(ty_b), float(approach_z_b)),
-                (float(tx_b), float(ty_b), float(max(pregrasp_z_b, grasp_z_b + 0.015))),
-                (float(tx_b), float(ty_b), float(grasp_z_b)),
+                (float(tx_b), float(ty_b), float(approaching_pregrasp_z)),
             ]
+            pick_grasp_points = [(float(tx_b), float(ty_b), float(grasp_z_b))]
             transit_points = [
-                (float(tx_b), float(ty_b), float(transit_z)),
-                (float(bin_drop_x_b), float(bin_drop_y_b), float(transit_z)),
+                (float(tx_b), float(ty_b), float(transit_z_b)),
+                (float(bin_drop_x_b), float(bin_drop_y_b), float(transit_z_b)),
                 (float(bin_drop_x_b), float(bin_drop_y_b), float(drop_z_b)),
             ]
             retreat_points = [
-                (float(bin_drop_x_b), float(bin_drop_y_b), float(transit_z)),
+                (float(bin_drop_x_b), float(bin_drop_y_b), float(transit_z_b)),
                 (float(home_b[0]), float(home_b[1]), float(home_b[2])),
             ]
 
             phases: List[Tuple[str, Dict[str, object]]] = [
                 ("open_gripper", {"steps": int(getattr(args, "gripper_open_steps", 24)), "value": +1.0, "name": "OPEN_GRIPPER"}),
-                ("waypoint", {"name": "PICK", "points": pick_points,
-                              "log": {"target_xy_b": [float(tx_b), float(ty_b)],
-                                      "grasp_z_b": float(grasp_z_b)}}),
+                (
+                    "waypoint",
+                    {
+                        "name": "PICK_APPROACH",
+                        "points": pick_approach_points,
+                        "grasp_finalize": False,
+                        "log": {
+                            "target_xy_b": [float(tx_b), float(ty_b)],
+                            "top_z_b": float(top_z_b),
+                            "pregrasp_z_b": float(pregrasp_z_b),
+                        },
+                    },
+                ),
+                (
+                    "waypoint",
+                    {
+                        "name": "PICK_GRASP",
+                        "points": pick_grasp_points,
+                        "grasp_finalize": True,
+                        "log": {
+                            "target_xy_b": [float(tx_b), float(ty_b)],
+                            "grasp_z_b": float(grasp_z_b),
+                            "pick_grasp_tol_m": float(getattr(args, "pick_grasp_tol_m", 0.004)),
+                        },
+                    },
+                ),
                 ("close_gripper", {"steps": int(getattr(args, "gripper_close_steps", 60)), "value": -1.0, "name": "CLOSE_GRIPPER"}),
                 ("hold", {"name": "POST_CLOSE_HOLD", "steps": int(getattr(args, "hold_after_close_steps", 20))}),
                 ("waypoint", {"name": "TRANSIT_AND_DROP", "points": transit_points,
-                              "log": {"transit_z_b": float(transit_z),
+                              "log": {"transit_z_b": float(transit_z_b),
                                       "bin_xy_b": [float(bin_drop_x_b), float(bin_drop_y_b)],
                                       "drop_z_b": float(drop_z_b),
                                       "bin_idx": int(lang_meta.get("bin_idx", 0))}}),
@@ -1233,9 +1490,10 @@ def run(args: argparse.Namespace) -> int:
 
             print(
                 f"[VLA_V2][EP {int(ep)+1}/{num_episodes}] target_pos_b=({float(tx_b):.3f}, {float(ty_b):.3f}, {float(tz_b):.3f}) "
+                f"(top_z_w={float(top_z_w):.3f} h={float(height_w):.3f}) "
                 f"-> bin {int(lang_meta.get('bin_idx', 0))} ({lang_meta.get('bin_color')}) @ "
                 f"({float(bin_drop_x_b):.3f}, {float(bin_drop_y_b):.3f}) "
-                f"| grasp_z={float(grasp_z_b):.3f}m transit_z={float(transit_z):.3f}m drop_z={float(drop_z_b):.3f}m"
+                f"| grasp_z={float(grasp_z_b):.3f}m transit_z={float(transit_z_b):.3f}m drop_z={float(drop_z_b):.3f}m"
             )
             print(f"[VLA_V2][EP {int(ep)+1}/{num_episodes}] instruction: \"{lang_cmd}\"")
 
@@ -1367,6 +1625,12 @@ def run(args: argparse.Namespace) -> int:
 
                     elif name == "waypoint":
                         if not phase_state.get("queued", False):
+                            if bool(params.get("grasp_finalize", False)):
+                                wp.set_tolerance_m(float(getattr(args, "pick_grasp_tol_m", 0.004)))
+                                wp.set_max_steps_per_waypoint(int(getattr(args, "pick_grasp_max_steps_per_waypoint", 3200)))
+                            else:
+                                wp.set_tolerance_m(float(getattr(args, "tolerance", 0.012)))
+                                wp.set_max_steps_per_waypoint(int(getattr(args, "wp_max_steps_per_waypoint", 480)))
                             pts = list(params.get("points", []))
                             dense = _densify(
                                 [(float(p[0]), float(p[1]), float(p[2])) for p in pts],
@@ -1419,6 +1683,9 @@ def run(args: argparse.Namespace) -> int:
                                 wp.set_waypoints_b([])
                             except Exception:
                                 pass
+                            if bool(params.get("grasp_finalize", False)):
+                                wp.set_tolerance_m(float(getattr(args, "tolerance", 0.012)))
+                                wp.set_max_steps_per_waypoint(int(getattr(args, "wp_max_steps_per_waypoint", 480)))
                             phase_idx += 1
                             phase_step_count = 0
                             phase_state = {}
@@ -1523,7 +1790,7 @@ def run(args: argparse.Namespace) -> int:
                     )
 
             # Evaluate drop success at the end (or at episode timeout).
-            final_state = _read_target_state()
+            final_state = _read_target_state(target_leaf)
             ok = bool(_drop_success(final_state, bin_meta))
             session_logger.log_event(
                 "drop_result",

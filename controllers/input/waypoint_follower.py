@@ -54,6 +54,14 @@ class WaypointFollowerInput(InputProvider):
 		self._wp_last_dist_m = None
 		self._wp_stagnant_steps = 0
 
+	def set_tolerance_m(self, tol_m: float) -> None:
+		"""Change position convergence radius (meters) for subsequent waypoints."""
+		self.tol_m = float(tol_m)
+
+	def set_max_steps_per_waypoint(self, n: int) -> None:
+		"""Change per-waypoint watchdog step budget."""
+		self.max_steps_per_waypoint = max(1, int(n))
+
 	def set_current_pose_b(self, ee_pos_b: torch.Tensor) -> None:
 		"""Update the current EE position in base frame: shape (3,) or (1,3)."""
 		if ee_pos_b.ndim == 2:
