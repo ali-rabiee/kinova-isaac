@@ -5,7 +5,8 @@
 # collect across several runs - they will all be merged.
 data:
   data_roots:
-    - logs/data_collection
+    # Single session only (avoid mixing other logs/data_collection/session_* runs).
+    - logs/data_collection/session_20260506_232450
   image_size: 224
   chunk_len: 8
   state_dim: 4
@@ -16,6 +17,8 @@ data:
   # If non-null, normalize the 6 continuous action dims (delta pose) by
   # mean/std computed from the training set. Recommended.
   normalize_actions: true
+  # If True, decode PNGs with torchvision.io (usually faster than PIL).
+  fast_image_io: true
 
 model:
   image_size: 224
@@ -39,14 +42,28 @@ model:
 train:
   device: cuda
   num_epochs: 30
-  batch_size: 32
-  num_workers: 4
+  # Larger batches improve GPU utilization for this small model; lower if you OOM.
+  batch_size: 512
+  # More workers + prefetch helps keep the GPU fed (data loading is often the bottleneck).
+  num_workers: 8
+  prefetch_factor: 4
+  persistent_workers: true
+  # Validation DataLoader (default: max(1, num_workers // 2)).
+  # val_num_workers: 4
+  cudnn_benchmark: true
+  # Mixed precision on CUDA (bf16 on Ampere+ when amp_dtype=auto; fp16 uses GradScaler).
+  amp: true
+  amp_dtype: auto  # auto | bfloat16 | float16
   lr: 3.0e-4
   weight_decay: 0.01
   grad_clip: 1.0
   warmup_steps: 200
   log_every: 50
   ckpt_every_epochs: 5
+  # Full training state every N optimizer steps (0 = off). Keeps newest `max_step_checkpoints` files.
+  save_every_steps: 2000
+  max_step_checkpoints: 3
+  metrics_file: metrics.jsonl
   out_dir: vla_lab/checkpoints/tiny_v0
   seed: 42
   # Loss weights

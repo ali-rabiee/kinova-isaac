@@ -178,21 +178,21 @@ def discover_episodes(roots: Sequence[Path]) -> List[EpisodeRecord]:
         if not root.exists():
             continue
 
-        # The user might pass either the parent of session folders, a single
-        # session folder, or a single episode folder. Handle all three.
-        if (root / "ticks.jsonl").exists():
+        # Layouts:
+        # - `session_ts/episode_####/` — session may hold an empty top-level `ticks.jsonl` (still scan `episode_*`).
+        # - `logs/data_collection/` with multiple `session_*`
+        # - single episode folder with real `ticks.jsonl` only
+        ep_dirs: List[Path] = []
+        direct_eps = sorted(p for p in root.iterdir() if p.is_dir() and p.name.startswith("episode_"))
+        if direct_eps:
+            ep_dirs = direct_eps
+        elif any(p.is_dir() and p.name.startswith("session_") for p in root.iterdir()):
+            for sd in sorted(p for p in root.iterdir() if p.is_dir() and p.name.startswith("session_")):
+                ep_dirs.extend(
+                    sorted(p for p in sd.iterdir() if p.is_dir() and p.name.startswith("episode_"))
+                )
+        elif (root / "ticks.jsonl").exists():
             ep_dirs = [root]
-        else:
-            session_dirs: List[Path] = []
-            if any(p.name.startswith("session_") for p in root.iterdir()):
-                session_dirs = sorted(p for p in root.iterdir() if p.is_dir() and p.name.startswith("session_"))
-            else:
-                # Treat root itself as a "session" container
-                session_dirs = [root]
-
-            ep_dirs = []
-            for sd in session_dirs:
-                ep_dirs.extend(sorted(p for p in sd.iterdir() if p.is_dir() and p.name.startswith("episode_")))
 
         for ep_dir in ep_dirs:
             ticks_path = ep_dir / "ticks.jsonl"
@@ -401,6 +401,8 @@ class DatasetConfig:
     state_dim: int = 4  # [ee_x, ee_y, ee_z, gripper_open=1.0/0.0]
     action_dim: int = 7  # [dx, dy, dz, drx, dry, drz, gripper]
     drop_no_image: bool = True
+    # If True (default), use torchvision.io.read_image when available (often faster than PIL).
+    fast_image_io: bool = True
 
 
 class KinovaSessionDataset(Dataset):
@@ -427,6 +429,19 @@ class KinovaSessionDataset(Dataset):
         self.cfg = cfg
         self.action_stats = action_stats
         self.train = train
+        self._fast_io = bool(cfg.fast_image_io)
+        self._tv_read_image = None
+        self._tv_interpolate = None
+        if self._fast_io:
+            try:
+                from torchvision.io import read_image as _read_image  # type: ignore
+
+                from torch.nn.functional import interpolate as _interpolate
+
+                self._tv_read_image = _read_image
+                self._tv_interpolate = _interpolate
+            except Exception:
+                self._fast_io = False
 
         self._index: List[Tuple[int, int]] = []
         for ep_idx, ep in enumerate(episodes):
@@ -455,6 +470,21 @@ class KinovaSessionDataset(Dataset):
         path = ep.folder / rel
         if not path.exists():
             return torch.zeros(3, H, W, dtype=torch.float32)
+        if self._fast_io and self._tv_read_image is not None and self._tv_interpolate is not None:
+            try:
+                t8 = self._tv_read_image(str(path))  # CHW uint8
+                if t8.dim() != 3 or t8.shape[0] == 1:
+                    raise ValueError("unexpected image shape")
+                if t8.shape[0] == 4:
+                    t8 = t8[:3]
+                t = t8.float() / 255.0
+                if t.shape[1] != H or t.shape[2] != W:
+                    t = self._tv_interpolate(
+                        t.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False
+                    ).squeeze(0)
+                return t.contiguous()
+            except Exception:
+                pass
         try:
             img = Image.open(path).convert("RGB").resize((W, H), Image.BILINEAR)
             arr = np.array(img, dtype=np.uint8, copy=True)

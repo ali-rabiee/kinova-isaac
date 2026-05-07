@@ -27,6 +27,7 @@ The Phase-1 pipeline is end-to-end runnable: **collect → train → eval**.
 | TTC inference | `vla_lab/ttc.py` | K-noise sampling at the bottleneck + consensus scoring fallback. |
 | IsaacLab eval | `vla_lab/eval_isaaclab.py` | Drops the trained policy into `reach_to_grasp_VLA` and reports success. |
 | Dryrun / inspect | `vla_lab/dryrun.py`, `vla_lab/inspect_data.py` | VRAM/latency check + dataset sanity tool. |
+| Plotting | `vla_lab/plot_metrics.py` | Learning curves + eval success (Wilson CI) from `metrics.jsonl` / eval JSON. |
 
 What this gives you on day one:
 
@@ -80,12 +81,14 @@ vla_lab/
 ├── eval_isaaclab.py                <- IsaacLab evaluation entrypoint
 ├── dryrun.py                       <- VRAM / latency dry-fit
 ├── inspect_data.py                 <- session sanity tool
+├── plot_metrics.py                 <- figures for training / eval (paper-style)
 └── scripts/
     ├── collect.sh                  <- **vla_v1** stable reach/grasp/lift (default data collection)
     ├── collect_v3.sh               <- same as collect.sh (--profile vla_v1); numbered alias for clarity
     ├── collect_v2.sh               <- **vla_v2** pick-and-place + bins
     ├── train.sh                    <- wrapper around `vla_lab.train`
     ├── eval.sh                     <- wrapper around `vla_lab.eval_isaaclab`
+    ├── plot.sh                     <- wrapper around `vla_lab.plot_metrics`
     └── dryrun.sh                   <- wrapper around `vla_lab.dryrun`
 ```
 
@@ -97,6 +100,8 @@ The training and inspection tools have **light** dependencies:
 
 ```bash
 pip install torch torchvision numpy pillow pyyaml
+# For PDF/PNG figures after training (`plot_metrics`, auto-run at train end):
+pip install matplotlib
 ```
 
 The Isaac Lab evaluation entrypoint additionally needs the same Isaac
@@ -316,33 +321,159 @@ DEVICE=cpu ./vla_lab/scripts/dryrun.sh --iters 8 --warmup 2 --k 1
 
 ### 5.4 Train
 
-The default config trains TinyVLA on every session under
-`logs/data_collection/`.
+From the **repo root** (`kinova-isaac/`), with a Python env that has PyTorch
+installed (no Isaac Lab required for training).
+
+**Default data:** `vla_lab/configs/train_tiny.yaml` uses a **single** session:
+
+`logs/data_collection/session_20260506_232450`
+
+(Change `data.data_roots` in that YAML if you want a different session or multiple roots.)
+
+**Recommended — start training:**
 
 ```bash
+cd /path/to/kinova-isaac
+pip install torch torchvision numpy pillow pyyaml matplotlib   # matplotlib: figures after training
+
 ./vla_lab/scripts/train.sh
+```
 
-# or, explicit:
+**GPU utilization:** TinyVLA is only ~2M parameters, so the GPU often waits on
+**CPU data loading** (decoding thousands of PNGs). The default config enables
+**larger batches** (`batch_size`), **more DataLoader workers**, **prefetch**,
+**mixed precision (AMP)**, **cuDNN benchmark**, and **torchvision-based image
+decode** (`data.fast_image_io`). Tune `train.batch_size` and `train.num_workers`
+in `train_tiny.yaml`; if you run out of VRAM, lower `batch_size`. For very high
+core-count CPUs you can try `num_workers: 12` or `16`.
+
+Checkpoints, `metrics.jsonl`, and plots go under `vla_lab/checkpoints/tiny_v0/`
+(or whatever `train.out_dir` is set to in the YAML). Override the output dir:
+
+```bash
+./vla_lab/scripts/train.sh --out-dir vla_lab/checkpoints/my_run
+```
+
+**Explicit module invocation (same as the script):**
+
+```bash
 python -m vla_lab.train --config vla_lab/configs/train_tiny.yaml
+```
 
-# Override common knobs from the CLI:
+**Use different data without editing the YAML:**
+
+```bash
 python -m vla_lab.train \
     --config vla_lab/configs/train_tiny.yaml \
-    --data-roots logs/data_collection logs/data_collection_extra \
-    --epochs 50 --batch-size 64 \
-    --out-dir vla_lab/checkpoints/tiny_v1
+    --data-roots logs/data_collection \
+    --out-dir vla_lab/checkpoints/all_sessions
+```
+
+**Resume after interruption** (loads optimizer + scheduler + dataloader position):
+
+```bash
+python -m vla_lab.train --config vla_lab/configs/train_tiny.yaml --auto-resume
+# or: python -m vla_lab.train --config ... --resume vla_lab/checkpoints/tiny_v0/last.pt
+```
+
+**Skip automatic plotting** (e.g. no matplotlib):
+
+```bash
+python -m vla_lab.train --config vla_lab/configs/train_tiny.yaml --no-plot-at-end
 ```
 
 Output checkpoints live under `vla_lab/checkpoints/<run_name>/`:
 
-- `last.pt`  — most recent epoch
+- `last.pt`  — latest epoch boundary (full state for `--resume`)
 - `best.pt`  — best validation loss (only if val split is non-empty)
+- `step_*.pt` — periodic snapshots (see `train.save_every_steps` in YAML)
 - `config.json` — frozen hyperparameter dump
+- `metrics.jsonl` — train/val scalars for plotting
+
+After training, figures are written to `<out_dir>/figures/` (learning curves,
+LR schedule, train/val per epoch). Install `matplotlib` for this step.
+
+Regenerate plots (optionally pass eval JSON from §5.5 for success-rate bars):
+
+```bash
+RUN_DIR=vla_lab/checkpoints/tiny_v0 ./vla_lab/scripts/plot.sh --format pdf \
+  --eval-json vla_lab/eval_results/tiny_v0/results_1234567890.json
+```
 
 To enable the optional DINOv2 feature-alignment loss flip
 `train.feature_alignment.enabled: true` in the YAML (or pass a YAML that
 already has it on) — `transformers` must be installed and the teacher
 weights cached.
+
+#### 5.4.1 SmolVLA — training & weights (LeRobot; **not** shipped in this repo)
+
+**There is no SmolVLA training script in `kinova-isaac`.**  
+Phase‑1 here trains **`TinyVLA`** via `vla_lab/train.py` only. A **SmolVLA
+wrapper + trainer integration** is still on the roadmap (see §2 and
+[`vla_ttc_engineering_spec.md`](./vla_ttc_engineering_spec.md)).
+
+To **fine-tune SmolVLA** and **load pretrained weights**, use **Hugging Face
+[LeRobot](https://github.com/huggingface/lerobot)** in a **separate Python
+environment** (LeRobot pins its own Torch / Python; do not assume it matches
+your Isaac Lab Kit env).
+
+Official overview: [SmolVLA in the LeRobot docs](https://huggingface.co/docs/lerobot/smolvla).
+
+**1. Install LeRobot + SmolVLA extras (follow the doc version you use)**
+
+```bash
+# Example only — see https://huggingface.co/docs/lerobot/installation
+git clone https://github.com/huggingface/lerobot.git
+cd lerobot
+pip install -e ".[smolvla]"
+```
+
+**2. Pretrained base policy (starting weights)**  
+SmolVLA is loaded from the Hub as a **policy checkpoint**, e.g. the base model
+[`lerobot/smolvla_base`](https://huggingface.co/lerobot/smolvla_base). LeRobot’s
+training CLI takes this as `--policy.path=lerobot/smolvla_base` (exact flag
+names can change between releases — use the docs for your installed version).
+
+**3. Dataset format (important gap)**  
+LeRobot training expects a **LeRobot dataset** (parquet + metadata on disk or
+`dataset.repo_id` on the Hub).  
+Your Isaac collection under `logs/data_collection/session_*/episode_*`
+(`ticks.jsonl`, `instruction.json`, `images/`) is **not** that format. You
+need either:
+
+- a **converter** into LeRobot dataset schema, or  
+- a **new collection path** that writes LeRobot datasets (see the engineering
+  spec’s `lerobot_writer` / real-robot collection notes), or  
+- manual export using LeRobot’s dataset APIs.
+
+Until a converter exists in this repo, treat SmolVLA training as **external**
+to `kinova-isaac`.
+
+**4. Typical fine-tune command (verify against your LeRobot version)**
+
+```bash
+lerobot-train \
+  --policy.path=lerobot/smolvla_base \
+  --dataset.repo_id=YOUR_USERNAME/YOUR_LEROBOT_DATASET \
+  --policy.device=cuda \
+  --batch_size=64 \
+  --steps=20000 \
+  --output_dir=outputs/train/my_smolvla_finetune \
+  --job_name=my_smolvla
+```
+
+Weights and configs are written under `--output_dir` per LeRobot’s layout.
+Use **`lerobot-record` / dataset upload** and **`lerobot-replay`** (or the
+notebooks linked from the SmolVLA model card) as in upstream docs.
+
+**5. Using a fine-tuned checkpoint**
+
+- In **LeRobot**: load the saved policy from `output_dir` (see LeRobot’s
+  `Policy.from_pretrained` / eval scripts in their repo).
+- In **`kinova-isaac`**: `vla_lab/eval_isaaclab.py` currently loads **`TinyVLA`**
+  checkpoints (`.pt` from `vla_lab.train`). Running **SmolVLA inside this
+  Isaac eval harness is not implemented yet** — that requires the planned
+  SmolVLA wrapper and adapter to `PolicyInputProvider`.
 
 ### 5.5 Evaluate in Isaac Lab
 
