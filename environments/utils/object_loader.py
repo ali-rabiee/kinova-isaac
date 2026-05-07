@@ -42,12 +42,12 @@ class ObjectLoaderConfig:
     # Physics and placement
     enable_physics: bool = True
     mass_kg: float | None = None
-    density: float | None = 500.0
+    density: float | None = 600.0
     contact_offset: float = 0.005
     rest_offset: float = 0.001
     # Friction and contact quality
-    static_friction: float = 100.0
-    dynamic_friction: float = 100.0
+    static_friction: float = 3.0
+    dynamic_friction: float = 3.0
     restitution: float = 0.0
     friction_combine_mode: str = "max"
     torsional_patch_radius: float = 0.02
@@ -723,6 +723,16 @@ class ObjectLoader:
                     except Exception:
                         box_color = tuple(self.cfg.box_color)
                     
+                    # Box-mode mass: prefer explicit mass_kg. Otherwise derive from density * volume
+                    # so larger cubes aren't unrealistically light. This keeps box-mode behavior
+                    # consistent with the rest of the repo's PhysicsConfig defaults.
+                    if self.cfg.mass_kg is not None:
+                        box_mass_kg = float(self.cfg.mass_kg)
+                    elif self.cfg.density is not None:
+                        box_mass_kg = float(self.cfg.density) * float(sx * sy * sz)
+                    else:
+                        box_mass_kg = 0.3
+
                     obj_cfg = CuboidCfg(
                         size=(sx, sy, sz),
                         visual_material=PreviewSurfaceCfg(diffuse_color=box_color),
@@ -731,7 +741,7 @@ class ObjectLoader:
                             kinematic_enabled=False,
                             disable_gravity=False,
                         ),
-                        mass_props=sim_utils.MassPropertiesCfg(mass=self.cfg.mass_kg or 0.1),
+                        mass_props=sim_utils.MassPropertiesCfg(mass=box_mass_kg),
                         collision_props=sim_utils.CollisionPropertiesCfg(
                             collision_enabled=True,
                             contact_offset=self.cfg.contact_offset,
