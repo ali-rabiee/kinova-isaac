@@ -1,0 +1,20 @@
+# Example knobs for `./vla_lab/scripts/train_smolvla.sh` (see comments in that script).
+#
+# Required once:
+#   SESSION_ROOTS="logs/data_collection/session_XXX" OUT_DIR=vla_lab/datasets/lerobot_kinova_v0 \
+#     ./vla_lab/scripts/export_lerobot_dataset.sh
+#
+# Then train:
+#   DATASET_DIR=vla_lab/datasets/lerobot_kinova_v0 \
+#   POLICY_PATH=lerobot/smolvla_base \
+#   STEPS=20000 BATCH_SIZE=32 \
+#     ./vla_lab/scripts/train_smolvla.sh
+
+policy_path: lerobot/smolvla_base
+dataset:
+  repo_id: kinova_isaac_vla
+  root: vla_lab/datasets/lerobot_kinova_v0
+training:
+  steps: 20000
+  batch_size: 32
+  device: cuda

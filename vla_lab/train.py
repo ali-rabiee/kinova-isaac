@@ -649,6 +649,11 @@ def main() -> int:
             print(f"[train] new best (val_loss={val_loss:.4f}) -> {p}")
 
     print(f"[train] done in {_format_minutes(time.time() - t_start)}")
+    abs_out = out_dir.resolve()
+    print(f"[train] run directory: {abs_out}")
+    print(f"[train] last checkpoint: {(abs_out / 'last.pt')}")
+    print(f"[train] metrics log: {(abs_out / str(train_cfg.get('metrics_file', 'metrics.jsonl')))}")
+    print(f"[train] plot: RUN_DIR={abs_out} ./vla_lab/scripts/plot.sh")
 
     if not args.no_plot_at_end:
         _maybe_plot_at_end(out_dir, list(args.plot_eval_json))

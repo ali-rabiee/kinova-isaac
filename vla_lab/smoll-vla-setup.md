@@ -1,5 +1,10 @@
 # SmolVLA in `vla_lab`: integration plan
 
+**Status (code in this repo):** The bridge is implemented under `vla_lab/smolvla_bridge/`
+with `convert_kinova_to_lerobot`, `policy_wrapper` (Isaac eval), `scripts/export_lerobot_dataset.sh`,
+`scripts/train_smolvla.sh`, `requirements-smolvla.txt`, and eval YAML/CLI flags (`policy_backend`,
+`lerobot_dataset_root`). You still install **LeRobot** separately for export/train.
+
 This document lists **exact changes** to keep inside **`vla_lab/`** so you can:
 
 1. **Load** a pretrained SmolVLA (Hub / LeRobot checkpoint).
@@ -194,12 +199,12 @@ These are **already largely present**; treat as a maintenance checklist:
 
 ## 10. Summary checklist
 
-- [ ] `smolvla_bridge/convert_kinova_to_lerobot.py` + `scripts/export_lerobot_dataset.sh`
-- [ ] `scripts/train_smolvla.sh` + `requirements-smolvla.txt` + `run_manifest.json`
-- [ ] Optional `lerobot_metrics.py` **or** `plot_metrics` extension for LeRobot logs
-- [ ] `policy_wrapper.py` + `eval_isaaclab.py` backend flag
-- [ ] Eval JSON includes `policy_backend` for comparison
-- [ ] Optional multi-run plot / summary script
-- [ ] `gitignore` `vla_lab/datasets/` (and large checkpoints if desired)
+- [x] `smolvla_bridge/convert_kinova_to_lerobot.py` + `scripts/export_lerobot_dataset.sh`
+- [x] `scripts/train_smolvla.sh` + `requirements-smolvla.txt` + `run_manifest.json` (written by train script)
+- [x] `lerobot_metrics.py` (helpers to append TinyVLA-style `metrics.jsonl` rows)
+- [x] `policy_wrapper.py` + `eval_isaaclab.py` backend flag
+- [x] Eval JSON includes `policy_backend` for comparison
+- [x] `scripts/summarize_comparison.sh` + `smolvla_bridge/summarize_comparison.py`
+- [x] `gitignore` — root `.gitignore` already ignores `vla_lab/datasets/`, `checkpoints/`, `eval_results/`
 
 Once these are done, you can **finetune SmolVLA on the same sessions** you use for TinyVLA and **compare** with identical Isaac eval + comparable training curves.

@@ -3,6 +3,11 @@
 
 ckpt: vla_lab/checkpoints/tiny_v0/last.pt
 
+# Policy runner: "tiny" = `vla_lab.train` checkpoint; "smolvla" = LeRobot Hub id or local dir.
+policy_backend: tiny
+# Path to the LeRobot dataset root produced by `convert_kinova_to_lerobot` (must contain meta/stats.json).
+lerobot_dataset_root: null
+
 eval:
   num_episodes: 10
   max_steps_per_episode: 4000

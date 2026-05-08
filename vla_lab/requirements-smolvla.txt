@@ -1,0 +1,6 @@
+# Pin versions loosely so `pip` can resolve Torch for your CUDA stack.
+# Install in an environment used for dataset export + SmolVLA fine-tuning (can differ from Isaac Lab).
+lerobot[smolvla]>=0.4.0
+num2words
+pillow
+numpy

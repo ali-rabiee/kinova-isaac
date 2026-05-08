@@ -1,20 +1,25 @@
-"""IsaacLab evaluation entrypoint for a trained TinyVLA + (optional) TTC.
+"""IsaacLab evaluation entrypoint for TinyVLA or SmolVLA + (optional) TTC.
 
-This script reuses the existing repo modules:
-- `environments.reach_to_grasp_VLA` (scene + camera config)
-- `environments.utils.{object_loader,physix,camera}` (scene + objects)
-- `controllers.CartesianVelocityJogController` (Cartesian velocity controller)
-- `data_collection.core.objects.ObjectsTracker` (object pose snapshot for success)
-
-It does NOT modify any of those files. Instead it imports them after the
-Isaac Lab `AppLauncher` is started, mirroring the pattern used by
-`data_collection/collect_data.py`.
+Policy backends:
+  - `tiny` (default): checkpoint from `python -m vla_lab.train` (`.pt`).
+  - `smolvla`: LeRobot policy (`lerobot/smolvla_base` or a fine-tuned output dir).
+    Requires `--lerobot-dataset-root` pointing at the **exported** dataset
+    (same path as `convert_kinova_to_lerobot --out-dir`) so `meta/stats.json`
+    matches training normalization.
 
 Usage (from repo root):
-    ./IsaacLab/isaaclab.sh -p vla_lab/eval_isaaclab.py \
-        --config vla_lab/configs/eval_isaac.yaml \
-        --enable_cameras \
+    ./IsaacLab/isaaclab.sh -p vla_lab/eval_isaaclab.py \\
+        --config vla_lab/configs/eval_isaac.yaml \\
+        --enable_cameras \\
         --device cuda:0
+
+SmolVLA example:
+    ./IsaacLab/isaaclab.sh -p vla_lab/eval_isaaclab.py \\
+        --config vla_lab/configs/eval_isaac.yaml \\
+        --policy-backend smolvla \\
+        --ckpt lerobot/smolvla_base \\
+        --lerobot-dataset-root vla_lab/datasets/lerobot_kinova_v0 \\
+        --enable_cameras --device cuda:0
 
 For headless eval add `--headless`.
 """
@@ -54,6 +59,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--spawn-mode", type=str, default=None, choices=[None, "box", "usd"])
     parser.add_argument("--language", type=str, default=None, help="Override episode language with a fixed string")
     parser.add_argument("--seed", type=int, default=None)
+
+    parser.add_argument(
+        "--policy-backend",
+        type=str,
+        default=None,
+        help="tiny (default) or smolvla",
+    )
+    parser.add_argument(
+        "--lerobot-dataset-root",
+        type=str,
+        default=None,
+        help="LeRobot dataset directory (meta/stats.json) used for SmolVLA normalization.",
+    )
 
     # Defer adding Isaac AppLauncher args to after we know we want to launch.
     from isaaclab.app import AppLauncher  # type: ignore
@@ -258,9 +276,26 @@ def main() -> int:
     eval_cfg = cfg.get("eval", {})
     ttc_cfg_dict = cfg.get("ttc", {})
     ckpt_path = Path(args.ckpt or cfg.get("ckpt", "vla_lab/checkpoints/tiny_v0/last.pt"))
-    if not ckpt_path.exists():
-        print(f"[eval] ERROR: checkpoint not found: {ckpt_path}")
+
+    policy_backend = str(args.policy_backend or cfg.get("policy_backend", "tiny")).lower().strip()
+    if policy_backend not in ("tiny", "smolvla"):
+        print(f"[eval] ERROR: unknown policy_backend {policy_backend!r} (use tiny or smolvla)")
         return 2
+
+    lerobot_root_cfg = args.lerobot_dataset_root or cfg.get("lerobot_dataset_root")
+    lerobot_dataset_root: Optional[Path] = Path(lerobot_root_cfg).resolve() if lerobot_root_cfg else None
+
+    if policy_backend == "tiny":
+        if not ckpt_path.exists():
+            print(f"[eval] ERROR: checkpoint not found: {ckpt_path}")
+            return 2
+    else:
+        if lerobot_dataset_root is None or not lerobot_dataset_root.is_dir():
+            print(
+                "[eval] ERROR: smolvla backend requires --lerobot-dataset-root or "
+                "`lerobot_dataset_root` in YAML (exported LeRobot dataset with meta/stats.json)."
+            )
+            return 2
 
     if args.num_episodes is not None:
         eval_cfg["num_episodes"] = int(args.num_episodes)
@@ -310,32 +345,55 @@ def main() -> int:
     from environments.utils.physix import PhysicsConfig, apply_to_simulation_cfg, object_loader_kwargs_from_physix
 
     # vla_lab imports (deferred so the path manipulation in _path takes effect first).
-    from vla_lab.dataset import ActionStats, TinyTokenizer
-    from vla_lab.models import TinyVLA, TinyVLAConfig
-    from vla_lab.ttc import TTCConfig, TTCPipeline
+    from vla_lab.dataset import TinyTokenizer
+    from vla_lab.smolvla_bridge.action_obs_contract import pack_state_xyz_quat
 
     # ------------------------------------------------------------------
-    # Load checkpoint
+    # Load policy (TinyVLA ckpt or SmolVLA Hub / directory)
     # ------------------------------------------------------------------
     device = torch.device(str(eval_cfg.get("device", "cuda:0" if torch.cuda.is_available() else "cpu")))
-    ckpt = torch.load(str(ckpt_path), map_location=device)
-    model_cfg_obj = TinyVLAConfig.from_dict(ckpt["model_config"])
-    model = TinyVLA(model_cfg_obj).to(device)
-    model.load_state_dict(ckpt["model_state"], strict=True)
-    model.eval()
-    tokenizer = TinyTokenizer.from_dict(ckpt["tokenizer"])
-    action_stats: Optional[ActionStats] = None
-    if ckpt.get("action_stats") is not None:
-        action_stats = ActionStats.from_dict(ckpt["action_stats"])
 
-    pipeline = TTCPipeline(
-        model,
-        TTCConfig.from_dict(ttc_cfg_dict),
-    )
-    print(
-        f"[eval] loaded checkpoint {ckpt_path}  params={model.num_parameters():,}  "
-        f"vocab={tokenizer.vocab_size}  K={ttc_cfg_dict.get('k_action_samples', 1)}"
-    )
+    tiny_model_cfg_obj = None
+    action_stats = None
+    tokenizer = None
+    pipeline = None
+    smol_policy = None
+
+    if policy_backend == "tiny":
+        from vla_lab.dataset import ActionStats
+        from vla_lab.models import TinyVLA, TinyVLAConfig
+        from vla_lab.ttc import TTCConfig, TTCPipeline
+
+        ckpt = torch.load(str(ckpt_path), map_location=device)
+        tiny_model_cfg_obj = TinyVLAConfig.from_dict(ckpt["model_config"])
+        model = TinyVLA(tiny_model_cfg_obj).to(device)
+        model.load_state_dict(ckpt["model_state"], strict=True)
+        model.eval()
+        tokenizer = TinyTokenizer.from_dict(ckpt["tokenizer"])
+        if ckpt.get("action_stats") is not None:
+            action_stats = ActionStats.from_dict(ckpt["action_stats"])
+
+        pipeline = TTCPipeline(
+            model,
+            TTCConfig.from_dict(ttc_cfg_dict),
+        )
+        print(
+            f"[eval] loaded TinyVLA {ckpt_path}  params={model.num_parameters():,}  "
+            f"vocab={tokenizer.vocab_size}  K={ttc_cfg_dict.get('k_action_samples', 1)}"
+        )
+    else:
+        if int(ttc_cfg_dict.get("k_action_samples", 1)) != 1:
+            print("[eval] WARNING: TTC is only wired for TinyVLA; running SmolVLA with effective K=1.")
+        from vla_lab.smolvla_bridge.policy_wrapper import SmolVLAIsaacPolicy
+
+        smol_policy = SmolVLAIsaacPolicy(
+            policy_path=str(ckpt_path),
+            dataset_root=lerobot_dataset_root,
+            device=device,
+        )
+        print(f"[eval] loaded SmolVLA policy={ckpt_path!r}  dataset={lerobot_dataset_root}")
+
+    infer_image_size = int(tiny_model_cfg_obj.image_size) if policy_backend == "tiny" else 224
 
     # ------------------------------------------------------------------
     # Build sim + scene
@@ -519,10 +577,12 @@ def main() -> int:
             )
         print(f"[eval][EP {ep}] target={leaf!r}  instruction={instruction!r}")
 
-        # Encode language once per episode.
-        ids, attn = tokenizer.encode(instruction)
-        ids = ids.to(device)
-        attn = attn.to(device)
+        ids = attn = None
+        if policy_backend == "tiny":
+            assert tokenizer is not None
+            ids, attn = tokenizer.encode(instruction)
+            ids = ids.to(device)
+            attn = attn.to(device)
 
         # Settle a few sim steps before evaluation.
         for _ in range(60):
@@ -570,26 +630,36 @@ def main() -> int:
                         rgb_t = rgb_t.permute(2, 0, 1).contiguous()
                     rgb_t = torch.nn.functional.interpolate(
                         rgb_t.unsqueeze(0).to(device),
-                        size=(model_cfg_obj.image_size, model_cfg_obj.image_size),
+                        size=(infer_image_size, infer_image_size),
                         mode="bilinear",
                         align_corners=False,
                     )[0]
                 else:
-                    rgb_t = torch.zeros(3, model_cfg_obj.image_size, model_cfg_obj.image_size, device=device)
+                    rgb_t = torch.zeros(3, infer_image_size, infer_image_size, device=device)
 
-                pos_b, _ = _ee_pose_b()
+                pos_b, quat_b = _ee_pose_b()
                 gx = 1.0 if _gripper_state().startswith("o") else 0.0
-                state_t = torch.tensor(
-                    list(pos_b) + [gx] + [0.0] * max(0, model_cfg_obj.state_dim - 4),
-                    dtype=torch.float32,
-                    device=device,
-                )[: model_cfg_obj.state_dim]
 
                 with torch.no_grad():
-                    chunk = pipeline.predict_action_chunk(rgb_t, state_t, ids, attn)
-                chunk_phys = chunk
-                if action_stats is not None:
-                    chunk_phys = action_stats.denormalize(chunk.detach().cpu()).to(device)
+                    if policy_backend == "tiny":
+                        assert pipeline is not None and tiny_model_cfg_obj is not None and ids is not None
+                        state_t = torch.tensor(
+                            list(pos_b) + [gx] + [0.0] * max(0, tiny_model_cfg_obj.state_dim - 4),
+                            dtype=torch.float32,
+                            device=device,
+                        )[: tiny_model_cfg_obj.state_dim]
+                        chunk = pipeline.predict_action_chunk(rgb_t, state_t, ids, attn)
+                        chunk_phys = chunk
+                        if action_stats is not None:
+                            chunk_phys = action_stats.denormalize(chunk.detach().cpu()).to(device)
+                    else:
+                        assert smol_policy is not None
+                        st6 = torch.from_numpy(pack_state_xyz_quat(pos_b, quat_b)).to(device)
+                        chunk_phys = smol_policy.predict_chunk_phys(
+                            rgb_chw_float=rgb_t,
+                            state6=st6,
+                            instruction=instruction,
+                        )
                 policy.set_chunk(chunk_phys)
 
             # Mode hint (gripper vs translate) drives controller mode.
@@ -654,6 +724,8 @@ def main() -> int:
         "num_success": int(sum(1 for r in ep_results if r["success"])),
         "success_rate": float(sum(1 for r in ep_results if r["success"]) / max(1, len(ep_results))),
         "ckpt": str(ckpt_path),
+        "policy_backend": policy_backend,
+        "lerobot_dataset_root": str(lerobot_dataset_root) if lerobot_dataset_root else None,
         "config": cfg,
         "results": ep_results,
     }
@@ -662,7 +734,8 @@ def main() -> int:
     print(f"[eval] success rate = {summary['success_rate']:.3f}  ({summary['num_success']}/{summary['num_episodes']})")
     print(f"[eval] wrote {out_file}")
 
-    pipeline.close()
+    if pipeline is not None:
+        pipeline.close()
     simulation_app.close()
     return 0
 
