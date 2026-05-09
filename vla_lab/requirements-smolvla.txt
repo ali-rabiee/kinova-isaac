@@ -1,6 +1,45 @@
-# Pin versions loosely so `pip` can resolve Torch for your CUDA stack.
-# Install in an environment used for dataset export + SmolVLA fine-tuning (can differ from Isaac Lab).
-lerobot[smolvla]>=0.4.0
+# ------------------------------------------------------------------------------
+# SmolVLA / LeRobot stack for `vla_lab` (dataset export + lerobot-train).
+#
+# **Two install paths**
+#
+# 1) **Recommended:** dedicated conda env (no Isaac numpy pin). From repo root:
+#        pip install -r vla_lab/requirements-smolvla.txt
+#    This allows NumPy 2.x (required by PyPI metadata for `rerun-sdk ≥0.24`).
+#
+# 2) **Shared Isaac Lab env** (`riften`, `isaaclab` needs NumPy \< 2): do **not**
+#    use this file alone — pip will either take minutes, hit `resolution-too-deep`,
+#    or fight `rerun-sdk`’s declared `numpy>=2`. Use instead:
+#        ./vla_lab/scripts/pip_install_smolvla_isaac.sh
+#
+# Linux — if pip fails while **building evdev** (pynput dependency), errors like
+#   BUS_SDW undeclared / BTN_GRIPL undeclared
+# usually mean the conda C compiler + kernel headers disagree. Fix ONE of:
+#
+#   A) Pre-install evdev from conda-forge, then re-run pip:
+#        conda install -y -c conda-forge evdev
+#        pip install -r vla_lab/requirements-smolvla.txt   # or the isaac script
+#
+#   B) Force the **system** GCC for this install (often fixes conda "cross" cc):
+#        export CC="${CC:-/usr/bin/gcc}"
+#        export CXX="${CXX:-/usr/bin/g++}"
+#        pip install ...
+#
+#   C) Debian/Ubuntu headers + compiler:
+#        sudo apt update && sudo apt install -y build-essential linux-libc-dev
+#        pip install ...
+# ------------------------------------------------------------------------------
+
+# Exact LeRobot pin avoids huge resolver backtracking across 0.4.x.
+lerobot[smolvla]==0.4.4
 num2words
 pillow
-numpy
+matplotlib>=3.8
+
+# Narrow version Fan-out (speed + reproducibility). Omit if you need flexibility.
+imageio[ffmpeg]==2.37.0
+opencv-python-headless==4.11.0.86
+gymnasium==1.2.1
+datasets==4.1.1
+diffusers==0.35.2
+huggingface-hub[cli,hf-transfer]==0.35.3

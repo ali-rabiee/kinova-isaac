@@ -1,20 +1,41 @@
-# Example knobs for `./vla_lab/scripts/train_smolvla.sh` (see comments in that script).
+# SmolVLA fine-tune via:  python -m vla_lab.train_smolvla --config vla_lab/configs/train_smolvla.example.yaml
+# Or shell:               OUT_DIR=... ./vla_lab/scripts/train_smolvla.sh
 #
-# Required once:
-#   SESSION_ROOTS="logs/data_collection/session_XXX" OUT_DIR=vla_lab/datasets/lerobot_kinova_v0 \
-#     ./vla_lab/scripts/export_lerobot_dataset.sh
+# Prerequisite (once): export Kinova sessions to LeRobot format, e.g.
+#   python -m vla_lab.smolvla_bridge.convert_kinova_to_lerobot \
+#     --session-roots logs/data_collection/session_YYYYMMDD_HHMMSS \
+#     --out-dir vla_lab/datasets/lerobot_kinova_v0 --overwrite
 #
-# Then train:
-#   DATASET_DIR=vla_lab/datasets/lerobot_kinova_v0 \
-#   POLICY_PATH=lerobot/smolvla_base \
-#   STEPS=20000 BATCH_SIZE=32 \
-#     ./vla_lab/scripts/train_smolvla.sh
+# Resume: set training.resume: true (YAML) or pass  --resume=true  after a
+#         checkpoint exists under training.output_dir. LeRobot reloads config
+#         from the checkpoint when resuming.
+#
+# Extra CLI (forwarded): e.g.  --wandb.enable=true  (see lerobot-train --help)
 
 policy_path: lerobot/smolvla_base
+# LeRobot 0.4+ defaults push_to_hub on policies; without HF repo_id, training fails validation.
+push_to_hub: false
+# If true, also set HF model repo, e.g.  push_to_hub: true  and pass on CLI:
+#   python -m vla_lab.train_smolvla ... --policy.repo_id=YOUR_ORG/smolvla_kinova_ft
+
 dataset:
   repo_id: kinova_isaac_vla
   root: vla_lab/datasets/lerobot_kinova_v0
+
 training:
-  steps: 20000
+  # Fixed directory = reproducible checkpoints + safe resume (do not change between resume runs).
+  output_dir: vla_lab/checkpoints/smolvla_kinova_ft
+  job_name: smolvla_kinova_ft
+  # ~4 "epochs" for Kinova export ≈78k frames at batch_size 32: 4 * ceil(78592/32) = 9824.
+  # Increase for real runs (e.g. 20000+). Override: STEPS=20000 ./vla_lab/scripts/train_smolvla.sh
+  steps: 9824
   batch_size: 32
   device: cuda
+  # Checkpointing & telemetry (passed to lerobot-train)
+  save_checkpoint: true
+  save_freq: 2000
+  log_freq: 50
+  eval_freq: 0
+  seed: 1000
+  # First run: false. After interrupt: true (same output_dir).
+  resume: false

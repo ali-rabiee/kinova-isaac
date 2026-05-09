@@ -11,12 +11,27 @@ DATASET_DIR="${DATASET_DIR:-${REPO_ROOT}/vla_lab/datasets/lerobot_kinova_v0}"
 RUN_NAME="${RUN_NAME:-smolvla_ft_$(date +%Y%m%d_%H%M%S)}"
 OUT_DIR="${OUT_DIR:-${REPO_ROOT}/vla_lab/checkpoints/${RUN_NAME}}"
 POLICY_PATH="${POLICY_PATH:-lerobot/smolvla_base}"
+# LeRobot defaults push_to_hub=true; without policy.repo_id training validation fails.
+PUSH_TO_HUB="${PUSH_TO_HUB:-false}"
 DATASET_REPO_ID="${DATASET_REPO_ID:-kinova_isaac_vla}"
-STEPS="${STEPS:-20000}"
+STEPS="${STEPS:-9824}"
+# ~4 passes over ~78k-frame export at batch 32; override for other data or full training (e.g. STEPS=20000).
 BATCH_SIZE="${BATCH_SIZE:-32}"
 DEVICE="${DEVICE:-cuda}"
 
-mkdir -p "${OUT_DIR}"
+# Do not mkdir OUT_DIR here: lerobot-train requires --output_dir to be absent when resume=false
+# (it errors if the directory already exists). Stash run metadata beside checkpoints instead.
+MANIFEST_STASH="${MANIFEST_STASH:-${REPO_ROOT}/vla_lab/checkpoints/_train_manifests}"
+mkdir -p "${MANIFEST_STASH}"
+
+if [ -e "${OUT_DIR}" ] && [ "${RESUME:-false}" != "true" ]; then
+  echo "[train_smolvla] ERROR: output dir already exists and RESUME is not true:" >&2
+  echo "  ${OUT_DIR}" >&2
+  echo "Pick a new run:  OUT_DIR=... ./vla_lab/scripts/train_smolvla.sh" >&2
+  echo "Or resume:       RESUME=true OUT_DIR=... ./vla_lab/scripts/train_smolvla.sh" >&2
+  echo "Or remove:       rm -rf \"${OUT_DIR}\"" >&2
+  exit 1
+fi
 
 GIT_REV=""
 if command -v git >/dev/null 2>&1; then
@@ -27,7 +42,7 @@ if command -v python3 >/dev/null 2>&1; then
   LR_VER="$(python3 -c 'import importlib.util;print(importlib.util.find_spec("lerobot") is not None)' 2>/dev/null || true)"
 fi
 
-MANIFEST="${OUT_DIR}/run_manifest.json"
+MANIFEST="${MANIFEST_STASH}/${RUN_NAME}.json"
 {
   echo "{"
   echo "  \"created\": \"$(date -Iseconds)\","
@@ -46,13 +61,52 @@ if ! command -v lerobot-train >/dev/null 2>&1; then
   exit 1
 fi
 
-exec lerobot-train \
-  --policy.path="${POLICY_PATH}" \
-  --dataset.repo_id="${DATASET_REPO_ID}" \
-  --dataset.root="${DATASET_DIR}" \
-  --policy.device="${DEVICE}" \
-  --batch_size="${BATCH_SIZE}" \
-  --steps="${STEPS}" \
-  --output_dir="${OUT_DIR}" \
-  --job_name="${RUN_NAME}" \
+export VLA_LAB_RUN_NAME="${RUN_NAME}"
+
+SAVE_FREQ="${SAVE_FREQ:-2000}"
+LOG_FREQ="${LOG_FREQ:-50}"
+EVAL_FREQ="${EVAL_FREQ:-0}"
+SAVE_CHECKPOINT="${SAVE_CHECKPOINT:-true}"
+RESUME_ARGS=()
+if [ "${RESUME:-false}" = "true" ]; then
+  RESUME_ARGS=(--resume=true)
+fi
+
+TRAIN_CMD=(python -m vla_lab.lerobot_train_capture --
+  --policy.path="${POLICY_PATH}"
+  --policy.push_to_hub="${PUSH_TO_HUB}"
+  --dataset.repo_id="${DATASET_REPO_ID}"
+  --dataset.root="${DATASET_DIR}"
+  --policy.device="${DEVICE}"
+  --batch_size="${BATCH_SIZE}"
+  --steps="${STEPS}"
+  --output_dir="${OUT_DIR}"
+  --job_name="${RUN_NAME}"
+  --save_checkpoint="${SAVE_CHECKPOINT}"
+  --save_freq="${SAVE_FREQ}"
+  --log_freq="${LOG_FREQ}"
+  --eval_freq="${EVAL_FREQ}"
+  "${RESUME_ARGS[@]}"
   "$@"
+)
+
+if [ "${VLA_LAB_CAPTURE_RESULTS:-1}" = "0" ]; then
+  exec lerobot-train \
+    --policy.path="${POLICY_PATH}" \
+    --policy.push_to_hub="${PUSH_TO_HUB}" \
+    --dataset.repo_id="${DATASET_REPO_ID}" \
+    --dataset.root="${DATASET_DIR}" \
+    --policy.device="${DEVICE}" \
+    --batch_size="${BATCH_SIZE}" \
+    --steps="${STEPS}" \
+    --output_dir="${OUT_DIR}" \
+    --job_name="${RUN_NAME}" \
+    --save_checkpoint="${SAVE_CHECKPOINT}" \
+    --save_freq="${SAVE_FREQ}" \
+    --log_freq="${LOG_FREQ}" \
+    --eval_freq="${EVAL_FREQ}" \
+    "${RESUME_ARGS[@]}" \
+    "$@"
+fi
+
+exec "${TRAIN_CMD[@]}"

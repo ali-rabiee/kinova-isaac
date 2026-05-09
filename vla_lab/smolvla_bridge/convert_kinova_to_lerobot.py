@@ -102,7 +102,8 @@ def convert(
         if not overwrite:
             raise FileExistsError(f"Output directory exists (use --overwrite): {out_dir}")
         shutil.rmtree(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # LeRobotDataset.create() requires `root` to not exist yet (it mkdirs with exist_ok=False).
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
 
     features = smolvla_base_dataset_features(use_video=False)
     h, w, _ = IMAGE_HWC_SHAPE

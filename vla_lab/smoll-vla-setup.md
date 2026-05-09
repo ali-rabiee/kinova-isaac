@@ -186,6 +186,77 @@ These are **already largely present**; treat as a maintenance checklist:
 
 ---
 
+## 8.5 Linux: `evdev` / `pynput` build failure (`BUS_SDW` / `BTN_GRIPL` undeclared)
+
+LeRobot depends on `pynput`, which builds **`evdev`** from C sources. In **conda** envs, pip sometimes uses `x86_64-conda-linux-gnu-cc` and a sysroot whose Linux input headers do not match what `evdev`’s code generator expects, so the wheel build aborts.
+
+**Fix (pick one, then retry your LeRobot install — `pip install -r vla_lab/requirements-smolvla.txt` or `./vla_lab/scripts/pip_install_smolvla_isaac.sh`):**
+
+1. **conda-forge binary (often easiest)**  
+   `conda install -y -c conda-forge evdev`
+
+2. **Force system GCC** (so headers match `/usr/include/linux/`)  
+   `CC=/usr/bin/gcc CXX=/usr/bin/g++ pip install -r vla_lab/requirements-smolvla.txt`
+
+3. **Debian/Ubuntu** — install kernel UAPI headers, then reinstall  
+   `sudo apt update && sudo apt install -y build-essential linux-libc-dev`
+
+Also avoid mixing **Isaac Sim’s** `pip_prebundle` `PYTHONPATH` into this install; use a clean env for LeRobot when possible (see Risk register).
+
+### Pip “dependency conflicts” after a successful install
+
+If you install LeRobot into the **same** conda env as Isaac Lab (`riften`), pip may print scary `ERROR: pip's dependency resolver...` messages (e.g. `numpy 2.x` vs `isaaclab requires numpy<2`). Check the **last line**: if it says `Successfully installed ...` and `numpy` is **1.26.x**, you are often fine for Isaac. **Do not** use `requirements-smolvla.txt` alone in `riften` if you need NumPy 1.x — it may pull NumPy 2 for `rerun-sdk`. Use **`./vla_lab/scripts/pip_install_smolvla_isaac.sh`** instead, or a **dedicated** `smolvla` env with `pip install -r vla_lab/requirements-smolvla.txt`.
+
+**Best practice:** `conda create -n smolvla python=3.11`, install PyTorch + `pip install -r vla_lab/requirements-smolvla.txt` there; keep Isaac work in `riften`.
+
+### Pip `resolution-too-deep` / multi-minute backtracking
+
+This usually happens with **`pip install -r vla_lab/requirements-smolvla.txt` inside the same env as Isaac Lab**: the resolver walks many versions of `rerun-sdk`, `opencv-python-headless`, `imageio`, … and may abort.
+
+Underlying issue: **`rerun-sdk` wheels on PyPI (≥0.24) declare `numpy>=2`**, while **Isaac / `isaaclab` expect NumPy 1.x**. A single `pip` solve cannot honestly satisfy both; mixing them forces huge backtracking or failure.
+
+**Fix (pick one):**
+
+1. **Dedicated SmolVLA env (simplest for training):**  
+   `conda create -n smolvla python=3.11 && conda activate smolvla`  
+   Install PyTorch for your CUDA stack, then:  
+   `pip install -r vla_lab/requirements-smolvla.txt`  
+   (This path may upgrade NumPy to 2.x for `rerun-sdk` — that is OK there.)
+
+2. **Stay in `riften` / Isaac env:** do **not** rely on a plain `pip -r` for LeRobot. Run:  
+   `./vla_lab/scripts/pip_install_smolvla_isaac.sh`  
+   It installs Lerobot’s dependencies explicitly, then `rerun-sdk` and `lerobot` with `--no-deps` so PyPI’s `numpy>=2` metadata on `rerun-sdk` does not force a NumPy upgrade. (You may still see `pip check` warnings; training usually works.)
+
+3. `pip install -U "pip>=24"` can help with unrelated resolver bugs, but it does not remove the NumPy 1.x vs `rerun-sdk` metadata tension — use (1) or (2).
+
+---
+
+## 8.6 Training metrics, CSV, and figures (`vla_lab/results/`)
+
+`./vla_lab/scripts/train_smolvla.sh` and `python -m vla_lab.train_smolvla` **wrap** `lerobot-train` with `python -m vla_lab.lerobot_train_capture` by default. That streams stdout, parses LeRobot’s periodic `MetricsTracker` lines, and after training writes:
+
+| Artifact | Purpose |
+|---------|---------|
+| `vla_lab/results/<UTC-date>/<run_name>/train_metrics.csv` | One row per log step: `step`, `smpl`, `ep`, `epch`, `loss`, `grdn`, `lr`, `updt_s`, `data_s` |
+| `train_metrics.jsonl` | Same data as JSON lines |
+| `train_console.log` | Full captured training log |
+| `eval_events.jsonl` / `eval_console_snippets.txt` | Lines related to mid-train **sim** eval (only if you configure `eval_freq` + env in LeRobot) |
+| `eval_success.csv` | Parsed success % (best-effort) when eval logs expose it |
+| `run_meta.json` | Command, git revision, paths, **metric glossary**, and notes on BC vs “accuracy” |
+| `figures/*.pdf` and `*.png` | Loss, LR, gradient norm, **dataset epoch coverage** (`epch`), timing plots; optional eval success curve |
+
+**BC / SmolVLA note:** there is no categorical **training accuracy** (no discrete correct/wrong labels). Use **loss**, **gradient norm**, **epoch coverage** (`epch`), and **sim eval success** (enable LeRobot’s eval + env) for paper-style curves.
+
+**Disable capture** (plain `lerobot-train` only):
+
+```bash
+VLA_LAB_CAPTURE_RESULTS=0 ./vla_lab/scripts/train_smolvla.sh
+```
+
+**matplotlib** is required for figures; install if needed: `pip install matplotlib`.
+
+---
+
 ## 9. Risk register (short)
 
 | Risk | Mitigation |

@@ -212,6 +212,7 @@ __marimo__/
 # vla_lab — checkpoints, exported datasets, eval JSON (large / regenerable)
 vla_lab/checkpoints/
 vla_lab/datasets/
+vla_lab/results/
 vla_lab/eval_results/
 # Draft paper (local; do not publish to GitHub)
 vla_lab/paper/
