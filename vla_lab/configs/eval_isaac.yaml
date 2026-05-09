@@ -3,6 +3,12 @@
 
 ckpt: vla_lab/checkpoints/tiny_v0/last.pt
 
+# Partial observability axis (paper framing: single overhead RGB, optional occlusion).
+observability_mode: external_only
+occlusion:
+  mode: none               # none | bottom_strip | top_strip | center_box | random_patch
+  fraction: 0.35
+
 # Policy runner: "tiny" = `vla_lab.train` checkpoint; "smolvla" = LeRobot Hub id or local dir.
 policy_backend: tiny
 # Path to the LeRobot dataset root produced by `convert_kinova_to_lerobot` (must contain meta/stats.json).
@@ -33,7 +39,12 @@ eval:
   language_seed: 1337
 
 ttc:
-  k_action_samples: 1   # 1 = no TTC; bump to 4 for K-sample + consensus
+  k_action_samples: 1
   noise_std: 0.1
-  scoring: consensus    # {"consensus", "first"}
-  log_jsonl: null       # set to a path to log per-step decisions
+  selection: naive_consensus
+  scoring: naive_consensus    # legacy alias for `selection`
+  gating: none                # none | twin_uncertainty
+  gating_noise_std: 0.05
+  gating_threshold: 0.02
+  log_jsonl: null
+  latency_log: null

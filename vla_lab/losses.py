@@ -66,7 +66,7 @@ class FeatureAlignmentConfig:
     teacher_dim: int = 768
     image_size: int = 224
     pool_to_tokens: int = 64
-    enabled: bool = False
+    enabled: bool = False  # off by default (CoRL sprint: keep the mainline on action-only loss)
 
 
 class FeatureAlignmentLoss(nn.Module):

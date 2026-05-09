@@ -572,3 +572,46 @@ def split_episodes(
     val = [episodes[i] for i in idx[:n_val]]
     train = [episodes[i] for i in idx[n_val:]]
     return train, val
+
+
+# ---------------------------------------------------------------------------
+# SmolVLA / SigLIP-style image normalization (dataset-side helper)
+# ---------------------------------------------------------------------------
+
+# NOTE: LeRobot's SmolVLA preprocessor applies its own normalization at inference.
+# Use these helpers when you intentionally bypass the preprocessor (debug / ablations)
+# or build a pure-torch dataset that must match SigLIP expectations.
+SMOLVLA_IMAGE_MEAN = (0.5, 0.5, 0.5)
+SMOLVLA_IMAGE_STD = (0.5, 0.5, 0.5)
+
+
+def normalize_image_smolvla(rgb_chw_01: torch.Tensor) -> torch.Tensor:
+    """Normalize float RGB in ``[0,1]``, shape ``(3,H,W)`` for SigLIP-style backbones."""
+
+    mean = rgb_chw_01.new_tensor(SMOLVLA_IMAGE_MEAN).view(3, 1, 1)
+    std = rgb_chw_01.new_tensor(SMOLVLA_IMAGE_STD).view(3, 1, 1)
+    return (rgb_chw_01 - mean) / (std + 1e-6)
+
+
+def write_lerobot_split_manifest(
+    *,
+    session_roots: Sequence[Path],
+    out_json: Path,
+    val_fraction: float = 0.1,
+    split_seed: int = 0,
+) -> Dict[str, Any]:
+    """Write deterministic train/val episode folder lists for LeRobot export / auditing."""
+
+    episodes = discover_episodes(session_roots)
+    train_eps, val_eps = split_episodes(episodes, val_fraction=float(val_fraction), seed=int(split_seed))
+    payload: Dict[str, Any] = {
+        "train_episode_dirs": [str(e.folder.resolve()) for e in train_eps],
+        "val_episode_dirs": [str(e.folder.resolve()) for e in val_eps],
+        "val_fraction": float(val_fraction),
+        "split_seed": int(split_seed),
+        "num_train_episodes": int(len(train_eps)),
+        "num_val_episodes": int(len(val_eps)),
+    }
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    out_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload

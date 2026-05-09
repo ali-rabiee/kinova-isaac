@@ -72,6 +72,24 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="LeRobot dataset directory (meta/stats.json) used for SmolVLA normalization.",
     )
+    parser.add_argument(
+        "--occlusion-mode",
+        type=str,
+        default=None,
+        help="Partial-observation ablation: none|bottom_strip|top_strip|center_box|random_patch",
+    )
+    parser.add_argument(
+        "--occlusion-fraction",
+        type=float,
+        default=None,
+        help="Fraction of image rows/area occluded (see vla_lab.partial_obs).",
+    )
+    parser.add_argument(
+        "--observability-mode",
+        type=str,
+        default=None,
+        help="Label for logging only, e.g. external_only | occluded (see eval YAML).",
+    )
 
     # Defer adding Isaac AppLauncher args to after we know we want to launch.
     from isaaclab.app import AppLauncher  # type: ignore
@@ -275,6 +293,10 @@ def main() -> int:
     cfg = _load_yaml(Path(args.config))
     eval_cfg = cfg.get("eval", {})
     ttc_cfg_dict = cfg.get("ttc", {})
+    occlusion_cfg = cfg.get("occlusion", {}) or {}
+    observability_mode = str(
+        args.observability_mode if args.observability_mode is not None else cfg.get("observability_mode", "external_only")
+    )
     ckpt_path = Path(args.ckpt or cfg.get("ckpt", "vla_lab/checkpoints/tiny_v0/last.pt"))
 
     policy_backend = str(args.policy_backend or cfg.get("policy_backend", "tiny")).lower().strip()
@@ -309,6 +331,9 @@ def main() -> int:
         eval_cfg["spawn_mode"] = args.spawn_mode
     if args.seed is not None:
         eval_cfg["language_seed"] = int(args.seed)
+
+    occ_mode = str(args.occlusion_mode) if args.occlusion_mode is not None else str(occlusion_cfg.get("mode", "none"))
+    occ_frac = float(args.occlusion_fraction) if args.occlusion_fraction is not None else float(occlusion_cfg.get("fraction", 0.35))
 
     out_dir = Path(eval_cfg.get("out_dir", "vla_lab/eval_results/tiny_v0"))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -346,6 +371,7 @@ def main() -> int:
 
     # vla_lab imports (deferred so the path manipulation in _path takes effect first).
     from vla_lab.dataset import TinyTokenizer
+    from vla_lab.partial_obs import apply_occlusion_rgb_chw
     from vla_lab.smolvla_bridge.action_obs_contract import pack_state_xyz_quat
 
     # ------------------------------------------------------------------
@@ -377,13 +403,14 @@ def main() -> int:
             model,
             TTCConfig.from_dict(ttc_cfg_dict),
         )
+        k_ttc = int(ttc_cfg_dict.get("k_action_samples", 1))
         print(
             f"[eval] loaded TinyVLA {ckpt_path}  params={model.num_parameters():,}  "
-            f"vocab={tokenizer.vocab_size}  K={ttc_cfg_dict.get('k_action_samples', 1)}"
+            f"vocab={tokenizer.vocab_size}  K_max={k_ttc}  "
+            f"selection={ttc_cfg_dict.get('selection', ttc_cfg_dict.get('scoring', 'naive_consensus'))}  "
+            f"gating={ttc_cfg_dict.get('gating', 'none')}"
         )
     else:
-        if int(ttc_cfg_dict.get("k_action_samples", 1)) != 1:
-            print("[eval] WARNING: TTC is only wired for TinyVLA; running SmolVLA with effective K=1.")
         from vla_lab.smolvla_bridge.policy_wrapper import SmolVLAIsaacPolicy
 
         smol_policy = SmolVLAIsaacPolicy(
@@ -391,7 +418,12 @@ def main() -> int:
             dataset_root=lerobot_dataset_root,
             device=device,
         )
-        print(f"[eval] loaded SmolVLA policy={ckpt_path!r}  dataset={lerobot_dataset_root}")
+        k_ttc = int(ttc_cfg_dict.get("k_action_samples", 1))
+        print(
+            f"[eval] loaded SmolVLA policy={ckpt_path!r}  dataset={lerobot_dataset_root}  "
+            f"K_max={k_ttc}  selection={ttc_cfg_dict.get('selection', ttc_cfg_dict.get('scoring', 'naive_consensus'))}  "
+            f"gating={ttc_cfg_dict.get('gating', 'none')}"
+        )
 
     infer_image_size = int(tiny_model_cfg_obj.image_size) if policy_backend == "tiny" else 224
 
@@ -551,6 +583,15 @@ def main() -> int:
         f"phys_steps_per_policy_tick={n_phys_per_policy}"
     )
 
+    use_smol_ttc = policy_backend == "smolvla" and (
+        int(ttc_cfg_dict.get("k_action_samples", 1)) > 1
+        or str(ttc_cfg_dict.get("gating", "none")).lower() not in ("none", "", "off", "false", "0")
+    )
+    print(
+        f"[eval] observability_mode={observability_mode!r}  occlusion={occ_mode!r} (frac={occ_frac:.3f})  "
+        f"smol_ttc={use_smol_ttc}"
+    )
+
     ep_results: List[Dict[str, Any]] = []
     for ep in range(num_episodes):
         if not simulation_app.is_running():
@@ -604,6 +645,7 @@ def main() -> int:
 
         steps = 0
         ep_t0 = time.time()
+        smol_latencies: List[Dict[str, Any]] = []
         while simulation_app.is_running() and steps < max_steps_ep:
             steps += 1
 
@@ -637,6 +679,8 @@ def main() -> int:
                 else:
                     rgb_t = torch.zeros(3, infer_image_size, infer_image_size, device=device)
 
+                rgb_used = apply_occlusion_rgb_chw(rgb_t, occ_mode, fraction=occ_frac)
+
                 pos_b, quat_b = _ee_pose_b()
                 gx = 1.0 if _gripper_state().startswith("o") else 0.0
 
@@ -648,18 +692,29 @@ def main() -> int:
                             dtype=torch.float32,
                             device=device,
                         )[: tiny_model_cfg_obj.state_dim]
-                        chunk = pipeline.predict_action_chunk(rgb_t, state_t, ids, attn)
+                        chunk = pipeline.predict_action_chunk(rgb_used, state_t, ids, attn)
                         chunk_phys = chunk
                         if action_stats is not None:
                             chunk_phys = action_stats.denormalize(chunk.detach().cpu()).to(device)
                     else:
                         assert smol_policy is not None
                         st6 = torch.from_numpy(pack_state_xyz_quat(pos_b, quat_b)).to(device)
-                        chunk_phys = smol_policy.predict_chunk_phys(
-                            rgb_chw_float=rgb_t,
-                            state6=st6,
-                            instruction=instruction,
-                        )
+                        if use_smol_ttc:
+                            one_call_lat: List[Dict[str, Any]] = []
+                            chunk_phys = smol_policy.predict_chunk_phys_ttc(
+                                rgb_chw_float=rgb_used,
+                                state6=st6,
+                                instruction=instruction,
+                                ttc_cfg_dict=ttc_cfg_dict,
+                                latency_log=one_call_lat,
+                            )
+                            smol_latencies.extend(one_call_lat)
+                        else:
+                            chunk_phys = smol_policy.predict_chunk_phys(
+                                rgb_chw_float=rgb_used,
+                                state6=st6,
+                                instruction=instruction,
+                            )
                 policy.set_chunk(chunk_phys)
 
             # Mode hint (gripper vs translate) drives controller mode.
@@ -692,6 +747,7 @@ def main() -> int:
             success = (z_after - z0_target) >= lift_thresh
 
         elapsed = time.time() - ep_t0
+        lat_totals = [float(r["total_ms"]) for r in smol_latencies if r.get("total_ms") is not None]
         result = {
             "episode_idx": int(ep),
             "target_prim": target_prim,
@@ -702,6 +758,14 @@ def main() -> int:
             "success": bool(success),
             "steps": int(steps),
             "elapsed_s": float(elapsed),
+            "observability_mode": observability_mode,
+            "occlusion_mode": occ_mode,
+            "occlusion_fraction": float(occ_frac),
+            "policy_infer_calls": int(len(smol_latencies)),
+            "policy_latency_median_ms": float(np.median(lat_totals)) if lat_totals else None,
+            "policy_latency_p95_ms": float(np.quantile(np.asarray(lat_totals, dtype=np.float64), 0.95))
+            if len(lat_totals) > 0
+            else None,
         }
         ep_results.append(result)
         print(
@@ -720,14 +784,21 @@ def main() -> int:
     # Save results
     # ------------------------------------------------------------------
     summary = {
+        "schema": "vla_lab_eval/v2",
+        "task": "reach_to_grasp_lift",
+        "eval_timestamp_unix": float(time.time()),
         "num_episodes": len(ep_results),
         "num_success": int(sum(1 for r in ep_results if r["success"])),
         "success_rate": float(sum(1 for r in ep_results if r["success"]) / max(1, len(ep_results))),
         "ckpt": str(ckpt_path),
         "policy_backend": policy_backend,
         "lerobot_dataset_root": str(lerobot_dataset_root) if lerobot_dataset_root else None,
-        "config": cfg,
+        "observability_mode": observability_mode,
+        "occlusion": {"mode": occ_mode, "fraction": float(occ_frac)},
+        "ttc": ttc_cfg_dict,
+        "episodes": ep_results,
         "results": ep_results,
+        "config": cfg,
     }
     out_file = out_dir / f"results_{int(time.time())}.json"
     out_file.write_text(json.dumps(summary, indent=2))

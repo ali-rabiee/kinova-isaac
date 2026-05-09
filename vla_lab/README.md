@@ -11,6 +11,13 @@ project lives under `vla_lab/`. The rest of the repository
 (`data_collection/`, `environments/`, `controllers/`, ...) was not
 modified and is consumed only via standard imports.
 
+**Paper direction (2026 sprint):** stress *partial observability* and
+single-camera manipulation—test-time scaling should help most when visual
+ambiguity is high. See `new_changes.md` for the full pivot notes; code
+support includes occlusion ablations (`partial_obs.py`), SmolVLA TTC
+(`smolvla_bridge/policy_wrapper.py`), MG-Select-style scoring
+(`baselines/mg_select.py`), and uncertainty gating (`ttc_methods/`).
+
 ---
 
 ## 1. What is implemented today

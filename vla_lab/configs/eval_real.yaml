@@ -1,0 +1,31 @@
+# Real-robot evaluation template (ROS / pyKinova wiring is intentionally out-of-tree).
+
+robot:
+  control_rate_hz: 5.0
+  camera_topic: /camera/color/image_raw
+  arm_namespace: /my_gen3
+
+policy:
+  backend: smolvla
+  checkpoint: vla_lab/checkpoints/smolvla_ft_XXX
+  lerobot_dataset_root: vla_lab/datasets/lerobot_kinova_v0
+
+safety:
+  workspace_min_xyz: [0.20, -0.45, 0.05]
+  workspace_max_xyz: [0.65, 0.45, 0.95]
+  max_linear_vel_m_s: 0.20
+  max_angular_vel_rad_s: 0.6
+
+ttc:
+  k_action_samples: 4
+  selection: mg_select_kl
+  gating: twin_uncertainty
+  gating_noise_std: 0.05
+  gating_threshold: 0.02
+
+eval:
+  num_episodes: 30
+  task_family: pick_lift_color
+  notes: >-
+    Minimum protocol from `vla_lab/new_changes.md`: report Wilson CIs, latency p95, and
+    run McNemar on paired success bits vs N=1 baseline using `vla_lab/stats_utils.py`.

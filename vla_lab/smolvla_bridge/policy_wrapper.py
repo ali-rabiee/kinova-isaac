@@ -5,8 +5,9 @@ Gripper channel is filled with 0 (this bridge exports 6D actions without gripper
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -96,3 +97,128 @@ class SmolVLAIsaacPolicy:
         phys = phys.squeeze(0)
         g = torch.zeros((phys.shape[0], 1), device=self.device, dtype=torch.float32)
         return torch.cat([phys[:, :6], g], dim=-1)
+
+    @torch.no_grad()
+    def predict_chunk_phys_k(
+        self,
+        *,
+        rgb_chw_float: torch.Tensor,
+        state6: torch.Tensor,
+        instruction: str,
+        k: int,
+        base_seed: int = 1337,
+    ) -> torch.Tensor:
+        """Draw K candidates (K, T, 7) using different RNG seeds (flow sampling noise)."""
+
+        k = max(1, int(k))
+        out: List[torch.Tensor] = []
+        for i in range(k):
+            try:
+                torch.manual_seed(int(base_seed) + int(i))
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(int(base_seed) + int(i))
+            except Exception:
+                pass
+            try:
+                self.reset()
+            except Exception:
+                pass
+            out.append(
+                self.predict_chunk_phys(rgb_chw_float=rgb_chw_float, state6=state6, instruction=instruction)
+            )
+        return torch.stack(out, dim=0)
+
+    @torch.no_grad()
+    def predict_chunk_phys_ttc(
+        self,
+        *,
+        rgb_chw_float: torch.Tensor,
+        state6: torch.Tensor,
+        instruction: str,
+        ttc_cfg_dict: Dict[str, Any],
+        latency_log: Optional[List[Dict[str, Any]]] = None,
+    ) -> torch.Tensor:
+        """TTC + optional twin-probe gating using the same selection API as TinyVLA (`vla_lab.ttc`)."""
+
+        from vla_lab.ttc import TTCConfig, select_from_candidates
+        from vla_lab.ttc_methods.entropy_gate import twin_sample_uncertainty, uncertainty_gate_effective_k
+
+        cfg = TTCConfig.from_dict(ttc_cfg_dict)
+        k_max = max(1, int(cfg.k_action_samples))
+        t0 = time.time()
+        forward_ms = 0.0
+        score_ms = 0.0
+        uncertainty = None
+        gated = False
+        k_eff = k_max
+
+        if k_max > 1 and str(cfg.gating) == "twin_uncertainty":
+            t_fw0 = time.time()
+            try:
+                torch.manual_seed(0)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(0)
+            except Exception:
+                pass
+            self.reset()
+            a0 = self.predict_chunk_phys(rgb_chw_float=rgb_chw_float, state6=state6, instruction=instruction)
+            try:
+                torch.manual_seed(1)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(1)
+            except Exception:
+                pass
+            self.reset()
+            a1 = self.predict_chunk_phys(rgb_chw_float=rgb_chw_float, state6=state6, instruction=instruction)
+            forward_ms += (time.time() - t_fw0) * 1000.0
+            uncertainty = float(twin_sample_uncertainty(a0, a1).item())
+            k_eff = uncertainty_gate_effective_k(
+                uncertainty,
+                threshold=float(cfg.gating_threshold),
+                k_when_uncertain=k_max,
+                k_when_certain=1,
+            )
+            gated = True
+            if k_eff == 1:
+                total_ms = (time.time() - t0) * 1000.0
+                if latency_log is not None:
+                    latency_log.append(
+                        {
+                            "forward_ms": float(forward_ms),
+                            "score_ms": float(max(0.0, total_ms - forward_ms)),
+                            "total_ms": float(total_ms),
+                            "k_eff": 1,
+                            "k_max": int(k_max),
+                            "gated": True,
+                            "uncertainty": float(uncertainty),
+                        }
+                    )
+                return a0
+
+        t_fw1 = time.time()
+        candidates = self.predict_chunk_phys_k(
+            rgb_chw_float=rgb_chw_float,
+            state6=state6,
+            instruction=instruction,
+            k=int(k_eff),
+            base_seed=2048,
+        )
+        forward_ms += (time.time() - t_fw1) * 1000.0
+
+        t_sc0 = time.time()
+        best, _scores = select_from_candidates(candidates, cfg.selection)
+        score_ms += (time.time() - t_sc0) * 1000.0
+        total_ms = (time.time() - t0) * 1000.0
+        if latency_log is not None:
+            latency_log.append(
+                {
+                    "forward_ms": float(forward_ms),
+                    "score_ms": float(score_ms),
+                    "total_ms": float(total_ms),
+                    "k_eff": int(candidates.shape[0]),
+                    "k_max": int(k_max),
+                    "gated": bool(gated),
+                    "uncertainty": uncertainty,
+                }
+            )
+        return best
