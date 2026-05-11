@@ -6,6 +6,8 @@ described in `new_changes.md` (external-only vs occluded workspace regions).
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 
 
@@ -14,6 +16,7 @@ def apply_occlusion_rgb_chw(
     mode: str,
     *,
     fraction: float = 0.35,
+    patch_seed: Optional[int] = None,
 ) -> torch.Tensor:
     """Return a copy of `rgb_chw` (3,H,W float) with a simple spatial mask.
 
@@ -22,7 +25,8 @@ def apply_occlusion_rgb_chw(
       - ``bottom_strip``: zero bottom ``fraction`` of rows
       - ``top_strip``: zero top ``fraction`` of rows
       - ``center_box``: zero a central ``fraction`` wide/tall box
-      - ``random_patch``: zero a random rectangle (~`fraction` area, stochastic)
+      - ``random_patch``: zero a random rectangle (~`fraction` area, stochastic).
+        If ``patch_seed`` is set, sampling is deterministic (paired-episode friendly).
     """
 
     m = str(mode or "none").lower().strip()
@@ -54,8 +58,14 @@ def apply_occlusion_rgb_chw(
     if m == "random_patch":
         side_h = max(1, int(round(h * (frac**0.5))))
         side_w = max(1, int(round(w * (frac**0.5))))
-        y0 = int(torch.randint(0, max(1, h - side_h + 1), (1,), device=x.device).item())
-        x0 = int(torch.randint(0, max(1, w - side_w + 1), (1,), device=x.device).item())
+        if patch_seed is not None:
+            gen = torch.Generator(device=x.device)
+            gen.manual_seed(int(patch_seed) & 0x7FFFFFFF)
+            y0 = int(torch.randint(0, max(1, h - side_h + 1), (1,), device=x.device, generator=gen).item())
+            x0 = int(torch.randint(0, max(1, w - side_w + 1), (1,), device=x.device, generator=gen).item())
+        else:
+            y0 = int(torch.randint(0, max(1, h - side_h + 1), (1,), device=x.device).item())
+            x0 = int(torch.randint(0, max(1, w - side_w + 1), (1,), device=x.device).item())
         x[:, y0 : y0 + side_h, x0 : x0 + side_w] = 0.0
         return x
 

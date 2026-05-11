@@ -138,9 +138,9 @@ class SmolVLAIsaacPolicy:
         ttc_cfg_dict: Dict[str, Any],
         latency_log: Optional[List[Dict[str, Any]]] = None,
     ) -> torch.Tensor:
-        """TTC + optional twin-probe gating using the same selection API as TinyVLA (`vla_lab.ttc`)."""
+        """TTC + gating (twin / noisy-pair) matching `vla_lab.ttc.TTCPipeline` semantics."""
 
-        from vla_lab.ttc import TTCConfig, select_from_candidates
+        from vla_lab.ttc import TTCConfig, _normalize_gating_label, select_from_candidates
         from vla_lab.ttc_methods.entropy_gate import twin_sample_uncertainty, uncertainty_gate_effective_k
 
         cfg = TTCConfig.from_dict(ttc_cfg_dict)
@@ -148,11 +148,30 @@ class SmolVLAIsaacPolicy:
         t0 = time.time()
         forward_ms = 0.0
         score_ms = 0.0
-        uncertainty = None
+        uncertainty: Optional[float] = None
         gated = False
+        gate_expanded = False
         k_eff = k_max
+        gmode = _normalize_gating_label(str(cfg.gating))
 
-        if k_max > 1 and str(cfg.gating) == "twin_uncertainty":
+        def _log_record(*, k_eff_i: int, score_ms_i: float) -> None:
+            if latency_log is None:
+                return
+            total_ms = (time.time() - t0) * 1000.0
+            latency_log.append(
+                {
+                    "forward_ms": float(forward_ms),
+                    "score_ms": float(score_ms_i),
+                    "total_ms": float(total_ms),
+                    "k_eff": int(k_eff_i),
+                    "k_max": int(k_max),
+                    "gated": bool(gated),
+                    "gate_expanded": bool(gate_expanded),
+                    "uncertainty": uncertainty,
+                }
+            )
+
+        if k_max > 1 and gmode == "twin_uncertainty":
             t_fw0 = time.time()
             try:
                 torch.manual_seed(0)
@@ -162,6 +181,7 @@ class SmolVLAIsaacPolicy:
                 pass
             self.reset()
             a0 = self.predict_chunk_phys(rgb_chw_float=rgb_chw_float, state6=state6, instruction=instruction)
+            # Second probe: low noise (LeRobot uses internal sampling; approximate via fresh seed).
             try:
                 torch.manual_seed(1)
                 if torch.cuda.is_available():
@@ -179,46 +199,74 @@ class SmolVLAIsaacPolicy:
                 k_when_certain=1,
             )
             gated = True
+            gate_expanded = k_eff > 1
             if k_eff == 1:
-                total_ms = (time.time() - t0) * 1000.0
-                if latency_log is not None:
-                    latency_log.append(
-                        {
-                            "forward_ms": float(forward_ms),
-                            "score_ms": float(max(0.0, total_ms - forward_ms)),
-                            "total_ms": float(total_ms),
-                            "k_eff": 1,
-                            "k_max": int(k_max),
-                            "gated": True,
-                            "uncertainty": float(uncertainty),
-                        }
-                    )
+                _log_record(k_eff_i=1, score_ms_i=max(0.0, (time.time() - t0) * 1000.0 - forward_ms))
+                return a0
+
+        elif k_max > 1 and gmode == "noisy_pair":
+            t_fw0 = time.time()
+            try:
+                torch.manual_seed(100)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(100)
+            except Exception:
+                pass
+            self.reset()
+            a0 = self.predict_chunk_phys(rgb_chw_float=rgb_chw_float, state6=state6, instruction=instruction)
+            try:
+                torch.manual_seed(101)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(101)
+            except Exception:
+                pass
+            self.reset()
+            a1 = self.predict_chunk_phys(rgb_chw_float=rgb_chw_float, state6=state6, instruction=instruction)
+            forward_ms += (time.time() - t_fw0) * 1000.0
+            uncertainty = float(twin_sample_uncertainty(a0, a1).item())
+            k_eff = uncertainty_gate_effective_k(
+                uncertainty,
+                threshold=float(cfg.gating_threshold),
+                k_when_uncertain=k_max,
+                k_when_certain=1,
+            )
+            gated = True
+            gate_expanded = k_eff > 1
+            if k_eff == 1:
+                _log_record(k_eff_i=1, score_ms_i=max(0.0, (time.time() - t0) * 1000.0 - forward_ms))
                 return a0
 
         t_fw1 = time.time()
-        candidates = self.predict_chunk_phys_k(
-            rgb_chw_float=rgb_chw_float,
-            state6=state6,
-            instruction=instruction,
-            k=int(k_eff),
-            base_seed=2048,
-        )
+        if k_eff > 1 and cfg.include_deterministic_candidate:
+            try:
+                torch.manual_seed(0)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(0)
+            except Exception:
+                pass
+            self.reset()
+            a_det = self.predict_chunk_phys(rgb_chw_float=rgb_chw_float, state6=state6, instruction=instruction)
+            rest = self.predict_chunk_phys_k(
+                rgb_chw_float=rgb_chw_float,
+                state6=state6,
+                instruction=instruction,
+                k=int(k_eff - 1),
+                base_seed=2048,
+            )
+            candidates = torch.cat([a_det.unsqueeze(0), rest], dim=0)
+        else:
+            candidates = self.predict_chunk_phys_k(
+                rgb_chw_float=rgb_chw_float,
+                state6=state6,
+                instruction=instruction,
+                k=int(k_eff),
+                base_seed=2048,
+            )
         forward_ms += (time.time() - t_fw1) * 1000.0
 
         t_sc0 = time.time()
         best, _scores = select_from_candidates(candidates, cfg.selection)
         score_ms += (time.time() - t_sc0) * 1000.0
-        total_ms = (time.time() - t0) * 1000.0
-        if latency_log is not None:
-            latency_log.append(
-                {
-                    "forward_ms": float(forward_ms),
-                    "score_ms": float(score_ms),
-                    "total_ms": float(total_ms),
-                    "k_eff": int(candidates.shape[0]),
-                    "k_max": int(k_max),
-                    "gated": bool(gated),
-                    "uncertainty": uncertainty,
-                }
-            )
+        gate_expanded = gate_expanded or (gated and int(candidates.shape[0]) > 1)
+        _log_record(k_eff_i=int(candidates.shape[0]), score_ms_i=score_ms)
         return best

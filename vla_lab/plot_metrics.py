@@ -200,6 +200,45 @@ def _plot_eval_comparison(summaries: List[Tuple[str, Dict[str, Any]]], out_dir: 
             fig2.savefig(out_dir / f"eval_success_by_target.{fmt}", dpi=150)
             plt.close(fig2)
 
+    _plot_success_vs_k_mean_frontier(summaries, out_dir, fmt)
+
+
+def _plot_success_vs_k_mean_frontier(summaries: List[Tuple[str, Dict[str, Any]]], out_dir: Path, fmt: str) -> None:
+    """Success vs mean effective K (gated TTC / τ sweeps). Requires ``ttc_aggregate.k_mean`` in JSON."""
+
+    import matplotlib.pyplot as plt
+
+    pts: List[Tuple[float, float, float, float, str]] = []
+    for label, s in summaries:
+        agg = s.get("ttc_aggregate") or {}
+        k_bar = agg.get("k_mean")
+        if k_bar is None:
+            continue
+        n_ep = int(s.get("num_episodes", 0))
+        ns = int(s.get("num_success", 0))
+        rate = float(s.get("success_rate", ns / max(1, n_ep)))
+        lo, hi = _wilson_ci(ns, n_ep)
+        pts.append((float(k_bar), rate, lo, hi, label))
+    if len(pts) < 2:
+        return
+    pts.sort(key=lambda x: x[0])
+    fig, ax = plt.subplots(figsize=(6.5, 4.2))
+    kx = [p[0] for p in pts]
+    ry = [p[1] for p in pts]
+    yerr_lo = [p[1] - p[2] for p in pts]
+    yerr_hi = [p[3] - p[1] for p in pts]
+    ax.errorbar(kx, ry, yerr=(yerr_lo, yerr_hi), fmt="o-", capsize=4, color="#8c564b", ecolor="#333333")
+    for p in pts:
+        ax.annotate(p[4], (p[0], p[1]), textcoords="offset points", xytext=(4, 4), fontsize=7, alpha=0.85)
+    ax.set_xlabel(r"Mean effective $K$ per policy query ($\bar K$)")
+    ax.set_ylabel("Success rate")
+    ax.set_title("Success vs. mean effective K (95% Wilson CI)")
+    ax.set_ylim(0, 1.05)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_dir / f"eval_success_vs_k_mean.{fmt}", dpi=150)
+    plt.close(fig)
+
 
 def _export_metrics_csv(train_logs: List[Dict[str, Any]], epoch_rows: List[Dict[str, Any]], out_csv: Path) -> None:
     lines = ["kind,step,epoch,train_loss,val_loss,act_loss,fa_loss,lr,wall_time_s"]

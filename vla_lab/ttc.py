@@ -11,19 +11,26 @@ Selection methods (``selection`` / legacy ``scoring``):
 
 Gating (``gating``):
 - ``none`` — draw ``k_action_samples`` candidates whenever K>1.
-- ``twin_uncertainty`` — two low-noise forwards; if they disagree beyond ``gating_threshold``,
-  draw up to ``k_action_samples``; otherwise use a single deterministic forward.
+- ``twin_uncertainty`` — deterministic ξ=0 vs. low-noise probe; if they disagree beyond
+  ``gating_threshold``, sample up to ``k_action_samples``; otherwise return the deterministic chunk.
+- ``noisy_pair`` — two **stochastic** probes (no ξ=0); same thresholding. On the cheap path,
+  returns the first probe (adaptive-budget ablation without a deterministic twin).
 
-Latency records: pass ``latency_log`` for a JSONL path; each line includes forward/score/total ms.
+``include_deterministic_candidate``: when true and K>1, build K candidates as one ξ=0 forward
+plus K−1 stochastic samples so consensus/MG-Select sees the deterministic trajectory as a candidate
+(reviewer ablation: fixed best-of-K *including* ξ=0).
+
+Latency: optional ``latency_buffer`` (list) on ``TTCConfig`` receives one dict per policy query;
+``latency_log`` still writes JSONL if set.
 """
 
 from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -44,9 +51,14 @@ class TTCConfig:
     log_jsonl: Optional[str] = None
     latency_log: Optional[str] = None
 
-    gating: str = "none"  # none | twin_uncertainty
+    gating: str = "none"  # none | twin_uncertainty | noisy_pair
     gating_noise_std: float = 0.05
     gating_threshold: float = 0.02
+    # If true and K>1, candidates are [ξ=0 chunk] + (K−1) stochastic samples (total K).
+    include_deterministic_candidate: bool = False
+
+    # Filled by eval when aggregating per-step K̄; not part of YAML serialization.
+    latency_buffer: Optional[List[Dict[str, Any]]] = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -59,6 +71,7 @@ class TTCConfig:
             "gating": str(self.gating),
             "gating_noise_std": float(self.gating_noise_std),
             "gating_threshold": float(self.gating_threshold),
+            "include_deterministic_candidate": bool(self.include_deterministic_candidate),
         }
 
     @classmethod
@@ -66,9 +79,7 @@ class TTCConfig:
         # Accept `selection` or fall back to `scoring`, mapping legacy labels.
         raw_sel = d.get("selection", d.get("scoring", "naive_consensus"))
         sel = _normalize_selection_label(str(raw_sel))
-        gate = str(d.get("gating", "none")).lower().strip()
-        if gate not in ("none", "twin_uncertainty"):
-            gate = "none"
+        gate = _normalize_gating_label(str(d.get("gating", "none")))
         return cls(
             k_action_samples=int(d.get("k_action_samples", 4)),
             noise_std=float(d.get("noise_std", 0.1)),
@@ -79,7 +90,25 @@ class TTCConfig:
             gating=gate,
             gating_noise_std=float(d.get("gating_noise_std", 0.05)),
             gating_threshold=float(d.get("gating_threshold", 0.02)),
+            include_deterministic_candidate=bool(d.get("include_deterministic_candidate", False)),
         )
+
+
+def _normalize_gating_label(name: str) -> str:
+    g = name.lower().strip().replace("-", "_")
+    aliases = {
+        "twin": "twin_uncertainty",
+        "twin_probe": "twin_uncertainty",
+        "twin_uncertainty": "twin_uncertainty",
+        "noisy_pair": "noisy_pair",
+        "noisy_pair_disagreement": "noisy_pair",
+        "stochastic_pair": "noisy_pair",
+        "none": "none",
+        "off": "none",
+        "false": "none",
+        "0": "none",
+    }
+    return aliases.get(g, "none")
 
 
 def _normalize_selection_label(name: str) -> str:
@@ -172,13 +201,15 @@ class TTCPipeline:
         score_ms = 0.0
         uncertainty = None
         gated = False
+        gate_mode = str(self.cfg.gating)
 
         sel = _normalize_selection_label(self.cfg.selection)
         k_max = max(1, int(self.cfg.k_action_samples))
         k_eff = k_max
+        gate_expanded = False
 
-        # Twin-probe gating (partial observability: spend K only when uncertain).
-        if k_max > 1 and self.cfg.gating == "twin_uncertainty":
+        gmode = _normalize_gating_label(gate_mode)
+        if k_max > 1 and gmode == "twin_uncertainty":
             t0 = time.time()
             out0 = self.model.forward(image, state, lang_ids, lang_mask, noise_std=0.0)
             out1 = self.model.forward(
@@ -195,6 +226,7 @@ class TTCPipeline:
                 k_when_certain=1,
             )
             gated = True
+            gate_expanded = k_eff > 1
             if k_eff == 1:
                 best = a0
                 scores = torch.zeros(1, device=best.device)
@@ -211,25 +243,77 @@ class TTCPipeline:
                     total_ms=total_ms,
                     uncertainty=uncertainty,
                     gated=gated,
+                    gate_expanded=False,
+                )
+                return best
+        elif k_max > 1 and gmode == "noisy_pair":
+            t0 = time.time()
+            gn = float(self.cfg.gating_noise_std)
+            out0 = self.model.forward(image, state, lang_ids, lang_mask, noise_std=gn)
+            out1 = self.model.forward(image, state, lang_ids, lang_mask, noise_std=gn)
+            forward_ms += (time.time() - t0) * 1000.0
+            a0 = out0.actions.squeeze(0)
+            a1 = out1.actions.squeeze(0)
+            uncertainty = float(twin_sample_uncertainty(a0, a1).item())
+            k_eff = uncertainty_gate_effective_k(
+                uncertainty,
+                threshold=float(self.cfg.gating_threshold),
+                k_when_uncertain=k_max,
+                k_when_certain=1,
+            )
+            gated = True
+            gate_expanded = k_eff > 1
+            if k_eff == 1:
+                best = a0
+                scores = torch.zeros(1, device=best.device)
+                t1 = time.time()
+                score_ms = (t1 - t_total0) * 1000.0 - forward_ms
+                total_ms = (t1 - t_total0) * 1000.0
+                self._write_logs(
+                    k_eff=k_eff,
+                    k_max=k_max,
+                    scores=scores,
+                    selection=sel,
+                    forward_ms=forward_ms,
+                    score_ms=max(0.0, score_ms),
+                    total_ms=total_ms,
+                    uncertainty=uncertainty,
+                    gated=gated,
+                    gate_expanded=False,
                 )
                 return best
         else:
             k_eff = k_max
 
         t0 = time.time()
-        candidates = self.model.sample_actions(
-            image=image,
-            state=state,
-            lang_ids=lang_ids,
-            lang_mask=lang_mask,
-            k=int(k_eff),
-            noise_std=float(self.cfg.noise_std),
-        )
-        forward_ms += (time.time() - t0) * 1000.0
+        if k_eff > 1 and self.cfg.include_deterministic_candidate:
+            a_det = self.model.forward(image, state, lang_ids, lang_mask, noise_std=0.0).actions.squeeze(0)
+            stoch = self.model.sample_actions(
+                image=image,
+                state=state,
+                lang_ids=lang_ids,
+                lang_mask=lang_mask,
+                k=int(k_eff - 1),
+                noise_std=float(self.cfg.noise_std),
+            )
+            if stoch.size(1) != 1:
+                raise ValueError("TTCPipeline.predict_action_chunk supports B=1 only.")
+            stoch = stoch.squeeze(1)
+            candidates = torch.cat([a_det.unsqueeze(0), stoch], dim=0)
+        else:
+            candidates = self.model.sample_actions(
+                image=image,
+                state=state,
+                lang_ids=lang_ids,
+                lang_mask=lang_mask,
+                k=int(k_eff),
+                noise_std=float(self.cfg.noise_std),
+            )
+            if candidates.size(1) != 1:
+                raise ValueError("TTCPipeline.predict_action_chunk supports B=1 only.")
+            candidates = candidates.squeeze(1)
 
-        if candidates.size(1) != 1:
-            raise ValueError("TTCPipeline.predict_action_chunk supports B=1 only.")
-        candidates = candidates.squeeze(1)
+        forward_ms += (time.time() - t0) * 1000.0
 
         t_s0 = time.time()
         best, scores = select_from_candidates(candidates, sel)
@@ -246,6 +330,7 @@ class TTCPipeline:
             total_ms=total_ms,
             uncertainty=uncertainty,
             gated=gated,
+            gate_expanded=gate_expanded or (gated and int(candidates.size(0)) > 1),
         )
         return best
 
@@ -261,43 +346,50 @@ class TTCPipeline:
         total_ms: float,
         uncertainty: Optional[float],
         gated: bool,
+        gate_expanded: bool,
     ) -> None:
+        buf = self.cfg.latency_buffer
+        if buf is not None:
+            try:
+                buf.append(
+                    {
+                        "ts": time.time(),
+                        "forward_ms": float(forward_ms),
+                        "score_ms": float(score_ms),
+                        "total_ms": float(total_ms),
+                        "k_eff": int(k_eff),
+                        "k_max": int(k_max),
+                        "selection": selection,
+                        "gated": bool(gated),
+                        "gate_expanded": bool(gate_expanded),
+                        "uncertainty": uncertainty,
+                    }
+                )
+            except Exception:
+                pass
+        row_common = {
+            "ts": time.time(),
+            "k_eff": int(k_eff),
+            "k_max": int(k_max),
+            "selection": selection,
+            "gated": bool(gated),
+            "gate_expanded": bool(gate_expanded),
+            "uncertainty": uncertainty,
+        }
         if self._log_fp is not None:
             try:
-                self._log_fp.write(
-                    json.dumps(
-                        {
-                            "ts": time.time(),
-                            "k_eff": int(k_eff),
-                            "k_max": int(k_max),
-                            "selection": selection,
-                            "gated": bool(gated),
-                            "uncertainty": uncertainty,
-                            "scores": [float(s) for s in scores.tolist()],
-                            "latency_ms": float(total_ms),
-                        }
-                    )
-                    + "\n"
-                )
+                payload = dict(row_common)
+                payload["scores"] = [float(s) for s in scores.tolist()]
+                payload["latency_ms"] = float(total_ms)
+                self._log_fp.write(json.dumps(payload) + "\n")
             except Exception:
                 pass
         if self._lat_fp is not None:
             try:
-                self._lat_fp.write(
-                    json.dumps(
-                        {
-                            "ts": time.time(),
-                            "forward_ms": float(forward_ms),
-                            "score_ms": float(score_ms),
-                            "total_ms": float(total_ms),
-                            "k_eff": int(k_eff),
-                            "k_max": int(k_max),
-                            "selection": selection,
-                            "gated": bool(gated),
-                            "uncertainty": uncertainty,
-                        }
-                    )
-                    + "\n"
-                )
+                payload = dict(row_common)
+                payload["forward_ms"] = float(forward_ms)
+                payload["score_ms"] = float(score_ms)
+                payload["total_ms"] = float(total_ms)
+                self._lat_fp.write(json.dumps(payload) + "\n")
             except Exception:
                 pass

@@ -31,6 +31,8 @@ import json
 import math
 import os
 import random
+import statistics
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -90,6 +92,24 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Label for logging only, e.g. external_only | occluded (see eval YAML).",
     )
+    parser.add_argument(
+        "--occlusion-patch-seed",
+        type=int,
+        default=None,
+        help="If set, random_patch occlusion uses a deterministic seed (paired episodes / sweeps).",
+    )
+    parser.add_argument(
+        "--gating-threshold",
+        type=float,
+        default=None,
+        help="Override yaml ttc.gating_threshold (τ sweeps for gated TTC).",
+    )
+    parser.add_argument(
+        "--gating-noise-std",
+        type=float,
+        default=None,
+        help="Override yaml ttc.gating_noise_std (ε sensitivity).",
+    )
 
     # Defer adding Isaac AppLauncher args to after we know we want to launch.
     from isaaclab.app import AppLauncher  # type: ignore
@@ -144,6 +164,48 @@ def _make_language_command(*, ep_idx: int, target_label: str, color: Optional[st
     rng = random.Random(int(ep_idx) + int(rng_seed))
     tmpl = rng.choice(templates)
     return tmpl.format(label=target_label, color=str(color), box_idx=str(box_idx))
+
+
+def _try_git_commit(repo_root: Path) -> Optional[str]:
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _aggregate_ttc_latencies(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Per-query TTC stats for reviewer-style reporting (K̄, gate expansion rate)."""
+
+    if not rows:
+        return {}
+    k_effs = [int(r["k_eff"]) for r in rows if r.get("k_eff") is not None]
+    expanded = [bool(r.get("gate_expanded")) for r in rows if r.get("gate_expanded") is not None]
+    unc = [float(r["uncertainty"]) for r in rows if r.get("uncertainty") is not None]
+    if not k_effs:
+        return {}
+    ks = sorted(k_effs)
+    p90_idx = max(0, min(len(ks) - 1, int(math.ceil(0.9 * len(ks)) - 1)))
+    out: Dict[str, Any] = {
+        "num_policy_queries": int(len(k_effs)),
+        "k_mean": float(statistics.mean(k_effs)),
+        "k_median": float(statistics.median(k_effs)),
+        "k_p90": float(ks[p90_idx]),
+    }
+    if expanded:
+        out["frac_gate_expanded"] = float(sum(1 for x in expanded if x) / max(1, len(expanded)))
+    if unc:
+        out["uncertainty_median"] = float(statistics.median(unc))
+    return out
 
 
 def _box_desc_from_prim(prim_path: str, box_colors: List[str]) -> Tuple[str, Optional[str], Optional[int]]:
@@ -292,8 +354,12 @@ def main() -> int:
     args = _parse_args()
     cfg = _load_yaml(Path(args.config))
     eval_cfg = cfg.get("eval", {})
-    ttc_cfg_dict = cfg.get("ttc", {})
+    ttc_cfg_dict = dict(cfg.get("ttc") or {})
     occlusion_cfg = cfg.get("occlusion", {}) or {}
+    if args.gating_threshold is not None:
+        ttc_cfg_dict["gating_threshold"] = float(args.gating_threshold)
+    if args.gating_noise_std is not None:
+        ttc_cfg_dict["gating_noise_std"] = float(args.gating_noise_std)
     observability_mode = str(
         args.observability_mode if args.observability_mode is not None else cfg.get("observability_mode", "external_only")
     )
@@ -331,6 +397,13 @@ def main() -> int:
         eval_cfg["spawn_mode"] = args.spawn_mode
     if args.seed is not None:
         eval_cfg["language_seed"] = int(args.seed)
+
+    occ_patch_base: Optional[int] = args.occlusion_patch_seed
+    if occ_patch_base is None and eval_cfg.get("occlusion_patch_seed") is not None:
+        try:
+            occ_patch_base = int(eval_cfg["occlusion_patch_seed"])
+        except (TypeError, ValueError):
+            occ_patch_base = None
 
     occ_mode = str(args.occlusion_mode) if args.occlusion_mode is not None else str(occlusion_cfg.get("mode", "none"))
     occ_frac = float(args.occlusion_fraction) if args.occlusion_fraction is not None else float(occlusion_cfg.get("fraction", 0.35))
@@ -385,6 +458,8 @@ def main() -> int:
     pipeline = None
     smol_policy = None
 
+    tiny_ttc_latencies: List[Dict[str, Any]] = []
+
     if policy_backend == "tiny":
         from vla_lab.dataset import ActionStats
         from vla_lab.models import TinyVLA, TinyVLAConfig
@@ -399,10 +474,9 @@ def main() -> int:
         if ckpt.get("action_stats") is not None:
             action_stats = ActionStats.from_dict(ckpt["action_stats"])
 
-        pipeline = TTCPipeline(
-            model,
-            TTCConfig.from_dict(ttc_cfg_dict),
-        )
+        ttc_live = TTCConfig.from_dict(ttc_cfg_dict)
+        ttc_live.latency_buffer = tiny_ttc_latencies
+        pipeline = TTCPipeline(model, ttc_live)
         k_ttc = int(ttc_cfg_dict.get("k_action_samples", 1))
         print(
             f"[eval] loaded TinyVLA {ckpt_path}  params={model.num_parameters():,}  "
@@ -583,15 +657,18 @@ def main() -> int:
         f"phys_steps_per_policy_tick={n_phys_per_policy}"
     )
 
+    from vla_lab.ttc import _normalize_gating_label as _ttc_gating_mode
+
+    _gate_on = _ttc_gating_mode(str(ttc_cfg_dict.get("gating", "none"))) != "none"
     use_smol_ttc = policy_backend == "smolvla" and (
-        int(ttc_cfg_dict.get("k_action_samples", 1)) > 1
-        or str(ttc_cfg_dict.get("gating", "none")).lower() not in ("none", "", "off", "false", "0")
+        int(ttc_cfg_dict.get("k_action_samples", 1)) > 1 or _gate_on
     )
     print(
         f"[eval] observability_mode={observability_mode!r}  occlusion={occ_mode!r} (frac={occ_frac:.3f})  "
         f"smol_ttc={use_smol_ttc}"
     )
 
+    smol_latencies_all: List[Dict[str, Any]] = []
     ep_results: List[Dict[str, Any]] = []
     for ep in range(num_episodes):
         if not simulation_app.is_running():
@@ -679,7 +756,15 @@ def main() -> int:
                 else:
                     rgb_t = torch.zeros(3, infer_image_size, infer_image_size, device=device)
 
-                rgb_used = apply_occlusion_rgb_chw(rgb_t, occ_mode, fraction=occ_frac)
+                occ_patch_seed = None
+                if occ_patch_base is not None and str(occ_mode).lower() == "random_patch":
+                    occ_patch_seed = int(occ_patch_base) + int(ep)
+                rgb_used = apply_occlusion_rgb_chw(
+                    rgb_t,
+                    occ_mode,
+                    fraction=occ_frac,
+                    patch_seed=occ_patch_seed,
+                )
 
                 pos_b, quat_b = _ee_pose_b()
                 gx = 1.0 if _gripper_state().startswith("o") else 0.0
@@ -771,6 +856,7 @@ def main() -> int:
         print(
             f"[eval][EP {ep}] success={success}  steps={steps}  z0={z0_target}  z_after={z_after}  elapsed={elapsed:.1f}s"
         )
+        smol_latencies_all.extend(smol_latencies)
 
         # Reset robot for next episode.
         try:
@@ -783,8 +869,10 @@ def main() -> int:
     # ------------------------------------------------------------------
     # Save results
     # ------------------------------------------------------------------
+    ttc_rows_all = tiny_ttc_latencies + smol_latencies_all
+
     summary = {
-        "schema": "vla_lab_eval/v2",
+        "schema": "vla_lab_eval/v3",
         "task": "reach_to_grasp_lift",
         "eval_timestamp_unix": float(time.time()),
         "num_episodes": len(ep_results),
@@ -796,6 +884,11 @@ def main() -> int:
         "observability_mode": observability_mode,
         "occlusion": {"mode": occ_mode, "fraction": float(occ_frac)},
         "ttc": ttc_cfg_dict,
+        "ttc_aggregate": _aggregate_ttc_latencies(ttc_rows_all),
+        "provenance": {
+            "git_commit": _try_git_commit(ROOT),
+            "repo_root": str(ROOT.resolve()),
+        },
         "episodes": ep_results,
         "results": ep_results,
         "config": cfg,
@@ -803,6 +896,14 @@ def main() -> int:
     out_file = out_dir / f"results_{int(time.time())}.json"
     out_file.write_text(json.dumps(summary, indent=2))
     print(f"[eval] success rate = {summary['success_rate']:.3f}  ({summary['num_success']}/{summary['num_episodes']})")
+    agg = summary.get("ttc_aggregate") or {}
+    if agg.get("k_mean") is not None:
+        print(
+            f"[eval] TTC aggregate: k_mean={agg['k_mean']:.3f}  k_median={agg.get('k_median')}  "
+            f"frac_gate_expanded={agg.get('frac_gate_expanded')}"
+        )
+    if summary.get("provenance", {}).get("git_commit"):
+        print(f"[eval] git_commit={summary['provenance']['git_commit']}")
     print(f"[eval] wrote {out_file}")
 
     if pipeline is not None:
