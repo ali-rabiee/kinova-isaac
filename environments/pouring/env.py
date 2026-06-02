@@ -155,7 +155,7 @@ class PouringEnv(BaseSceneEnv):
             n_segments=self.pitcher_cfg.n_segments,
             color_rgb=self.pitcher_cfg.color_rgb,
             mass_kg=self.pitcher_cfg.mass_kg,
-            physics_cfg=self.physics_cfg,
+            grip_cfg=self.pitcher_cfg,
         )
         self.glass_prim_path = self._spawn_open_top_cylinder(
             prim_path=f"{containers_root}/Glass",
@@ -167,7 +167,7 @@ class PouringEnv(BaseSceneEnv):
             n_segments=self.glass_cfg.n_segments,
             color_rgb=self.glass_cfg.color_rgb,
             mass_kg=self.glass_cfg.mass_kg,
-            physics_cfg=self.physics_cfg,
+            grip_cfg=self.glass_cfg,
         )
         return self.pitcher_prim_path, self.glass_prim_path
 
@@ -183,7 +183,7 @@ class PouringEnv(BaseSceneEnv):
         n_segments: int,
         color_rgb: tuple[float, float, float],
         mass_kg: float,
-        physics_cfg: PhysicsConfig,
+        grip_cfg: "PitcherConfig | GlassConfig",
     ) -> str:
         """Build one open-top hollow cylinder rigid body.
 
@@ -191,11 +191,13 @@ class PouringEnv(BaseSceneEnv):
         bottom-center: the floor's lowest face sits at ``position[2]`` and
         the walls extend upward to ``position[2] + base_thickness + inner_height``.
 
-        Physics is wired to match the YCB reach-to-grasp env -- contact /
-        rest offsets, torsional patch radius, and the high-friction
-        ``RigidBodyMaterialCfg`` are all read from ``physics_cfg`` so the
-        gripper grips and lifts the container the same way it grips a YCB
-        object.
+        Grasp physics (friction, contact/rest offsets, and the torsional patch
+        radius) come from ``grip_cfg`` -- the container's own
+        :class:`PitcherConfig` / :class:`GlassConfig`. These are deliberately
+        grippier than the env's shared object defaults because the vessel is
+        round and thin-walled, so the gripper only makes a small curved
+        contact patch and would otherwise let the container twist/slip out
+        while the arm carries it.
         """
         import importlib
 
@@ -240,20 +242,22 @@ class PouringEnv(BaseSceneEnv):
             sim_utils.CollisionPropertiesCfg(collision_enabled=True),
         )
 
-        # 2. Shared visual + physics materials (high friction so the gripper grips).
+        # 2. Shared visual + physics materials. The friction is intentionally
+        #    high (and combine-mode "max") so the round, thin-walled vessel
+        #    doesn't slip out of the gripper while the arm carries it.
         visual = PreviewSurfaceCfg(diffuse_color=tuple(color_rgb))
         physics_material = RigidBodyMaterialCfg(
-            static_friction=float(physics_cfg.object_static_friction),
-            dynamic_friction=float(physics_cfg.object_dynamic_friction),
-            restitution=float(physics_cfg.object_restitution),
-            friction_combine_mode=str(physics_cfg.object_friction_combine_mode),
+            static_friction=float(grip_cfg.static_friction),
+            dynamic_friction=float(grip_cfg.dynamic_friction),
+            restitution=float(grip_cfg.restitution),
+            friction_combine_mode=str(grip_cfg.friction_combine_mode),
         )
         col = sim_utils.CollisionPropertiesCfg(
             collision_enabled=True,
-            contact_offset=float(physics_cfg.contact_offset),
-            rest_offset=float(physics_cfg.rest_offset),
-            torsional_patch_radius=float(physics_cfg.object_torsional_patch_radius),
-            min_torsional_patch_radius=float(physics_cfg.object_min_torsional_patch_radius),
+            contact_offset=float(grip_cfg.contact_offset),
+            rest_offset=float(grip_cfg.rest_offset),
+            torsional_patch_radius=float(grip_cfg.torsional_patch_radius),
+            min_torsional_patch_radius=float(grip_cfg.min_torsional_patch_radius),
         )
 
         # 3. Floor: solid cylinder centered at (0, 0, bt/2) in local frame.

@@ -63,7 +63,31 @@ class PitcherConfig:
     # Strong blue, opaque (a "fluid container" look).
     color_rgb: Tuple[float, float, float] = (0.20, 0.45, 0.95)
 
-    mass_kg: float = 0.40
+    # A bit lighter than a "real" pitcher so the grip has margin to spare.
+    # The pellets add their own weight on top of this.
+    mass_kg: float = 0.30
+
+    # ------------------------------------------------------------------
+    # Grasp-stability tuning (overrides the env's shared object physics).
+    #
+    # The pitcher is a *round, thin-walled* vessel, so the gripper only makes
+    # a small, curved contact patch -- much grippier than a flat-faced cube.
+    # We therefore give the container its own, much higher friction profile and
+    # a large torsional patch radius. The torsional patch radius is what lets
+    # the contact resist *twisting about the finger-normal*, which is the main
+    # way a round object spins out of a grip while the arm moves it.
+    # ``friction_combine_mode="max"`` makes PhysX use the higher of the two
+    # contacting materials, so this high friction is honored even though the
+    # JACO2 finger pads are less grippy.
+    # ------------------------------------------------------------------
+    static_friction: float = 6.0
+    dynamic_friction: float = 6.0
+    restitution: float = 0.0
+    friction_combine_mode: str = "max"
+    contact_offset: float = 0.005
+    rest_offset: float = 0.0015
+    torsional_patch_radius: float = 0.04
+    min_torsional_patch_radius: float = 0.02
 
 
 @dataclass
@@ -86,6 +110,18 @@ class GlassConfig:
     color_rgb: Tuple[float, float, float] = (0.80, 0.95, 0.98)
 
     mass_kg: float = 0.30
+
+    # Same grasp-stability profile as the pitcher (see PitcherConfig). The glass
+    # isn't grasped in the default demo, but if a task does pick it up it should
+    # be just as hard to drop.
+    static_friction: float = 6.0
+    dynamic_friction: float = 6.0
+    restitution: float = 0.0
+    friction_combine_mode: str = "max"
+    contact_offset: float = 0.005
+    rest_offset: float = 0.0015
+    torsional_patch_radius: float = 0.04
+    min_torsional_patch_radius: float = 0.02
 
 
 @dataclass
