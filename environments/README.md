@@ -1,16 +1,55 @@
 # `environments/`
 
-Scene setup and object loading utilities used by the Kinova demos:
+Scene-environment packages for the Kinova Jaco2 demos.
 
-- `reach_to_grasp/`: scene config + `design_scene(...)` helper
-- `object_loader.py`: spawns objects (typically YCB assets)
-- `physix.py`: physics configuration helpers
+## Layout
 
-## Run: reach-to-grasp environment demo
+- `base.py` — shared `BaseSceneEnv`, `SceneConfig`, `CameraConfig`, `TopDownCameraConfig`, and the `design_scene` helper used by every concrete environment.
+- `ycb_reach_to_grasp/` — reach-to-grasp scene with YCB objects loaded from Isaac Nucleus. Provides `YCBReachToGraspEnv` plus module-level `DEFAULT_SCENE` / `DEFAULT_CAMERA` / `DEFAULT_TOP_DOWN_CAMERA`. Top-down camera is opt-in via `env.attach_top_down_camera()`.
+- `cubes/` — block-stacking scene with uniform colored cubes. Provides `CubesEnv`, the `BOX_COLORS` palette, and per-prim helpers (`label_for_prim`, `read_prim_world_yaw_rad`, `read_prim_height_m`).
+- `pouring/` — pouring task: YCB pitcher + YCB mug/glass + N small dynamic-sphere "pellets" pre-filled inside the pitcher. Both containers use **SDF mesh collision** so their hollow interiors are preserved on dynamic rigid bodies (convex hull would seal the openings). Provides `PouringEnv` plus `count_pellets_in_glass()` / `amount_poured_grams()` volume sensors.
+- `utils/object_loader.py` — generic object loader (USD or `box` mode).
+- `utils/physix.py` — physics configuration (sim dt, substeps, friction, etc.).
+- `utils/camera/` — top-down camera prim creation.
 
-```bash
-cd <repo-root>
-./IsaacLab/isaaclab.sh -p kinova-isaac/environments/reach_to_grasp/demo.py --device cuda
+## Using an environment
+
+```python
+from environments.ycb_reach_to_grasp import YCBReachToGraspEnv
+
+env = YCBReachToGraspEnv(device="cuda:0")
+sim = env.build_simulation()
+env.set_default_camera_view()        # GUI only
+env.design_scene()                   # ground / light / table / robot
+env.attach_top_down_camera()         # optional
+loader = env.build_object_loader(
+    spawn_min=(0.30, -0.30, 0.85),
+    spawn_max=(0.55,  0.30, 0.92),
+    min_distance=0.10,
+)
+prim_paths = loader.spawn(parent_prim_path="/World/Origin1", num_objects=4)
+env.reset()
 ```
 
+```python
+from environments.cubes import CubesEnv
 
+env = CubesEnv(device="cuda:0", box_size=0.08)
+sim = env.build_simulation()
+env.design_scene()
+loader = env.build_object_loader(spawn_min=(0.30, -0.30, 0.90),
+                                 spawn_max=(0.55,  0.30, 0.95),
+                                 min_distance=0.22)
+spawned = loader.spawn(parent_prim_path="/World/Origin1", num_objects=3)
+env.reset()
+for p in spawned:
+    label, color, idx = env.label_for_prim(p)
+```
+
+## Smoke-test demos
+
+```bash
+./IsaacLab/isaaclab.sh -p kinova-isaac/environments/ycb_reach_to_grasp/demo.py --device cuda
+./IsaacLab/isaaclab.sh -p kinova-isaac/environments/cubes/demo.py --device cuda --num-objects 3
+./IsaacLab/isaaclab.sh -p kinova-isaac/environments/pouring/demo.py --device cuda --num-pellets 30
+```

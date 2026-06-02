@@ -46,30 +46,14 @@ def main() -> None:
 
     try:
         # Deferred imports that require a running Kit app
-        import isaaclab.sim as sim_utils
-        import torch
-
-        from environments.reach_to_grasp.config import DEFAULT_SCENE
-        from environments.reach_to_grasp.utils import design_scene
+        from environments.ycb_reach_to_grasp import YCBReachToGraspEnv
         from kinova import GripperConfig, GripperController
 
-        # Build minimal simulation context
-        sim_cfg = sim_utils.SimulationCfg(device=str(args.device))
-        sim = sim_utils.SimulationContext(sim_cfg)
-
-        # Spawn scene and get robot articulation
-        scene_entities, scene_origins = design_scene(DEFAULT_SCENE)
-        robot = scene_entities["kinova_j2n6s300"]
-
-        # Reset sim and robot into a valid initial state
-        sim.reset()
-        origin0 = torch.tensor(scene_origins[0], device=sim.device)
-        root_state = robot.data.default_root_state.clone()
-        root_state[:, :3] += origin0
-        robot.write_root_pose_to_sim(root_state[:, :7])
-        robot.write_root_velocity_to_sim(root_state[:, 7:])
-        robot.write_joint_state_to_sim(robot.data.default_joint_pos, robot.data.default_joint_vel)
-        robot.reset()
+        env = YCBReachToGraspEnv(device=str(args.device))
+        sim = env.build_simulation()
+        env.design_scene()
+        robot = env.robot
+        env.reset()
 
         # Instantiate a gripper controller with desired gains
         g_cfg = GripperConfig(

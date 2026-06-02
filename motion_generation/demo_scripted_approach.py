@@ -103,23 +103,14 @@ def main() -> int:
     simulation_app = app_launcher.app
 
     import random
-    import importlib
 
     import torch
-    import isaaclab.sim as sim_utils
     from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
     from isaaclab.utils.math import subtract_frame_transforms, quat_conjugate, quat_apply
 
-    from environments.utils.object_loader import ObjectLoader, ObjectLoaderConfig, SpawnBounds
-    from environments.utils.physix import PhysicsConfig, apply_to_simulation_cfg, object_loader_kwargs_from_physix
+    from environments.cubes import CubesEnv
     from motion_generation.grasp_estimation.obb import ObbGraspPoseProvider
     from kinova import GripperConfig, GripperController
-
-    env_cfg_mod = importlib.import_module("environments.reach_to_grasp_VLA.config")
-    env_utils_mod = importlib.import_module("environments.reach_to_grasp_VLA.utils")
-    DEFAULT_SCENE = getattr(env_cfg_mod, "DEFAULT_SCENE")
-    DEFAULT_CAMERA = getattr(env_cfg_mod, "DEFAULT_CAMERA", None)
-    design_scene = getattr(env_utils_mod, "design_scene")
 
     # Only seed when a non-negative value is provided; otherwise let every run differ.
     if int(args.seed) >= 0:
@@ -226,46 +217,28 @@ def main() -> int:
             return self.t_elapsed >= self.min_duration_s
 
     # ------------------------------------------------------------------
-    # Build sim + scene + robot.
+    # Build sim + scene + robot via the cubes environment.
     # ------------------------------------------------------------------
-    phys = PhysicsConfig(device=str(getattr(args, "device", "cuda:0")))
-    sim_cfg = sim_utils.SimulationCfg(device=phys.device)
-    apply_to_simulation_cfg(sim_cfg, phys)
-    sim = sim_utils.SimulationContext(sim_cfg)
-    if (not getattr(args, "headless", False)) and DEFAULT_CAMERA is not None:
-        sim.set_camera_view(DEFAULT_CAMERA.eye, DEFAULT_CAMERA.target)
+    env = CubesEnv(device=str(getattr(args, "device", "cuda:0")), box_size=float(args.box_size))
+    sim = env.build_simulation()
+    if not getattr(args, "headless", False):
+        env.set_default_camera_view()
+    env.design_scene()
+    scene_origins = env.scene_origins
+    robot = env.robot
 
-    scene_entities, scene_origins = design_scene(DEFAULT_SCENE)
-    robot = scene_entities["kinova_j2n6s300"]
-
-    # Spawn uniform cubes.
-    loader_cfg = ObjectLoaderConfig(
-        dataset_dirs=[],  # unused in box mode
-        bounds=SpawnBounds(min_xyz=tuple(args.spawn_min), max_xyz=tuple(args.spawn_max)),
+    loader = env.build_object_loader(
+        spawn_min=tuple(args.spawn_min),
+        spawn_max=tuple(args.spawn_max),
         min_distance=float(args.min_distance),
-        spawn_mode="box",
-        box_size_min=(float(args.box_size), float(args.box_size), float(args.box_size)),
-        box_size_max=(float(args.box_size), float(args.box_size), float(args.box_size)),
-        box_color_palette=[(0.9, 0.2, 0.2), (0.2, 0.4, 0.9), (0.2, 0.9, 0.3), (0.9, 0.8, 0.2), (0.7, 0.3, 0.8)],
-        box_color_names=["red", "blue", "green", "yellow", "purple"],
-        **object_loader_kwargs_from_physix(phys),
     )
-    loader = ObjectLoader(loader_cfg)
     spawned_paths = loader.spawn(parent_prim_path="/World/Origin1", num_objects=int(args.num_objects))
     if len(spawned_paths) == 0:
         print("[DEMO][ERROR] No objects spawned. Aborting.")
         simulation_app.close()
         return 2
 
-    # Reset sim and robot to default state.
-    sim.reset()
-    origin0 = torch.tensor(scene_origins[0], device=sim.device)
-    root_state = robot.data.default_root_state.clone()
-    root_state[:, :3] += origin0
-    robot.write_root_pose_to_sim(root_state[:, :7])
-    robot.write_root_velocity_to_sim(root_state[:, 7:])
-    robot.write_joint_state_to_sim(robot.data.default_joint_pos, robot.data.default_joint_vel)
-    robot.reset()
+    env.reset()
 
     # ------------------------------------------------------------------
     # Resolve joint / body ids.
@@ -313,40 +286,9 @@ def main() -> int:
     # ------------------------------------------------------------------
     grasp_provider = ObbGraspPoseProvider(align_to_min_width=False)
 
-    # ------------------------------------------------------------------
-    # Direct USD yaw reader.
-    # The existing ObbGraspPoseProvider uses UsdGeom.BBoxCache.ComputeWorldBound,
-    # which for USD shape prims (Cuboid/Sphere/etc.) returns a world-AABB-style
-    # GfBBox3d whose matrix is effectively identity. That silently strips the
-    # cube's yaw, and the provider returns yaw=0 no matter how the cube was
-    # spawned. For this demo we just read the prim's world transform directly
-    # and take its yaw about +Z, which is what we actually want to align to.
-    # ------------------------------------------------------------------
-    import importlib as _importlib_for_yaw
-    _pxr_usd = _importlib_for_yaw.import_module("pxr.Usd")
-    _pxr_usdgeom = _importlib_for_yaw.import_module("pxr.UsdGeom")
-    _omni_usd = _importlib_for_yaw.import_module("omni.usd")
-    _usd_stage = _omni_usd.get_context().get_stage()
-
-    def _read_prim_world_yaw_rad(prim_path: str) -> float | None:
-        """Yaw (rotation about world +Z) of a prim's world transform, in radians.
-
-        Returns None if the prim cannot be read.
-        """
-        try:
-            prim = _usd_stage.GetPrimAtPath(str(prim_path))
-            if not prim.IsValid():
-                return None
-            xformable = _pxr_usdgeom.Xformable(prim)
-            M = xformable.ComputeLocalToWorldTransform(_pxr_usd.TimeCode.Default())
-            # USD uses row-vector post-multiplication: v_world = v_local * M
-            # -> local +X ends up at world = (M[0][0], M[0][1], M[0][2])
-            m00 = float(M[0][0])
-            m01 = float(M[0][1])
-            return math.atan2(m01, m00)
-        except Exception as e:
-            print(f"[DEMO][WARN] could not read world yaw for {prim_path}: {e}")
-            return None
+    # ObbGraspPoseProvider strips yaw for USD shape prims, so we read the cube's
+    # world transform directly via the env helper.
+    _read_prim_world_yaw_rad = env.read_prim_world_yaw_rad
 
     # ------------------------------------------------------------------
     # Helpers.

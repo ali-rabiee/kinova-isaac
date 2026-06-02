@@ -3,7 +3,7 @@
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from environments.reach_to_grasp_VLA.config import TopDownCameraConfig
+    from environments.base import TopDownCameraConfig
 
 
 def create_topdown_camera(camera_cfg: "TopDownCameraConfig") -> None:

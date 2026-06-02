@@ -11,7 +11,7 @@ from data_collection.profiles.spec import ProfileSpec
 
 
 def add_cli_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--env", type=str, default="reach_to_grasp_VLA", choices=sorted(get_envs().keys()))
+    parser.add_argument("--env", type=str, default="ycb_reach_to_grasp", choices=sorted(get_envs().keys()))
     parser.add_argument("--logs-root", type=str, default="logs/data_collection")
     # For VLA training, a 5Hz policy/control rate is a good default trade-off between
     # responsiveness and dataset size (and matches common OpenVLA-style datasets).
@@ -377,40 +377,39 @@ def run(args: argparse.Namespace) -> int:
     print(f"[VLA_V1] enable_cameras flag value: {enable_cameras}")
     print(f"[VLA_V1] carb /isaaclab/cameras_enabled={carb_settings.get('/isaaclab/cameras_enabled')}")
 
-    import importlib
-    import isaaclab.sim as sim_utils
     from isaaclab.sensors import Camera, CameraCfg
     from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
     from controllers import CartesianVelocityJogConfig, CartesianVelocityJogController
     from environments.utils.object_loader import ObjectLoader, ObjectLoaderConfig, SpawnBounds
-    from environments.utils.physix import PhysicsConfig, apply_to_simulation_cfg, object_loader_kwargs_from_physix
+    from environments.utils.physix import object_loader_kwargs_from_physix
+    from environments.ycb_reach_to_grasp import (
+        DEFAULT_TOP_DOWN_CAMERA,
+        YCBReachToGraspEnv,
+    )
 
-    env_spec = get_envs()[str(getattr(args, "env", "reach_to_grasp_VLA"))]
-    env_cfg_mod = importlib.import_module(f"{env_spec.module_base}.config")
-    env_utils_mod = importlib.import_module(f"{env_spec.module_base}.utils")
-    DEFAULT_SCENE = getattr(env_cfg_mod, "DEFAULT_SCENE")
-    DEFAULT_CAMERA = getattr(env_cfg_mod, "DEFAULT_CAMERA", None)
-    DEFAULT_TOP_DOWN_CAMERA = getattr(env_cfg_mod, "DEFAULT_TOP_DOWN_CAMERA", None)
-    design_scene = getattr(env_utils_mod, "design_scene")
-    create_topdown_camera = getattr(importlib.import_module("environments.utils.camera"), "create_topdown_camera")
+    # Pull scale_range from CLI if provided so it can be threaded into the env loader.
+    _scale_range = None
+    if getattr(args, "scale_min", None) is not None and getattr(args, "scale_max", None) is not None:
+        _scale_range = (float(args.scale_min), float(args.scale_max))
 
-    # Setup sim
-    phys = PhysicsConfig(device=str(getattr(args, "device", "cuda:0")))
-    sim_cfg = sim_utils.SimulationCfg(device=phys.device)
-    apply_to_simulation_cfg(sim_cfg, phys)
-    sim = sim_utils.SimulationContext(sim_cfg)
-    if (not getattr(args, "headless", False)) and DEFAULT_CAMERA is not None:
-        sim.set_camera_view(DEFAULT_CAMERA.eye, DEFAULT_CAMERA.target)
+    env = YCBReachToGraspEnv(
+        device=str(getattr(args, "device", "cuda:0")),
+        scale_range=_scale_range,
+    )
+    sim = env.build_simulation()
+    phys = env.physics_cfg
+    if not getattr(args, "headless", False):
+        env.set_default_camera_view()
 
-    # Build scene and robot
-    scene_entities, scene_origins = design_scene(DEFAULT_SCENE)
-    robot = scene_entities["kinova_j2n6s300"]
+    env.design_scene()
+    robot = env.robot
+    scene_origins = env.scene_origins  # consumed inside teleport / reset closures below
 
     # Create top-down camera prim ONLY if cameras are enabled.
     # IsaacLab will error during sim.reset() if a Camera exists without --enable_cameras.
-    if enable_cameras and DEFAULT_TOP_DOWN_CAMERA is not None:
-        create_topdown_camera(DEFAULT_TOP_DOWN_CAMERA)
+    if enable_cameras:
+        env.attach_top_down_camera()
         print(f"[VLA_V1] Top-down camera created at: {DEFAULT_TOP_DOWN_CAMERA.prim_path}")
 
     # -----------------------------

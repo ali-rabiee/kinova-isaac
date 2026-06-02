@@ -37,23 +37,22 @@ def run_grasp_loop_demo(args: argparse.Namespace) -> int:
     enable_optional_planner_extensions()
 
     # Import modules requiring active app
-    import isaaclab.sim as sim_utils
-    from environments.reach_to_grasp.utils import design_scene
-    from environments.reach_to_grasp.config import DEFAULT_SCENE, DEFAULT_CAMERA
+    import isaaclab.sim as sim_utils  # noqa: F401  (still used for primitives spawning below)
+    from environments.ycb_reach_to_grasp import DEFAULT_SCENE, YCBReachToGraspEnv
     from environments.utils.object_loader import ObjectLoader, ObjectLoaderConfig, SpawnBounds
-    from environments.utils.physix import PhysicsConfig, apply_to_simulation_cfg, object_loader_kwargs_from_physix
+    from environments.utils.physix import object_loader_kwargs_from_physix
 
-    # Setup sim
-    phys = PhysicsConfig(device=args.device)
-    sim_cfg = sim_utils.SimulationCfg(device=phys.device)
-    apply_to_simulation_cfg(sim_cfg, phys)
-    sim = sim_utils.SimulationContext(sim_cfg)
+    env = YCBReachToGraspEnv(device=args.device)
+    phys = env.physics_cfg
+    sim = env.build_simulation()
     if not args.headless:
-        sim.set_camera_view(DEFAULT_CAMERA.eye, DEFAULT_CAMERA.target)
+        env.set_default_camera_view()
 
     print("[MG] App launched; building scene...")
-    scene_entities, scene_origins = design_scene(DEFAULT_SCENE)
-    robot = scene_entities["kinova_j2n6s300"]
+    env.design_scene()
+    scene_entities = env.scene_entities
+    scene_origins = env.scene_origins
+    robot = env.robot
     robot_prim_path = None
     try:
         robot_prim_path = str(getattr(getattr(robot, "cfg", None), "prim_path", None))

@@ -7,7 +7,6 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-import torch
 from isaaclab.app import AppLauncher
 
 # Ensure repo roots are importable.
@@ -283,76 +282,47 @@ def main() -> None:
     # Imports that require an active Kit app (i.e., provide `omni.*`) MUST be deferred
     # until after AppLauncher has started.
     import carb  # noqa: E402
-    import isaaclab.sim as sim_utils  # noqa: E402
-    from environments.reach_to_grasp_VLA.config import (  # noqa: E402
-        DEFAULT_SCENE,
-        DEFAULT_CAMERA,
-        DEFAULT_TOP_DOWN_CAMERA,
-    )
-    from environments.reach_to_grasp_VLA.utils import design_scene  # noqa: E402
-    from environments.utils.camera import create_topdown_camera  # noqa: E402
-    from environments.utils.object_loader import (  # noqa: E402
-        ObjectLoader,
-        ObjectLoaderConfig,
-        SpawnBounds,
-    )
-    from environments.utils.physix import (  # noqa: E402
-        PhysicsConfig,
-        apply_to_simulation_cfg,
-        object_loader_kwargs_from_physix,
-    )
+    from environments.ycb_reach_to_grasp import YCBReachToGraspEnv  # noqa: E402
     from motion_generation.planners import PlannerContext  # noqa: E402
 
     carb_settings = carb.settings.get_settings()
     carb_settings.set_bool("/isaaclab/cameras_enabled", bool(args.enable_cameras))
 
-    # Scene setup
-    phys = PhysicsConfig(device=str(args.device))
-    sim_cfg = sim_utils.SimulationCfg(device=phys.device)
-    apply_to_simulation_cfg(sim_cfg, phys)
-    sim = sim_utils.SimulationContext(sim_cfg)
-    if not args.headless:
-        sim.set_camera_view(DEFAULT_CAMERA.eye, DEFAULT_CAMERA.target)
+    scale_range = (
+        (float(args.scale_min), float(args.scale_max))
+        if args.scale_min and args.scale_max
+        else None
+    )
 
-    scene_entities, scene_origins = design_scene(DEFAULT_SCENE)
-    robot = scene_entities["kinova_j2n6s300"]
+    env = YCBReachToGraspEnv(device=str(args.device), scale_range=scale_range)
+    sim = env.build_simulation()
+    if not args.headless:
+        env.set_default_camera_view()
+    env.design_scene()
+    robot = env.robot
     if bool(args.enable_cameras):
-        create_topdown_camera(DEFAULT_TOP_DOWN_CAMERA)
+        env.attach_top_down_camera()
 
     # Spawn objects
     prim_paths: List[str] = []
     id_to_label: Dict[str, str] = {}
     if not getattr(args, "no_objects", False):
-        try:
-            from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-
-            ycb_dir = f"{ISAAC_NUCLEUS_DIR}/Props/YCB"
-        except Exception:
-            ycb_dir = "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.0/Isaac/Props/YCB"
-        phys_loader_kwargs = object_loader_kwargs_from_physix(phys)
-        loader_cfg = ObjectLoaderConfig(
-            dataset_dirs=[ycb_dir],
-            bounds=SpawnBounds(min_xyz=tuple(args.spawn_min), max_xyz=tuple(args.spawn_max)),
+        loader = env.build_object_loader(
+            spawn_min=tuple(args.spawn_min),
+            spawn_max=tuple(args.spawn_max),
             min_distance=float(args.min_distance),
-            uniform_scale_range=(args.scale_min, args.scale_max) if args.scale_min and args.scale_max else None,
-            **phys_loader_kwargs,
         )
-        loader = ObjectLoader(loader_cfg)
-        prim_paths = loader.spawn(parent_prim_path="/World/Origin1", num_objects=int(args.num_objects))
+        prim_paths = loader.spawn(
+            parent_prim_path="/World/Origin1",
+            num_objects=int(args.num_objects),
+        )
         try:
             prim_to_label = loader.get_last_spawn_labels()
             id_to_label = {str(p).split("/")[-1]: str(lbl) for p, lbl in prim_to_label.items()}
         except Exception:
             id_to_label = {}
 
-    sim.reset()
-    origin0 = torch.tensor(scene_origins[0], device=sim.device)
-    root_state = robot.data.default_root_state.clone()
-    root_state[:, :3] += origin0
-    robot.write_root_pose_to_sim(root_state[:, :7])
-    robot.write_root_velocity_to_sim(root_state[:, 7:])
-    robot.write_joint_state_to_sim(robot.data.default_joint_pos, robot.data.default_joint_vel)
-    robot.reset()
+    env.reset()
 
     # Controller and input
     ctrl_cfg = CartesianVelocityJogConfig(
