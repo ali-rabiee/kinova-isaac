@@ -1,5 +1,11 @@
 # `vla_lab/` — VLA-TTC starter package
 
+> **Now on the HRI 2027 pivot.** The act/compute/query allocator, the robot-only calibration
+> experiments, and the human study live in `allocation/`, `calibration/`, and `human_study/`.
+> See **[§7](#7-hri-2027-pivot--actcomputequery-allocator-calibration--human-study)** for the
+> run commands and [`project_pivot_VLA_HRI2027.md`](./project_pivot_VLA_HRI2027.md) for the why.
+> Sections §1–§6 below document the original CoRL pipeline (still runnable).
+
 This folder is the home of the **CoRL 2026 VLA-TTC** project (codename
 `vla-ttc`), built on top of the existing `kinova-isaac` simulation /
 data-collection stack. The full design document lives at
@@ -90,6 +96,11 @@ vla_lab/
 ├── dryrun.py                       <- VRAM / latency dry-fit
 ├── inspect_data.py                 <- session sanity tool
 ├── plot_metrics.py                 <- figures for training / eval (paper-style)
+├── allocation/                     <- act/compute/query allocator + 6 baselines (HRI pivot, §7)
+├── calibration/                    <- Result-2 metrics + figures (ECE / decoupling / coverage)
+├── human_study/                    <- study protocol, instruments, reliance, power, offline sim runner
+├── fit_allocator.py                <- fit the allocator (irreducibility + conformal) from calibration logs
+├── tests/                          <- offline test suite (`python -m vla_lab.tests.run_tests`; no pytest)
 └── scripts/
     ├── collect.sh                  <- **vla_v1** stable reach/grasp/lift (default data collection)
     ├── collect_v3.sh               <- same as collect.sh (--profile vla_v1); numbered alias for clarity
@@ -101,7 +112,15 @@ vla_lab/
     ├── after_smolvla_train.sh      <- optional TensorBoard / plot_metrics hook after SmolVLA run
     ├── eval.sh                     <- wrapper around `vla_lab.eval_isaaclab`
     ├── plot.sh                     <- wrapper around `vla_lab.plot_metrics`
-    └── dryrun.sh                   <- wrapper around `vla_lab.dryrun`
+    ├── dryrun.sh                   <- wrapper around `vla_lab.dryrun`
+    │   # --- HRI 2027 pivot (§7): act/compute/query, calibration & human study ---
+    ├── run_tests.sh                <- offline test suite (no Isaac / torch / pytest)
+    ├── calibration_eval.sh         <- Isaac occlusion sweep → per-step calibration records
+    ├── fit_allocator.sh            <- fit allocator_fit.json from calibration logs
+    ├── calibration_analyze.sh      <- Result-2 figures (reliability / decoupling / coverage)
+    ├── human_study_pilot.sh        <- offline study pilot (synthetic robot+human) → analyze
+    ├── human_study_analyze.sh      <- analyze a study log (pilot or real) → reliance/trust figures
+    └── power_analysis.sh           <- sample-size / power from a pilot or effect size
 ```
 
 Nothing outside `vla_lab/` was modified to add this package.
@@ -582,6 +601,119 @@ when extending — it lets us swap models without touching anything else.
 The action is exactly what `vla_v1.py` writes as `policy.action_from_prev`
 in `ticks.jsonl`, so the supervised target is always available without
 custom labelling.
+
+## 7. HRI 2027 pivot — act/compute/query allocator, calibration & human study
+
+> The project has pivoted from the CoRL "TTC under partial observability" framing (§1–§6,
+> still runnable) to an **HRI 2027** contribution. The full memo is
+> [`project_pivot_VLA_HRI2027.md`](./project_pivot_VLA_HRI2027.md). One-sentence thesis:
+> *self-generated uncertainty tells a policy **how** to spend compute, but not **when**
+> compute is useless — and that regime is exactly where it must **ask a human**.*
+
+Inference-time decision-making is reframed from a binary (act vs. compute) gate into a
+**trichotomy — act / compute / query** — governed by visual observability. Three new,
+self-contained packages implement it, all **pure-Python/NumPy at the core** (no torch / Isaac
+/ LeRobot import to load), so the whole thing is runnable and testable offline:
+
+| Package | Memo | What it is |
+| --- | --- | --- |
+| `vla_lab/allocation/` | §3, C3 | The act/compute/query allocator (`allocator.py`), VoC-vs-VoI rule (`value_of_information.py`), conformal escalation (`conformal.py`), uncertainty probes (`uncertainty.py`), the 6 comparison controllers (`baselines.py`: autonomy / fixed-compute / compute-gated / SCALE / KnowNo / INSIGHT), human-query interface (`query.py`), and uncertainty-type transparency (`transparency.py`). Torch policy adapters live in `policy_adapters.py` (imported only by the Isaac glue). |
+| `vla_lab/calibration/` | §4.2–4.3 | "Result 2": ECE, the agreement→correctness **decoupling**, and conformal **coverage under occlusion shift** (`metrics.py`), the per-step record schema (`records.py`), and a figure CLI (`analyze.py`). |
+| `vla_lab/human_study/` | §5 | The study layer: design + counterbalancing (`protocol.py`), NASA-TLX / Jian-2000 / MDMT scoring (`instruments.py`), appropriate-reliance & over-trust (`reliance.py`), power analysis (`power.py`), an offline session runner with synthetic robot+human (`session.py`), and a figure CLI (`analyze.py`). |
+| `vla_lab/fit_allocator.py` | C3 | "Trains" the query branch: fits the irreducibility detector + conformal rule from a calibration log → `allocator_fit.json`. |
+
+`eval_isaaclab.py` gained `--controller / --allocator-fit / --emit-calibration` (and an
+`allocation:` block in `configs/eval_isaac.yaml`) to run any controller inside the existing
+Isaac scene and log calibration records.
+
+### 7.1 Validate offline first (no robot, no humans, no Isaac)
+
+Everything below is pure Python + NumPy (+ matplotlib for figures). Start here — it confirms
+the whole pipeline works before you touch hardware.
+
+```bash
+# Run the full offline test suite (51 tests: allocator, calibration, human study, fit).
+./vla_lab/scripts/run_tests.sh
+
+# Pilot the entire human study with a synthetic robot + human, then analyze + plot it.
+# Reproduces the headline: the type-aware allocator cuts over-trust vs. the baselines.
+PARTICIPANTS=12 DESIGN=within ./vla_lab/scripts/human_study_pilot.sh
+#   -> vla_lab/study_runs/pilot/study.jsonl
+#   -> vla_lab/results/human_study/{study_summary.json, *_by_condition.pdf, overtrust_vs_occlusion.pdf}
+
+# Sample-size / power analysis (memo §10). Three modes:
+./vla_lab/scripts/power_analysis.sh --from-log vla_lab/study_runs/pilot/study.jsonl --design paired
+./vla_lab/scripts/power_analysis.sh --d 0.5                 # a continuous paired DV (trust / TLX)
+./vla_lab/scripts/power_analysis.sh --p1 0.88 --p2 0.56     # two reliance proportions
+```
+
+### 7.2 Robot-only calibration sweep — "Result 2" (needs Isaac Lab)
+
+This is the empirical heart of the pivot and needs **no humans**. Run the policy across
+occlusion levels, log per-step calibration records, fit the allocator, and make the figures.
+
+```bash
+# 1. Sweep occlusion in Isaac, emitting per-step calibration records under OUT_ROOT/*/records.jsonl.
+#    CONTROLLER=compute_gated logs the twin-probe dispersion at every step; --policy-backend smolvla too.
+OUT_ROOT=vla_lab/calibration_runs/run_a NUM_EPISODES=50 \
+  ./vla_lab/scripts/calibration_eval.sh
+
+# 2. Fit the allocator (irreducibility detector + conformal rule) -> allocator_fit.json.
+CALIB='vla_lab/calibration_runs/run_a/*/records.jsonl' \
+OUT=vla_lab/fits/allocator_fit.json \
+  ./vla_lab/scripts/fit_allocator.sh
+
+# 3. Make the Result-2 figures (reliability, ECE-vs-occlusion, agreement-vs-correctness, coverage).
+CALIB='vla_lab/calibration_runs/run_a/*/records.jsonl' \
+  ./vla_lab/scripts/calibration_analyze.sh
+#   -> vla_lab/results/calibration/{calibration_summary.json, reliability_diagram.pdf,
+#      ece_vs_occlusion.pdf, agreement_vs_correctness.pdf, coverage_vs_occlusion.pdf}
+```
+
+### 7.3 Run a controller inside the Isaac eval (needs Isaac Lab)
+
+Once you have `allocator_fit.json`, drop any controller into the normal eval. Either pass
+flags, or set the `allocation:` block in `vla_lab/configs/eval_isaac.yaml`.
+
+```bash
+# The full act/compute/query allocator (query branch unlocked by the fit):
+./vla_lab/scripts/eval.sh \
+  --num-episodes 50 --occlusion-mode bottom_strip --occlusion-fraction 0.5 \
+  --controller allocator --allocator-fit vla_lab/fits/allocator_fit.json
+
+# A baseline for comparison (same scenes/seeds): autonomy | fixed_compute | compute_gated | scale | knowno | insight
+./vla_lab/scripts/eval.sh --num-episodes 50 --controller knowno --allocator-fit vla_lab/fits/allocator_fit.json
+```
+
+The eval JSON gains a `controller_aggregate` block (act/compute/query fractions, query rate,
+mean K, latency). `controller: none` (the default) keeps the legacy TTC path from §5.5.
+
+### 7.4 The real human study
+
+`session.py` is hardware/human-agnostic: the robot loop and the human's answers are *injected*
+into `SessionRunner`. To run for real, replace `SimEpisodeRunner` with the Kinova JACO loop and
+`SimQuestionnaireProvider` with your study front-end, write the JSONL with `StudyLogger`, then
+analyze it exactly like the pilot:
+
+```bash
+LOG=vla_lab/study_runs/study_2026.jsonl ./vla_lab/scripts/human_study_analyze.sh
+```
+
+### 7.5 Command / module quick reference
+
+| Goal | Command |
+| --- | --- |
+| Run all offline tests | `./vla_lab/scripts/run_tests.sh` (or `python -m vla_lab.tests.run_tests`) |
+| Offline study pilot + figures | `./vla_lab/scripts/human_study_pilot.sh` |
+| Power / sample size | `./vla_lab/scripts/power_analysis.sh --from-log <log> --design paired` |
+| Calibration sweep (Isaac) | `OUT_ROOT=... ./vla_lab/scripts/calibration_eval.sh` |
+| Fit the allocator | `CALIB='...' ./vla_lab/scripts/fit_allocator.sh` |
+| Calibration figures | `CALIB='...' ./vla_lab/scripts/calibration_analyze.sh` |
+| Controller eval (Isaac) | `./vla_lab/scripts/eval.sh --controller allocator --allocator-fit <fit>` |
+| Analyze a study log | `LOG=... ./vla_lab/scripts/human_study_analyze.sh` |
+
+All of these honor env-var overrides (e.g. `DEVICE`, `FORMAT=png`, `NUM_EPISODES`); read the
+top of each script for the full list, and pass extra flags through after the script name.
 
 ## 8. Known gotchas
 

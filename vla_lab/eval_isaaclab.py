@@ -110,6 +110,25 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Override yaml ttc.gating_noise_std (ε sensitivity).",
     )
+    parser.add_argument(
+        "--controller",
+        type=str,
+        default=None,
+        help="act/compute/query controller: none|autonomy|fixed_compute|compute_gated|scale|"
+        "knowno|insight|allocator (default none = legacy TTC path).",
+    )
+    parser.add_argument(
+        "--allocator-fit",
+        type=str,
+        default=None,
+        help="Path to allocator_fit.json from `python -m vla_lab.fit_allocator` (unlocks the query branch).",
+    )
+    parser.add_argument(
+        "--emit-calibration",
+        type=str,
+        default=None,
+        help="Write per-step calibration records (JSONL) for vla_lab.calibration.analyze.",
+    )
 
     # Defer adding Isaac AppLauncher args to after we know we want to launch.
     from isaaclab.app import AppLauncher  # type: ignore
@@ -365,6 +384,13 @@ def main() -> int:
     )
     ckpt_path = Path(args.ckpt or cfg.get("ckpt", "vla_lab/checkpoints/tiny_v0/last.pt"))
 
+    # Act/compute/query controller (HRI pivot). controller="none" keeps the legacy TTC path.
+    alloc_cfg = dict(cfg.get("allocation") or {})
+    controller_kind = str(args.controller if args.controller is not None else alloc_cfg.get("controller", "none")).lower().strip()
+    use_controller = controller_kind not in ("", "none")
+    allocator_fit_path = args.allocator_fit if args.allocator_fit is not None else alloc_cfg.get("fit_path")
+    emit_calibration = args.emit_calibration if args.emit_calibration is not None else alloc_cfg.get("emit_calibration")
+
     policy_backend = str(args.policy_backend or cfg.get("policy_backend", "tiny")).lower().strip()
     if policy_backend not in ("tiny", "smolvla"):
         print(f"[eval] ERROR: unknown policy_backend {policy_backend!r} (use tiny or smolvla)")
@@ -446,6 +472,7 @@ def main() -> int:
     from vla_lab.dataset import TinyTokenizer
     from vla_lab.partial_obs import apply_occlusion_rgb_chw
     from vla_lab.smolvla_bridge.action_obs_contract import pack_state_xyz_quat
+    from vla_lab.calibration.records import CalibrationRecord, write_jsonl
 
     # ------------------------------------------------------------------
     # Load policy (TinyVLA ckpt or SmolVLA Hub / directory)
@@ -498,6 +525,29 @@ def main() -> int:
             f"K_max={k_ttc}  selection={ttc_cfg_dict.get('selection', ttc_cfg_dict.get('scoring', 'naive_consensus'))}  "
             f"gating={ttc_cfg_dict.get('gating', 'none')}"
         )
+
+    # Build the act/compute/query controller harness over the loaded policy (if requested).
+    harness = None
+    if use_controller:
+        from vla_lab.allocation.isaac_glue import build_eval_harness
+
+        tiny_objs = None
+        if policy_backend == "tiny":
+            tiny_objs = {"model": model, "tokenizer": tokenizer, "action_stats": action_stats}
+        harness = build_eval_harness(
+            controller_kind=controller_kind,
+            policy_backend=policy_backend,
+            tiny=tiny_objs,
+            smol=smol_policy,
+            device=device,
+            ttc_cfg=ttc_cfg_dict,
+            alloc_cfg=alloc_cfg,
+            fit_path=str(allocator_fit_path) if allocator_fit_path else None,
+        )
+        print(f"[eval] controller={controller_kind!r}  fit={allocator_fit_path}  emit_calibration={emit_calibration}")
+
+    calib_records: List[Any] = []
+    run_id = f"{policy_backend}_{controller_kind}_{int(time.time())}"
 
     infer_image_size = int(tiny_model_cfg_obj.image_size) if policy_backend == "tiny" else 224
 
@@ -695,6 +745,22 @@ def main() -> int:
             )
         print(f"[eval][EP {ep}] target={leaf!r}  instruction={instruction!r}")
 
+        # Per-episode allocator state: query options (object descriptions) + the oracle target.
+        ep_decisions: List[Tuple[int, Any]] = []
+        policy_tick_idx = 0
+        ep_options: List[str] = []
+        ep_oracle: Optional[str] = None
+        if harness is not None:
+            try:
+                for sp in sorted([str(p) for p in spawned_paths]):
+                    desc, c, _bidx = _box_desc_from_prim(sp, BOX_COLORS)
+                    ep_options.append(c or desc)
+                tgt_desc, tgt_color, _ = _box_desc_from_prim(target_prim, BOX_COLORS)
+                ep_oracle = tgt_color or tgt_desc
+            except Exception:
+                ep_options, ep_oracle = [], None
+            harness.set_oracle(ep_oracle)
+
         ids = attn = None
         if policy_backend == "tiny":
             assert tokenizer is not None
@@ -770,7 +836,25 @@ def main() -> int:
                 gx = 1.0 if _gripper_state().startswith("o") else 0.0
 
                 with torch.no_grad():
-                    if policy_backend == "tiny":
+                    if harness is not None:
+                        # Act/compute/query controller path (HRI pivot).
+                        if policy_backend == "tiny":
+                            assert tiny_model_cfg_obj is not None
+                            state_t = torch.tensor(
+                                list(pos_b) + [gx] + [0.0] * max(0, tiny_model_cfg_obj.state_dim - 4),
+                                dtype=torch.float32,
+                                device=device,
+                            )[: tiny_model_cfg_obj.state_dim]
+                            obs_h = {"image": rgb_used, "state": state_t, "occlusion_fraction": float(occ_frac)}
+                        else:
+                            st6 = torch.from_numpy(pack_state_xyz_quat(pos_b, quat_b)).to(device)
+                            obs_h = {"image": rgb_used, "state": st6, "occlusion_fraction": float(occ_frac)}
+                        decision = harness.decide(
+                            obs_h, instruction=instruction, options=ep_options or None, oracle_answer=ep_oracle
+                        )
+                        chunk_phys = decision.chunk
+                        ep_decisions.append((policy_tick_idx, decision))
+                    elif policy_backend == "tiny":
                         assert pipeline is not None and tiny_model_cfg_obj is not None and ids is not None
                         state_t = torch.tensor(
                             list(pos_b) + [gx] + [0.0] * max(0, tiny_model_cfg_obj.state_dim - 4),
@@ -801,6 +885,7 @@ def main() -> int:
                                 instruction=instruction,
                             )
                 policy.set_chunk(chunk_phys)
+                policy_tick_idx += 1
 
             # Mode hint (gripper vs translate) drives controller mode.
             try:
@@ -858,6 +943,24 @@ def main() -> int:
         )
         smol_latencies_all.extend(smol_latencies)
 
+        # Backfill per-step calibration records with the episode outcome (sim correctness proxy).
+        if harness is not None and ep_decisions:
+            for st_idx, dec in ep_decisions:
+                calib_records.append(
+                    CalibrationRecord.from_decision(
+                        dec,
+                        run_id=run_id,
+                        episode_idx=ep,
+                        step_idx=st_idx,
+                        occlusion_mode=occ_mode,
+                        occlusion_fraction=float(occ_frac),
+                        correct=bool(success),
+                        success=bool(success),
+                        target_leaf=leaf,
+                        instruction=instruction,
+                    )
+                )
+
         # Reset robot for next episode.
         try:
             policy.reset()
@@ -885,6 +988,10 @@ def main() -> int:
         "occlusion": {"mode": occ_mode, "fraction": float(occ_frac)},
         "ttc": ttc_cfg_dict,
         "ttc_aggregate": _aggregate_ttc_latencies(ttc_rows_all),
+        "controller": controller_kind if use_controller else None,
+        "controller_aggregate": harness.aggregate() if harness is not None else {},
+        "allocator_fit": str(allocator_fit_path) if allocator_fit_path else None,
+        "emit_calibration": str(emit_calibration) if emit_calibration else None,
         "provenance": {
             "git_commit": _try_git_commit(ROOT),
             "repo_root": str(ROOT.resolve()),
@@ -905,6 +1012,17 @@ def main() -> int:
     if summary.get("provenance", {}).get("git_commit"):
         print(f"[eval] git_commit={summary['provenance']['git_commit']}")
     print(f"[eval] wrote {out_file}")
+
+    if harness is not None:
+        agg = harness.aggregate()
+        print(
+            f"[eval] controller={controller_kind}  act={agg.get('frac_act')}  compute={agg.get('frac_compute')}  "
+            f"query={agg.get('frac_query')}  query_rate={agg.get('query_rate')}  k_mean={agg.get('k_mean')}"
+        )
+    if emit_calibration and calib_records:
+        cpath = Path(emit_calibration)
+        write_jsonl(calib_records, cpath)
+        print(f"[eval] wrote {len(calib_records)} calibration records to {cpath}")
 
     if pipeline is not None:
         pipeline.close()

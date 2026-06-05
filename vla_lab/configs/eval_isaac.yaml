@@ -52,3 +52,20 @@ ttc:
   include_deterministic_candidate: false
   log_jsonl: null
   latency_log: null
+
+# Act/compute/query controller (HRI-2027 pivot; see project_pivot_VLA_HRI2027.md + README §7).
+# `controller: none` keeps the legacy TTC path above. Any other value routes each policy tick
+# through vla_lab/allocation (the act/compute/query trichotomy). CLI overrides:
+# --controller, --allocator-fit, --emit-calibration.
+allocation:
+  controller: none          # none | autonomy | fixed_compute | compute_gated | scale | knowno | insight | allocator
+  fit_path: null            # allocator_fit.json from `python -m vla_lab.fit_allocator` (unlocks query / INSIGHT / KnowNo)
+  emit_calibration: null    # JSONL path: write per-step calibration records for vla_lab.calibration.analyze
+  # Query interface used when a controller escalates to a human:
+  query_interface: scripted # scripted = sim oracle (uses the episode's true target); stdin = autonomous console prompt (real robot)
+  query_accuracy: 1.0       # scripted-only: P(simulated human answers correctly)
+  query_latency_s: 3.0      # scripted-only: simulated interruption cost (s)
+  # Uncertainty-type transparency (study condition 4 vs 5). Leave enabled:false for the robot-only runs.
+  transparency:
+    enabled: false
+    signal_type: false      # false: magnitude-only ("unsure"); true: type-aware ("thinking…" vs "I can't see — which one?")
