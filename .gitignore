@@ -217,5 +217,8 @@ vla_lab/eval_results/
 # Draft paper (local; do not publish to GitHub)
 vla_lab/paper/
 
+# Claude local workspace (do not publish to GitHub)
+/claude/
+
 # python cache
 __pycache__/
