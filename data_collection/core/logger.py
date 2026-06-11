@@ -165,15 +165,22 @@ class SessionLogWriter:
             lin = torch.zeros(3, device=ee_pose_w.device)
             ang = torch.zeros(3, device=ee_pose_w.device)
 
-        # Gripper state: infer from finger joints if possible
+        # Gripper state: infer from the proximal finger joints only. The tip
+        # joints stay near 0 even when closed, and fingers stall well below the
+        # commanded close position (1.2 rad) when wrapped around an object, so
+        # averaging all "finger" joints against a 0.5 threshold never reports
+        # "close" during a real grasp. Proximal joints sit at ~0 when open and
+        # >= ~0.25 rad once a close is commanded (stalled or free).
         gr_state = "open"
         try:
             joint_pos = robot.data.joint_pos[0]
             names = robot.data.joint_names
-            idxs = [i for i, n in enumerate(names) if ("finger" in str(n))]
+            idxs = [
+                i for i, n in enumerate(names) if ("finger" in str(n) and "finger_tip" not in str(n))
+            ]
             if idxs:
                 vals = torch.tensor([joint_pos[i] for i in idxs], dtype=torch.float32)
-                gr_state = "close" if vals.mean().item() > 0.5 else "open"
+                gr_state = "close" if vals.mean().item() > 0.2 else "open"
         except Exception:
             pass
 

@@ -23,6 +23,7 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from .checkpoint_utils import torch_load_checkpoint
 from .models import TinyVLA, TinyVLAConfig
 from .ttc import TTCConfig, TTCPipeline
 
@@ -55,7 +56,7 @@ def main() -> int:
 
     # Build model.
     if args.ckpt:
-        ckpt = torch.load(args.ckpt, map_location=device)
+        ckpt = torch_load_checkpoint(args.ckpt, map_location=device)
         cfg = TinyVLAConfig.from_dict(ckpt["model_config"])
         model = TinyVLA(cfg).to(device)
         model.load_state_dict(ckpt["model_state"], strict=True)

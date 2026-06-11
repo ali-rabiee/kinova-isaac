@@ -17,15 +17,29 @@ lerobot_dataset_root: null
 eval:
   num_episodes: 10
   max_steps_per_episode: 4000
-  policy_rate_hz: 5
+  # MUST match the collection `--log-rate-hz` of the training session:
+  # actions are EE deltas per 1/log_rate_hz tick (collect.sh = 5, collect_v3.sh = 15).
+  policy_rate_hz: 15
+  # Rate the training actions were logged at. If it differs from
+  # policy_rate_hz, eval rescales action deltas by train/policy to preserve
+  # demo EE speed (and warns). Keep both equal when possible.
+  train_action_rate_hz: 15
   device: cuda:0
-  # Spawn settings (mirrors `vla_v1` defaults so eval matches collection).
-  num_objects: 3
+  # Spawn settings (mirrors `collect_v3.sh` so eval matches collection).
+  num_objects: 6
   spawn_mode: box       # 'usd' for YCB, 'box' for uniform cubes (recommended for eval)
   box_size: 0.08
-  spawn_min: [0.28, -0.30, 0.90]
-  spawn_max: [0.55, 0.30, 1.05]
-  min_distance: 0.20
+  spawn_min: [0.26, -0.34, 0.89]
+  spawn_max: [0.52, 0.36, 1.06]
+  min_distance: 0.16
+  # Per-action safety clamps (per policy interval). Generous bounds a sane
+  # policy never hits — they turn runaway commands into logged clamp events.
+  max_action_dpos_m: 0.06
+  max_action_drot_rad: 0.30
+  # Scripted pre-roll target: drive the EE here (base frame) before the policy
+  # takes over. Matches the training session's tick-0 EE pose so the first
+  # observation is in-distribution. Set null to disable.
+  start_ee_pos_b: [0.454, 0.093, 0.210]
   ee_link: j2n6s300_end_effector
   workspace_min_z: 0.0
   workspace_max_z: 1.20

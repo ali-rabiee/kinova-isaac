@@ -6,7 +6,10 @@
 data:
   data_roots:
     # Single session only (avoid mixing other logs/data_collection/session_* runs).
-    - logs/data_collection/session_20260506_232450
+    # NOTE: collected at 15 Hz (collect_v3.sh) — eval policy_rate_hz must match.
+    # Run `python -m vla_lab.repair_gripper_labels --session <dir>` on sessions
+    # collected before the 2026-06 gripper-state logger fix.
+    - logs/data_collection/session_20260607_115038
   image_size: 224
   chunk_len: 8
   state_dim: 4

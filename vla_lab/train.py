@@ -9,7 +9,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import inspect
 import json
 import math
 import random
@@ -38,6 +37,7 @@ from .dataset import (
     discover_episodes,
     split_episodes,
 )
+from .checkpoint_utils import torch_load_checkpoint
 from .losses import FeatureAlignmentConfig, FeatureAlignmentLoss, masked_action_loss
 from .models import TinyVLA, TinyVLAConfig
 
@@ -67,13 +67,6 @@ def _build_lr_scheduler(opt: torch.optim.Optimizer, total_steps: int, warmup: in
         return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
 
     return torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=fn)
-
-
-def _torch_load_checkpoint(path: Path, map_location: torch.device) -> Dict[str, Any]:
-    kwargs: Dict[str, Any] = {"map_location": map_location}
-    if "weights_only" in inspect.signature(torch.load).parameters:  # PyTorch >= 2.0
-        kwargs["weights_only"] = False
-    return torch.load(str(path), **kwargs)
 
 
 def _rng_state_payload() -> Dict[str, Any]:
@@ -420,7 +413,7 @@ def main() -> int:
             print(f"[train] ERROR: resume path not found: {resume_path}")
             return 2
         print(f"[train] loading checkpoint: {resume_path}")
-        ckpt = _torch_load_checkpoint(resume_path, map_location=device)
+        ckpt = torch_load_checkpoint(resume_path, map_location=device)
         meta = ckpt.get("train_meta") or {}
         mismatch = False
         if meta.get("total_steps") is not None and int(meta["total_steps"]) != total_steps:

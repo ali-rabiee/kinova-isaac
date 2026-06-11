@@ -586,6 +586,27 @@ Each run writes a `results_<unix_ts>.json` under `eval.out_dir` with:
 Toggle K-sample TTC by editing `ttc.k_action_samples` in
 `vla_lab/configs/eval_isaac.yaml` (1 = no TTC, 4 = the spec's default).
 
+#### Debugging erratic eval behavior
+
+- `eval.policy_rate_hz` **must equal the collection `--log-rate-hz`** of the
+  training session (`collect.sh` = 5 Hz, `collect_v3.sh` = 15 Hz; check the
+  session's `episode_*/metadata.json`). Actions are EE deltas *per logged
+  tick*; running eval at a different rate replays them at the wrong speed.
+  `eval.train_action_rate_hz` lets eval rescale (with a warning) if they differ.
+- `--debug-actions` logs per-policy-tick action magnitudes + EE positions to
+  `out_dir/debug_actions_*.jsonl` and the console.
+- `--replay-episode logs/data_collection/session_X/episode_0000` runs an
+  **open-loop replay** of a recorded episode through the controller (no
+  policy). If replay is smooth and roughly tracks the demo, the execution
+  path is healthy and problems are on the model/observation side.
+- `eval.max_action_dpos_m` / `eval.max_action_drot_rad` clamp runaway
+  per-action deltas and report how often they trigger.
+- Sessions collected before the 2026-06 gripper-state fix log every tick as
+  `open` (the detector averaged finger *tip* joints and used too high a
+  threshold, so stalled-on-object grasps never registered). Repair them with
+  `python -m vla_lab.repair_gripper_labels --session <session_dir>` before
+  training.
+
 ## 6. Action / observation contract
 
 This is what the dataset, model, and eval all agree on. Keep this stable

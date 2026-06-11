@@ -129,6 +129,24 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Write per-step calibration records (JSONL) for vla_lab.calibration.analyze.",
     )
+    parser.add_argument(
+        "--policy-rate-hz",
+        type=int,
+        default=None,
+        help="Override yaml eval.policy_rate_hz (should match the collection log rate).",
+    )
+    parser.add_argument(
+        "--debug-actions",
+        action="store_true",
+        help="Log per-policy-tick action magnitudes and EE positions (JSONL in out_dir + console).",
+    )
+    parser.add_argument(
+        "--replay-episode",
+        type=str,
+        default=None,
+        help="Open-loop replay: path to a collected episode_XXXX dir; feeds its recorded "
+        "action_from_prev sequence through the controller, bypassing the policy.",
+    )
 
     # Defer adding Isaac AppLauncher args to after we know we want to launch.
     from isaaclab.app import AppLauncher  # type: ignore
@@ -267,11 +285,22 @@ class PolicyInputProvider:
         policy_rate_hz: int,
         device: str,
         chunk_consume: int = 1,
+        action_scale: float = 1.0,
+        max_action_dpos_m: Optional[float] = None,
+        max_action_drot_rad: Optional[float] = None,
     ) -> None:
         self.physics_dt = float(physics_dt)
         self.policy_rate_hz = int(policy_rate_hz)
         self.device = device
         self.chunk_consume = max(1, int(chunk_consume))
+        # Rescale for train/eval action-rate mismatch (train_rate / policy_rate),
+        # applied to the 6 continuous dims so executed EE speed matches the demos.
+        self.action_scale = float(action_scale)
+        # Per-action safety clamps (per policy interval). Generous bounds that a
+        # sane policy never hits; they exist to turn "seizure" into a logged event.
+        self.max_action_dpos_m = max_action_dpos_m
+        self.max_action_drot_rad = max_action_drot_rad
+        self.clamp_count = 0
 
         # number of physics steps per policy action interval
         self._n_phys_per_action = max(1, int(round(1.0 / (self.policy_rate_hz * self.physics_dt))))
@@ -297,9 +326,26 @@ class PolicyInputProvider:
         return self._chunk is None or self._action_idx >= min(self.chunk_consume, self._chunk.size(0))
 
     def set_chunk(self, chunk_actions: "torch.Tensor") -> None:
-        """Provide a new (T, A) action chunk in *physical* (denormalised) units."""
+        """Provide a new (T, A) action chunk in *physical* (denormalised) units.
 
-        self._chunk = chunk_actions
+        Applies the train/eval rate rescale and the per-action safety clamps
+        before the chunk is executed.
+        """
+
+        chunk = chunk_actions.clone()
+        if abs(self.action_scale - 1.0) > 1e-9:
+            chunk[:, :6] = chunk[:, :6] * self.action_scale
+        if self.max_action_dpos_m is not None:
+            norms = chunk[:, :3].norm(dim=-1, keepdim=True)
+            factor = (float(self.max_action_dpos_m) / norms.clamp_min(1e-9)).clamp(max=1.0)
+            self.clamp_count += int((factor < 1.0).sum().item())
+            chunk[:, :3] = chunk[:, :3] * factor
+        if self.max_action_drot_rad is not None:
+            norms = chunk[:, 3:6].norm(dim=-1, keepdim=True)
+            factor = (float(self.max_action_drot_rad) / norms.clamp_min(1e-9)).clamp(max=1.0)
+            self.clamp_count += int((factor < 1.0).sum().item())
+            chunk[:, 3:6] = chunk[:, 3:6] * factor
+        self._chunk = chunk
         self._action_idx = 0
         self._phys_in_action = 0
         self._gripper_flush_steps = 0
@@ -364,6 +410,21 @@ class PolicyInputProvider:
         return self._last_cmd
 
 
+class _FixedCmdProvider:
+    """Input provider that returns a fixed per-step command (scripted pre-roll)."""
+
+    def __init__(self, device: str) -> None:
+        self.device = device
+        self.cmd: Optional[Any] = None
+
+    def advance(self) -> "torch.Tensor":
+        import torch as _torch
+
+        if self.cmd is None:
+            return _torch.zeros(1, 7, device=self.device)
+        return self.cmd
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -399,7 +460,27 @@ def main() -> int:
     lerobot_root_cfg = args.lerobot_dataset_root or cfg.get("lerobot_dataset_root")
     lerobot_dataset_root: Optional[Path] = Path(lerobot_root_cfg).resolve() if lerobot_root_cfg else None
 
-    if policy_backend == "tiny":
+    # Open-loop replay mode: bypass the policy and execute a recorded episode's
+    # action sequence (the gold-standard execution-path diagnostic).
+    replay_dir: Optional[Path] = Path(args.replay_episode).resolve() if args.replay_episode else None
+    replay_meta_rate: Optional[int] = None
+    if replay_dir is not None:
+        if not (replay_dir / "ticks.jsonl").exists():
+            print(f"[eval] ERROR: --replay-episode {replay_dir} has no ticks.jsonl")
+            return 2
+        meta_path = replay_dir / "metadata.json"
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text())
+                replay_meta_rate = int(meta.get("config", {}).get("log_rate_hz"))
+            except Exception:
+                replay_meta_rate = None
+        eval_cfg["num_episodes"] = 1
+        print(f"[eval][REPLAY] open-loop replay of {replay_dir} (policy is bypassed)")
+
+    if replay_dir is not None:
+        pass  # replay needs no policy/checkpoint
+    elif policy_backend == "tiny":
         if not ckpt_path.exists():
             print(f"[eval] ERROR: checkpoint not found: {ckpt_path}")
             return 2
@@ -487,12 +568,16 @@ def main() -> int:
 
     tiny_ttc_latencies: List[Dict[str, Any]] = []
 
-    if policy_backend == "tiny":
+    if replay_dir is not None:
+        print("[eval][REPLAY] skipping policy load")
+    elif policy_backend == "tiny":
         from vla_lab.dataset import ActionStats
         from vla_lab.models import TinyVLA, TinyVLAConfig
         from vla_lab.ttc import TTCConfig, TTCPipeline
 
-        ckpt = torch.load(str(ckpt_path), map_location=device)
+        from vla_lab.checkpoint_utils import torch_load_checkpoint
+
+        ckpt = torch_load_checkpoint(ckpt_path, map_location=device)
         tiny_model_cfg_obj = TinyVLAConfig.from_dict(ckpt["model_config"])
         model = TinyVLA(tiny_model_cfg_obj).to(device)
         model.load_state_dict(ckpt["model_state"], strict=True)
@@ -528,6 +613,9 @@ def main() -> int:
 
     # Build the act/compute/query controller harness over the loaded policy (if requested).
     harness = None
+    if use_controller and replay_dir is not None:
+        print("[eval][REPLAY] ignoring allocation controller during replay")
+        use_controller = False
     if use_controller:
         from vla_lab.allocation.isaac_glue import build_eval_harness
 
@@ -549,7 +637,7 @@ def main() -> int:
     calib_records: List[Any] = []
     run_id = f"{policy_backend}_{controller_kind}_{int(time.time())}"
 
-    infer_image_size = int(tiny_model_cfg_obj.image_size) if policy_backend == "tiny" else 224
+    infer_image_size = int(tiny_model_cfg_obj.image_size) if tiny_model_cfg_obj is not None else 224
 
     # ------------------------------------------------------------------
     # Build sim + scene
@@ -604,20 +692,25 @@ def main() -> int:
     spawned_paths = loader.spawn(parent_prim_path="/World/Origin1", num_objects=int(eval_cfg.get("num_objects", 3)))
     print(f"[eval] spawned {len(spawned_paths)} objects: {spawned_paths}")
 
-    # Camera sensor (only if enabled).
+    # Camera sensor (only if enabled). `spawn=None` attaches to the prim that
+    # `create_topdown_camera` already made (same pattern as vla_v1) — without
+    # it CameraCfg validation fails and eval silently runs on black images.
     camera_sensor: Optional[Camera] = None
     if enable_cameras and DEFAULT_TOP_DOWN_CAMERA is not None:
         try:
             cam_cfg = CameraCfg(
                 prim_path=DEFAULT_TOP_DOWN_CAMERA.prim_path,
+                offset=CameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
+                spawn=None,
                 width=DEFAULT_TOP_DOWN_CAMERA.resolution[0],
                 height=DEFAULT_TOP_DOWN_CAMERA.resolution[1],
                 update_period=0.0,
                 data_types=["rgb"],
             )
             camera_sensor = Camera(cfg=cam_cfg)
+            print(f"[eval] camera sensor attached: {cam_cfg.width}x{cam_cfg.height} at {DEFAULT_TOP_DOWN_CAMERA.prim_path}")
         except Exception as e:
-            print(f"[eval] could not create Camera sensor: {e}; continuing without images.")
+            print(f"[eval] ERROR: could not create Camera sensor: {e}; policy will see BLACK images.")
             camera_sensor = None
 
     # Reset sim + robot
@@ -647,11 +740,39 @@ def main() -> int:
 
     physics_dt = float(sim.get_physics_dt())
     policy_rate_hz = int(eval_cfg.get("policy_rate_hz", 5))
+    if args.policy_rate_hz is not None:
+        policy_rate_hz = int(args.policy_rate_hz)
+
+    # Actions are EE deltas per 1/log_rate_hz of the *collection* session. If
+    # eval runs at a different rate, rescale the deltas so EE speed matches the
+    # demos (prefer matching the rates outright).
+    action_scale = 1.0
+    if replay_meta_rate is not None:
+        policy_rate_hz = int(replay_meta_rate)
+        print(f"[eval][REPLAY] policy_rate_hz={policy_rate_hz} (from session metadata)")
+    else:
+        train_rate = eval_cfg.get("train_action_rate_hz")
+        if train_rate:
+            action_scale = float(train_rate) / float(policy_rate_hz)
+            if abs(action_scale - 1.0) > 1e-6:
+                print(
+                    f"[eval] WARNING: train_action_rate_hz={train_rate} != policy_rate_hz={policy_rate_hz}; "
+                    f"scaling action deltas by {action_scale:.3f} to preserve demo EE speed. "
+                    "Prefer setting policy_rate_hz to the collection log rate."
+                )
+
     policy = PolicyInputProvider(
         physics_dt=physics_dt,
         policy_rate_hz=policy_rate_hz,
         device=str(device),
         chunk_consume=int(eval_cfg.get("chunk_consume", 1)),
+        action_scale=action_scale,
+        max_action_dpos_m=(
+            float(eval_cfg["max_action_dpos_m"]) if eval_cfg.get("max_action_dpos_m") is not None else None
+        ),
+        max_action_drot_rad=(
+            float(eval_cfg["max_action_drot_rad"]) if eval_cfg.get("max_action_drot_rad") is not None else None
+        ),
     )
     controller.set_input_provider(policy)
 
@@ -683,16 +804,75 @@ def main() -> int:
         )
 
     def _gripper_state() -> str:
+        # Proximal finger joints only — tips stay near 0 and fingers stall well
+        # below the commanded close position when wrapped around an object
+        # (same fix as data_collection/core/logger.py, keeps train/eval aligned).
         try:
             joint_pos = robot.data.joint_pos[0]
             names = robot.data.joint_names
-            idxs = [i for i, n in enumerate(names) if "finger" in str(n)]
+            idxs = [i for i, n in enumerate(names) if ("finger" in str(n) and "finger_tip" not in str(n))]
             if idxs:
                 vals = torch.tensor([joint_pos[i] for i in idxs], dtype=torch.float32)
-                return "close" if vals.mean().item() > 0.5 else "open"
+                return "close" if vals.mean().item() > 0.2 else "open"
         except Exception:
             pass
         return "open"
+
+    # ------------------------------------------------------------------
+    # Replay actions + per-tick debug logging
+    # ------------------------------------------------------------------
+    replay_actions: Optional[List[Tuple[float, ...]]] = None
+    replay_targets: Optional[List[Tuple[float, float, float]]] = None
+    replay_instruction: Optional[str] = None
+    if replay_dir is not None:
+        from vla_lab.dataset import _parse_instruction, _parse_ticks
+
+        _rticks = _parse_ticks(replay_dir / "ticks.jsonl")
+        replay_actions = [t.action_from_prev for t in _rticks if t.action_from_prev is not None]
+        replay_targets = [t.ee_pos_b for t in _rticks if t.action_from_prev is not None]
+        replay_instruction, _ = _parse_instruction(replay_dir)
+        if not replay_actions:
+            print(f"[eval] ERROR: no action_from_prev records in {replay_dir}/ticks.jsonl")
+            simulation_app.close()
+            return 2
+        n_grip = sum(1 for a in replay_actions if abs(float(a[6])) > 0.5)
+        print(f"[eval][REPLAY] {len(replay_actions)} recorded actions ({n_grip} gripper)  instruction={replay_instruction!r}")
+
+    debug_fp = None
+    if bool(args.debug_actions):
+        debug_path = out_dir / f"debug_actions_{int(time.time())}.jsonl"
+        debug_fp = open(debug_path, "a", buffering=1)
+        print(f"[eval] --debug-actions: writing per-tick logs to {debug_path}")
+
+    def _debug_log_tick(*, ep: int, tick: int, chunk_phys: Any, source: str, chunk_norm: Any = None) -> None:
+        if debug_fp is None:
+            return
+        try:
+            pos_now, _ = _ee_pose_b()
+            ch = chunk_phys.detach().to("cpu")
+            dp = ch[:, :3].norm(dim=-1)
+            dr = ch[:, 3:6].norm(dim=-1)
+            rec: Dict[str, Any] = {
+                "ep": int(ep),
+                "tick": int(tick),
+                "source": source,
+                "ee_pos_b": [round(float(v), 4) for v in pos_now],
+                "dpos_mm": {"mean": round(float(dp.mean()) * 1000, 2), "max": round(float(dp.max()) * 1000, 2)},
+                "drot_rad_max": round(float(dr.max()), 4),
+                "gripper": {"min": round(float(ch[:, 6].min()), 3), "max": round(float(ch[:, 6].max()), 3)},
+                "clamp_count": int(policy.clamp_count),
+            }
+            if chunk_norm is not None:
+                rec["norm_absmax"] = round(float(chunk_norm.detach().abs().max()), 3)
+            debug_fp.write(json.dumps(rec) + "\n")
+            if tick < 10 or tick % 25 == 0:
+                print(
+                    f"[dbg][EP {ep} t{tick}] ee=({pos_now[0]:.3f},{pos_now[1]:.3f},{pos_now[2]:.3f})  "
+                    f"|dpos|max={float(dp.max()) * 1000:.1f}mm  |drot|max={float(dr.max()):.4f}rad  "
+                    f"g=[{float(ch[:, 6].min()):.2f},{float(ch[:, 6].max()):.2f}]  clamps={policy.clamp_count}"
+                )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Episode loop
@@ -743,6 +923,8 @@ def main() -> int:
                 box_idx=box_idx,
                 rng_seed=int(eval_cfg.get("language_seed", 1337)),
             )
+        if replay_dir is not None:
+            instruction = replay_instruction or instruction
         print(f"[eval][EP {ep}] target={leaf!r}  instruction={instruction!r}")
 
         # Per-episode allocator state: query options (object descriptions) + the oracle target.
@@ -762,21 +944,90 @@ def main() -> int:
             harness.set_oracle(ep_oracle)
 
         ids = attn = None
-        if policy_backend == "tiny":
-            assert tokenizer is not None
+        if policy_backend == "tiny" and tokenizer is not None:
             ids, attn = tokenizer.encode(instruction)
             ids = ids.to(device)
             attn = attn.to(device)
 
-        # Settle a few sim steps before evaluation.
-        for _ in range(60):
+        # Reset the robot to its default state, then settle with the controller
+        # actively holding the arm (mirrors vla_v1's settle loop). A bare
+        # `sim.step()` loop leaves the arm without fresh drive targets or
+        # gravity compensation, so it sags/swings during the settle and the
+        # first policy step then fights a large stale-orientation IK error —
+        # which looks like violent flailing the moment the policy loop starts.
+        root_state = robot.data.default_root_state.clone()
+        robot.write_root_pose_to_sim(root_state[:, :7])
+        robot.write_root_velocity_to_sim(root_state[:, 7:])
+        robot.write_joint_state_to_sim(robot.data.default_joint_pos, robot.data.default_joint_vel)
+        robot.reset()
+        policy.reset()
+        # Step once so robot.data (body poses, jacobians) reflects the written
+        # state before the controller captures its hold orientation — resetting
+        # the controller on stale buffers makes the settle drag the arm toward a
+        # bogus pre-reset pose (vla_v1 does the same single step).
+        sim.step(render=False)
+        robot.update(physics_dt)
+        controller.reset(robot)
+        controller.set_mode("translate")
+        for settle_i in range(60):
+            if not simulation_app.is_running():
+                break
+            controller.step(robot, physics_dt)
             sim.step(render=False)
             robot.update(physics_dt)
-        if camera_sensor is not None:
-            try:
-                camera_sensor.update(physics_dt)
-            except Exception:
-                pass
+        # Re-capture IK state + hold orientation from the *settled* pose.
+        controller.reset(robot)
+        controller.set_mode("translate")
+
+        # Scripted pre-roll: drive the EE to the demos' start pose before the
+        # policy (or replay) takes over. The collection pipeline's setup leaves
+        # the arm at a different pose than a plain settle, so without this the
+        # first observation is out of distribution and open-loop replay carries
+        # a constant offset.
+        start_pos_cfg = eval_cfg.get("start_ee_pos_b")
+        if start_pos_cfg is not None:
+            tgt = [float(v) for v in start_pos_cfg]
+            preroll = _FixedCmdProvider(device=str(device))
+            controller.set_input_provider(preroll)
+            pre_steps = 0
+            for _ in range(900):  # <= ~3.75 s sim at 240 Hz
+                if not simulation_app.is_running():
+                    break
+                cur, _ = _ee_pose_b()
+                err = [tgt[k] - cur[k] for k in range(3)]
+                dist = math.sqrt(sum(e * e for e in err))
+                if dist < 0.005:
+                    break
+                step_m = min(0.002, dist)  # <= ~0.5 m/s
+                cmd = torch.zeros(1, 7, device=device)
+                for k in range(3):
+                    cmd[0, k] = step_m * err[k] / dist
+                preroll.cmd = cmd
+                controller.step(robot, physics_dt)
+                sim.step(render=False)
+                robot.update(physics_dt)
+                pre_steps += 1
+            controller.set_input_provider(policy)
+            controller.reset(robot)
+            controller.set_mode("translate")
+            if debug_fp is not None:
+                print(f"[dbg][EP {ep}] pre-roll {pre_steps} steps to start_ee_pos_b={tgt}")
+
+        # A few rendered hold steps so the camera has fresh frames at tick 0.
+        for _ in range(4):
+            if not simulation_app.is_running():
+                break
+            controller.step(robot, physics_dt)
+            sim.step(render=True)
+            robot.update(physics_dt)
+            if camera_sensor is not None:
+                try:
+                    camera_sensor.update(physics_dt)
+                except Exception:
+                    pass
+        if debug_fp is not None:
+            _pos_dbg, _ = _ee_pose_b()
+            print(f"[dbg][EP {ep}] settled EE pos_b=({_pos_dbg[0]:.3f}, {_pos_dbg[1]:.3f}, {_pos_dbg[2]:.3f})")
 
         # Capture initial target z for success check.
         snap = tracker.snapshot()
@@ -789,11 +1040,26 @@ def main() -> int:
         steps = 0
         ep_t0 = time.time()
         smol_latencies: List[Dict[str, Any]] = []
+        replay_idx = 0
+        replay_errs: List[float] = []
         while simulation_app.is_running() and steps < max_steps_ep:
             steps += 1
 
             # Refresh policy chunk at the policy rate.
-            if policy.needs_new_chunk():
+            if replay_actions is not None and policy.needs_new_chunk():
+                # Open-loop replay: feed the next recorded action, tracking how
+                # far execution drifts from the recorded EE trajectory.
+                if replay_idx >= len(replay_actions):
+                    break
+                if replay_idx > 0 and replay_targets is not None:
+                    _cur, _ = _ee_pose_b()
+                    replay_errs.append(math.dist(_cur, replay_targets[replay_idx - 1]))
+                chunk_phys = torch.tensor(replay_actions[replay_idx], dtype=torch.float32, device=device).view(1, 7)
+                replay_idx += 1
+                policy.set_chunk(chunk_phys)
+                policy_tick_idx += 1
+                _debug_log_tick(ep=ep, tick=policy_tick_idx - 1, chunk_phys=chunk_phys, source="replay")
+            elif policy.needs_new_chunk():
                 # Build observation tensors.
                 if camera_sensor is not None:
                     try:
@@ -811,6 +1077,8 @@ def main() -> int:
                     rgb_t = rgb_t.float()
                     if rgb_t.max() > 1.5:
                         rgb_t = rgb_t / 255.0
+                    if rgb_t.dim() == 3 and rgb_t.shape[-1] == 4:
+                        rgb_t = rgb_t[..., :3]  # some Isaac versions return RGBA
                     if rgb_t.shape[-1] == 3 and rgb_t.dim() == 3:
                         rgb_t = rgb_t.permute(2, 0, 1).contiguous()
                     rgb_t = torch.nn.functional.interpolate(
@@ -835,6 +1103,7 @@ def main() -> int:
                 pos_b, quat_b = _ee_pose_b()
                 gx = 1.0 if _gripper_state().startswith("o") else 0.0
 
+                chunk_norm_dbg = None
                 with torch.no_grad():
                     if harness is not None:
                         # Act/compute/query controller path (HRI pivot).
@@ -862,6 +1131,7 @@ def main() -> int:
                             device=device,
                         )[: tiny_model_cfg_obj.state_dim]
                         chunk = pipeline.predict_action_chunk(rgb_used, state_t, ids, attn)
+                        chunk_norm_dbg = chunk
                         chunk_phys = chunk
                         if action_stats is not None:
                             chunk_phys = action_stats.denormalize(chunk.detach().cpu()).to(device)
@@ -886,6 +1156,13 @@ def main() -> int:
                             )
                 policy.set_chunk(chunk_phys)
                 policy_tick_idx += 1
+                _debug_log_tick(
+                    ep=ep,
+                    tick=policy_tick_idx - 1,
+                    chunk_phys=chunk_phys,
+                    source=policy_backend,
+                    chunk_norm=chunk_norm_dbg,
+                )
 
             # Mode hint (gripper vs translate) drives controller mode.
             try:
@@ -937,6 +1214,20 @@ def main() -> int:
             if len(lat_totals) > 0
             else None,
         }
+        if replay_actions is not None:
+            result["replay_episode"] = str(replay_dir)
+            result["replay_actions_executed"] = int(replay_idx)
+            if replay_errs:
+                result["replay_track_err_mean_m"] = float(statistics.mean(replay_errs))
+                result["replay_track_err_max_m"] = float(max(replay_errs))
+                print(
+                    f"[eval][REPLAY] executed {replay_idx}/{len(replay_actions)} actions  "
+                    f"EE tracking error mean={statistics.mean(replay_errs) * 1000:.1f}mm  "
+                    f"max={max(replay_errs) * 1000:.1f}mm"
+                )
+        if policy.clamp_count:
+            result["action_clamp_count"] = int(policy.clamp_count)
+            print(f"[eval][EP {ep}] WARNING: safety clamps triggered {policy.clamp_count}x (see max_action_dpos_m/max_action_drot_rad)")
         ep_results.append(result)
         print(
             f"[eval][EP {ep}] success={success}  steps={steps}  z0={z0_target}  z_after={z_after}  elapsed={elapsed:.1f}s"
@@ -961,13 +1252,8 @@ def main() -> int:
                     )
                 )
 
-        # Reset robot for next episode.
-        try:
-            policy.reset()
-            controller.reset(robot)
-            controller.set_mode("translate")
-        except Exception:
-            pass
+        # Robot/controller are reset at the start of the next episode (see the
+        # powered-settle block above), so nothing to do here.
 
     # ------------------------------------------------------------------
     # Save results
@@ -982,7 +1268,11 @@ def main() -> int:
         "num_success": int(sum(1 for r in ep_results if r["success"])),
         "success_rate": float(sum(1 for r in ep_results if r["success"]) / max(1, len(ep_results))),
         "ckpt": str(ckpt_path),
-        "policy_backend": policy_backend,
+        "policy_backend": policy_backend if replay_dir is None else "replay",
+        "replay_episode": str(replay_dir) if replay_dir else None,
+        "policy_rate_hz": int(policy_rate_hz),
+        "action_scale": float(action_scale),
+        "action_clamp_count": int(policy.clamp_count),
         "lerobot_dataset_root": str(lerobot_dataset_root) if lerobot_dataset_root else None,
         "observability_mode": observability_mode,
         "occlusion": {"mode": occ_mode, "fraction": float(occ_frac)},
@@ -1024,6 +1314,11 @@ def main() -> int:
         write_jsonl(calib_records, cpath)
         print(f"[eval] wrote {len(calib_records)} calibration records to {cpath}")
 
+    if debug_fp is not None:
+        try:
+            debug_fp.close()
+        except Exception:
+            pass
     if pipeline is not None:
         pipeline.close()
     simulation_app.close()

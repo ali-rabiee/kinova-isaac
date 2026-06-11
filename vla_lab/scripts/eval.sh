@@ -9,10 +9,18 @@ cd "${REPO_ROOT}"
 
 CONFIG="${CONFIG:-vla_lab/configs/eval_isaac.yaml}"
 DEVICE="${DEVICE:-cuda:0}"
-ISAACLAB="${ISAACLAB:-./IsaacLab/isaaclab.sh}"
 
-if [[ ! -x "${ISAACLAB}" ]]; then
-  echo "[eval] ${ISAACLAB} not found or not executable. Set ISAACLAB= to your isaaclab.sh path." >&2
+if [[ -z "${ISAACLAB:-}" ]]; then
+  for candidate in "./IsaacLab/isaaclab.sh" "${HOME}/IsaacLab/isaaclab.sh"; do
+    if [[ -x "${candidate}" ]]; then
+      ISAACLAB="${candidate}"
+      break
+    fi
+  done
+fi
+
+if [[ -z "${ISAACLAB:-}" || ! -x "${ISAACLAB}" ]]; then
+  echo "[eval] isaaclab.sh not found. Set ISAACLAB= to your isaaclab.sh path (e.g. ${HOME}/IsaacLab/isaaclab.sh)." >&2
   exit 1
 fi
 
