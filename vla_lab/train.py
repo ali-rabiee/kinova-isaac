@@ -196,9 +196,16 @@ def main() -> int:
 
     roots: List[Path] = [Path(p) for p in data_cfg.get("data_roots", ["logs/data_collection"])]
     print(f"[train] discovering episodes under: {[str(r) for r in roots]}")
-    episodes = discover_episodes(roots)
+    # Train on successful demonstrations only by default: failed/truncated episodes are
+    # several times longer than successful ones (stall/retry loops) and would dominate
+    # the frame count. Set data.success_only: false to include everything.
+    success_only = bool(data_cfg.get("success_only", True))
+    episodes = discover_episodes(roots, success_only=success_only)
     if not episodes:
         print("[train] ERROR: no episodes found. Run data collection first (see vla_lab/README.md).")
+        if success_only:
+            print("[train] note: data.success_only=true is filtering episodes; legacy sessions without")
+            print("[train] events.jsonl/episode_summary.json outcome records are dropped as 'unknown'.")
         return 2
     print(f"[train] found {len(episodes)} episodes, total ticks: {sum(len(e.ticks) for e in episodes)}")
 

@@ -67,7 +67,7 @@ ttc:
   log_jsonl: null
   latency_log: null
 
-# Act/compute/query controller (HRI-2027 pivot; see project_pivot_VLA_HRI2027.md + README §7).
+# Act/compute/query controller (HRI-2027 pivot; see README §7).
 # `controller: none` keeps the legacy TTC path above. Any other value routes each policy tick
 # through vla_lab/allocation (the act/compute/query trichotomy). CLI overrides:
 # --controller, --allocator-fit, --emit-calibration.

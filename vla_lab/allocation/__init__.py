@@ -1,7 +1,7 @@
 """Act / compute / query allocation for VLA policies under partial observability.
 
 This package implements the methodological core of the HRI-2027 pivot
-(`vla_lab/project_pivot_VLA_HRI2027.md`): inference-time decision-making for a
+(see the HRI-2027 pivot memo; removed from the repo — ask Kye): inference-time decision-making for a
 stochastic VLA policy is reframed from a **binary** (act vs. compute) gate into a
 **trichotomy**:
 

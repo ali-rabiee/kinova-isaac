@@ -5,11 +5,17 @@
 # collect across several runs - they will all be merged.
 data:
   data_roots:
-    # Single session only (avoid mixing other logs/data_collection/session_* runs).
-    # NOTE: collected at 15 Hz (collect_v3.sh) — eval policy_rate_hz must match.
+    # List the session(s) to train on. Only mix sessions with the SAME contract:
+    # log rate (15 Hz for collect_v3), camera config, and start pose.
+    # NOTE: sessions collected before 2026-06-11 are NOT compatible with new ones:
+    # the top-down camera moved (z 4.0 -> 2.2), respawn was frozen (single layout),
+    # and episodes contained a logged sag prefix. Prefer training purely on new data.
     # Run `python -m vla_lab.repair_gripper_labels --session <dir>` on sessions
     # collected before the 2026-06 gripper-state logger fix.
     - logs/data_collection/session_20260607_115038
+  # Train on successful demonstrations only (reads episode_summary.json / events.jsonl).
+  # Failed/truncated episodes are much longer than successful ones and would dominate.
+  success_only: true
   image_size: 224
   chunk_len: 8
   state_dim: 4

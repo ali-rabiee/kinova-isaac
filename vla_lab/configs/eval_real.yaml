@@ -27,5 +27,5 @@ eval:
   num_episodes: 30
   task_family: pick_lift_color
   notes: >-
-    Minimum protocol from `vla_lab/new_changes.md`: report Wilson CIs, latency p95, and
+    Minimum protocol from `vla_lab/docs/new_changes.md`: report Wilson CIs, latency p95, and
     run McNemar on paired success bits vs N=1 baseline using `vla_lab/stats_utils.py`.

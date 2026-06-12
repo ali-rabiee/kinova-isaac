@@ -6,7 +6,7 @@ Same session layout, planners, logging, and CLI surface as ``vla_v1``, with thes
 * Three static colored bins (red / green / blue) at the far end of the workspace.
 * After a successful grasp+lift, the scripted/cuRobo planner continues with transit → drop → release.
 
-Use ``--profile vla_temp`` with ``data_collection.collect_data`` (see ``vla_lab/scripts/collect_temp.sh``).
+Use ``--profile vla_temp`` with ``data_collection.collect_data`` (see ``vla_lab/scripts/legacy/collect_temp.sh``).
 """
 
 from __future__ import annotations
@@ -1708,7 +1708,7 @@ def run(args: argparse.Namespace) -> int:
         if camera_sensor is not None:
             print(
                 "[VLA_TEMP] Continuing without camera images. "
-                "Re-run with ENABLE_CAMERAS=0 ./vla_lab/scripts/collect_temp.sh if needed."
+                "Re-run with ENABLE_CAMERAS=0 ./vla_lab/scripts/legacy/collect_temp.sh if needed."
             )
             camera_sensor = None
             try:

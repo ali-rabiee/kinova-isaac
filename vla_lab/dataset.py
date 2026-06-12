@@ -93,6 +93,52 @@ class EpisodeRecord:
     instruction: str
     target_label: str
     ticks: List[TickRecord]
+    # True/False if the episode outcome is known (episode_summary.json or events.jsonl),
+    # None for legacy sessions without outcome records.
+    success: Optional[bool] = None
+
+
+def _parse_episode_success(folder: Path) -> Optional[bool]:
+    """Read the episode outcome.
+
+    Prefers `episode_summary.json` (written by vla_v1 since 2026-06-11); falls back to
+    the last `grasp_result` event in events.jsonl. Returns None when unknown.
+    """
+
+    p = folder / "episode_summary.json"
+    if p.exists():
+        try:
+            obj = json.loads(p.read_text())
+            if "success" in obj:
+                return bool(obj["success"])
+        except Exception:
+            pass
+    ev = folder / "events.jsonl"
+    if ev.exists():
+        try:
+            last_ok: Optional[bool] = None
+            truncated = False
+            with ev.open("r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    t = rec.get("type")
+                    if t == "grasp_result":
+                        last_ok = bool(rec.get("data", {}).get("ok", False))
+                    elif t == "episode_end" and rec.get("data", {}).get("truncated"):
+                        truncated = True
+            if last_ok is not None:
+                return bool(last_ok and not truncated)
+            if truncated:
+                return False
+        except Exception:
+            pass
+    return None
 
 
 def _parse_instruction(folder: Path) -> Tuple[str, str]:
@@ -169,8 +215,17 @@ def _parse_ticks(ticks_path: Path) -> List[TickRecord]:
     return out
 
 
-def discover_episodes(roots: Sequence[Path]) -> List[EpisodeRecord]:
-    """Find all `episode_XXXX/` folders under any of the given session roots."""
+def discover_episodes(roots: Sequence[Path], *, success_only: bool = False) -> List[EpisodeRecord]:
+    """Find all `episode_XXXX/` folders under any of the given session roots.
+
+    Args:
+        roots: Session folders (or roots containing `session_*` folders).
+        success_only: If True, keep only episodes whose recorded outcome is a successful
+            lift (per episode_summary.json / events.jsonl). Failed and truncated episodes
+            can be several times longer than successful ones (stall/retry loops), so even
+            a few of them can dominate the frame count and teach the policy to hover.
+            Episodes with unknown outcome are dropped too (a warning is printed).
+    """
 
     episodes: List[EpisodeRecord] = []
     for root in roots:
@@ -208,8 +263,20 @@ def discover_episodes(roots: Sequence[Path]) -> List[EpisodeRecord]:
                     instruction=instr,
                     target_label=target_label,
                     ticks=ticks,
+                    success=_parse_episode_success(ep_dir),
                 )
             )
+
+    if success_only:
+        kept = [e for e in episodes if e.success is True]
+        n_failed = sum(1 for e in episodes if e.success is False)
+        n_unknown = sum(1 for e in episodes if e.success is None)
+        if n_failed or n_unknown:
+            print(
+                f"[dataset] success_only: kept {len(kept)}/{len(episodes)} episodes "
+                f"(dropped {n_failed} failed, {n_unknown} unknown-outcome)"
+            )
+        episodes = kept
 
     return episodes
 

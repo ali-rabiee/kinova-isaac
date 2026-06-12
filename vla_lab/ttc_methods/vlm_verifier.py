@@ -1,7 +1,7 @@
 """Appendix / future work: zero-shot VLM scoring over trajectory hypotheses.
 
 Not wired into the default eval loop yet — kept as a small, import-safe stub so
-experiments can grow toward the `new_changes.md` appendix idea without blocking
+experiments can grow toward the `docs/new_changes.md` appendix idea without blocking
 the partial-observability baseline.
 """
 

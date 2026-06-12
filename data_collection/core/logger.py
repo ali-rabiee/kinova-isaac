@@ -24,6 +24,9 @@ class TickLoggingConfig:
     ee_link_name: str = "j2n6s300_end_effector"
     arm_joint_regex: str = "j2n6s300_joint_[1-6]"
     log_joint_data: bool = False  # Enable joint positions/velocities logging (for VLA training)
+    # Optional: also log raw gripper joint positions (lets gripper state be re-derived offline
+    # if the open/close heuristic ever changes). None = skip (backward compatible).
+    gripper_joint_regex: Optional[str] = None
 
 
 class SessionLogWriter:
@@ -43,6 +46,8 @@ class SessionLogWriter:
         self._ee_body_id: Optional[int] = None
         self._ee_jacobi_idx: Optional[int] = None
         self._arm_joint_ids: Optional[List[int]] = None
+        self._gripper_joint_ids: Optional[List[int]] = None
+        self._gripper_joint_names: Optional[List[str]] = None
         self._obj_last_pos: Dict[str, Tuple[List[float], int]] = {}
         # Previous-tick caches for policy-aligned action derivation (delta from prev tick).
         self._prev_tick_ms: Optional[int] = None
@@ -366,6 +371,24 @@ class SessionLogWriter:
             },
             "safety": {"jacobian_s_min": s_min, "workspace_clamped_axes": clamped_axes, "near_joint_limit": near},
         }
+
+        # Optional raw gripper joint positions (offline re-derivation of open/close state).
+        if cfg.gripper_joint_regex:
+            try:
+                if self._gripper_joint_ids is None:
+                    gids, gnames = robot.find_joints(cfg.gripper_joint_regex)
+                    if torch.is_tensor(gids):
+                        self._gripper_joint_ids = [int(v) for v in gids.view(-1).tolist()]
+                    else:
+                        self._gripper_joint_ids = [int(v) for v in gids]
+                    self._gripper_joint_names = [str(n) for n in gnames]
+                if self._gripper_joint_ids:
+                    robot_record["gripper"]["joint_positions"] = [
+                        float(robot.data.joint_pos[0, jid].item()) for jid in self._gripper_joint_ids
+                    ]
+                    robot_record["gripper"]["joint_names"] = list(self._gripper_joint_names or [])
+            except Exception:
+                pass
 
         # Add joint data if enabled (for VLA training)
         if cfg.log_joint_data and arm_ids:

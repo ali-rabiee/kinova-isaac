@@ -1,765 +1,282 @@
-# `vla_lab/` — VLA-TTC starter package
+# `vla_lab/` — VLA training & evaluation for the Kinova Jaco in Isaac Sim
 
-> **Now on the HRI 2027 pivot.** The act/compute/query allocator, the robot-only calibration
-> experiments, and the human study live in `allocation/`, `calibration/`, and `human_study/`.
-> See **[§7](#7-hri-2027-pivot--actcomputequery-allocator-calibration--human-study)** for the
-> run commands and [`project_pivot_VLA_HRI2027.md`](./project_pivot_VLA_HRI2027.md) for the why.
-> Sections §1–§6 below document the original CoRL pipeline (still runnable).
+This package contains everything needed to go from **scripted demonstrations** in Isaac Sim
+to a **language-conditioned visuomotor policy** (VLA) and back into the simulator for
+closed-loop evaluation — plus the HRI-2027 *act / compute / query* allocation experiments
+built on top of it.
 
-This folder is the home of the **CoRL 2026 VLA-TTC** project (codename
-`vla-ttc`), built on top of the existing `kinova-isaac` simulation /
-data-collection stack. The full design document lives at
-[`vla_ttc_engineering_spec.md`](./vla_ttc_engineering_spec.md); this
-README is the practical "how do I actually run it" companion.
+```
+collect (Isaac, scripted expert)  →  verify  →  train (TinyVLA or SmolVLA)  →  eval (Isaac, closed loop)
+   collect_v3.sh                 verify_session     train.sh / train_smolvla.sh     eval.sh
+```
 
-The folder is **fully self-contained**: every change required for the
-project lives under `vla_lab/`. The rest of the repository
-(`data_collection/`, `environments/`, `controllers/`, ...) was not
-modified and is consumed only via standard imports.
+Task: a Kinova Jaco `j2n6s300` on a table with 6 colored boxes; the policy receives one
+top-down RGB image, the EE state, and an instruction like *"Pick up the red box."*, and must
+reach, grasp, and lift the right box.
 
-**Paper direction (2026 sprint):** stress *partial observability* and
-single-camera manipulation—test-time scaling should help most when visual
-ambiguity is high. See `new_changes.md` for the full pivot notes; code
-support includes occlusion ablations (`partial_obs.py`), SmolVLA TTC
-(`smolvla_bridge/policy_wrapper.py`), MG-Select-style scoring
-(`baselines/mg_select.py`), and uncertainty gating (`ttc_methods/`).
+> **New here?** Read this file top-to-bottom, then
+> [`data_collection_guide.md`](./data_collection_guide.md) before collecting any data.
 
 ---
 
-## 1. What is implemented today
+## Quick start
 
-The Phase-1 pipeline is end-to-end runnable: **collect → train → eval**.
+```bash
+conda activate riften                       # NOT isaac_env; needs numpy<2
+cd ~/Desktop/Depo/Code/CORL/kinova-isaac
 
-| Stage | Path | What it does |
-| --- | --- | --- |
-| Data collection | reuses `data_collection.collect_data` (no edits needed) | Saves `vla_v1` sessions with images + ticks + per-episode language. |
-| Dataset reader | `vla_lab/dataset.py` | Reads `session_*/episode_*` folders; converts stringified floats; builds tokenizer + action stats. |
-| Baseline model | `vla_lab/models.py` (`TinyVLA`, ~2 M params) | Vision CNN + tiny language transformer + state MLP + cross-attention action decoder. |
-| Loss(es) | `vla_lab/losses.py` | Masked action MSE + optional DINOv2 feature-alignment loss (lazy import). |
-| Trainer | `vla_lab/train.py` | Single-GPU AdamW + cosine schedule + checkpointing. |
-| TTC inference | `vla_lab/ttc.py` | K-noise sampling at the bottleneck + consensus scoring fallback. |
-| IsaacLab eval | `vla_lab/eval_isaaclab.py` | Drops the trained policy into `reach_to_grasp_VLA` and reports success. |
-| Dryrun / inspect | `vla_lab/dryrun.py`, `vla_lab/inspect_data.py` | VRAM/latency check + dataset sanity tool. |
-| Plotting | `vla_lab/plot_metrics.py` | Learning curves + eval success (Wilson CI) from `metrics.jsonl` / eval JSON. |
+# 1. Collect demonstrations (repeat for more chunks; ~2 min/episode headless)
+NUM_EPISODES=40 ./vla_lab/scripts/collect_v3.sh --headless
 
-What this gives you on day one:
+# 2. Verify the session (MANDATORY — exit 1 means do not train on it)
+python -m vla_lab.verify_session logs/data_collection/session_<TS>
 
-- A small (~2 M parameters) **TinyVLA** baseline that trains on a single
-  consumer GPU with **no required external model downloads**.
-- A clean upgrade path to **SmolVLA** later: the model wrapper exposes
-  `forward(image, state, lang_ids, lang_mask, noise=...)` and
-  `sample_actions(...)` with the same contract used by the spec, so we
-  can drop in a SmolVLA wrapper without touching the trainer / TTC /
-  eval code.
-- Sanity-check tooling (`dryrun`, `inspect_data`) so the spec's
-  Day-3 / Day-12 / Day-14 / Day-18 hard checkpoints can be evaluated
-  early.
+# 3. Train TinyVLA (edit data.data_roots in vla_lab/configs/train_tiny.yaml first)
+./vla_lab/scripts/train.sh
 
-## 2. What is intentionally stubbed / left for later
+# 4. Evaluate in Isaac Lab (closed loop, same scene/camera as collection)
+./vla_lab/scripts/eval.sh --num-episodes 10 --headless
+```
 
-These match the spec's later phases and can be added without changing
-the public APIs already shipped.
+## 1. Environment
 
-- **SmolVLA fine-tuning** — use `export_lerobot_dataset.sh`, then e.g. **`STEPS=20000 ./vla_lab/scripts/train_smolvla.sh`** or `python -m vla_lab.train_smolvla --config ...` (§5.4.1); Isaac eval can use `policy_backend: smolvla` when checkpoint paths are set.
-- **Learned verifier** (spec §4.9). Phase-1 uses a simple "consensus to
-  median" scorer in `vla_lab/ttc.py`. The spec's hard checkpoint at
-  Day 12 says we explicitly fall back to this if verifier accuracy
-  stalls, so this is a publishable baseline.
-- **OOD detector / trigger** (spec §4.11/4.12). The current pipeline
-  always uses the slow K-sample path; the trigger logic is a future drop-in.
-- **Scene parser + inpainter** (spec §4.10). Skipped for now per the
-  Day-3 VRAM-budget guidance ("drop SDXL inpainting if it doesn't fit").
-- **Background augmentation** (spec §4.8). Train-time only; orthogonal
-  to everything here.
-- **Real-robot collection** (spec §4.1). Out of scope for the Phase-1
-  sim-only loop.
+| Requirement | Why |
+| --- | --- |
+| conda env **`riften`** | Isaac Sim 5.x + Isaac Lab + torch are set up there (`isaac_env` is stale). |
+| **NumPy < 2** | NumPy 2.x freezes/crashes Isaac data collection. `python -c "import numpy; print(numpy.__version__)"` |
+| Isaac Lab checkout | `eval.sh` looks for `./IsaacLab/isaaclab.sh` or `~/IsaacLab/isaaclab.sh` (override with `ISAACLAB=`). |
+| `pip install matplotlib` | optional, for training plots (`plot_metrics`). |
+| `pip install -r vla_lab/requirements-smolvla.txt` | only for the SmolVLA path (LeRobot). |
 
-## 3. Repository layout
+Training (`vla_lab.train`) and all offline tools run with plain `python` — no Isaac needed.
+Only collection and eval start the simulator.
+
+## 2. Folder map
 
 ```
 vla_lab/
-├── README.md                       <- you are here
-├── vla_ttc_engineering_spec.md     <- the full design doc
-├── __init__.py
-├── _path.py                        <- sys.path fix-up for IsaacLab runs
-├── configs/
-│   ├── train_tiny.yaml             <- baseline training config
-│   ├── train_smolvla.example.yaml  <- SmolVLA / lerobot-train YAML shim
-│   └── eval_isaac.yaml             <- IsaacLab eval config
-├── dataset.py                      <- KinovaSessionDataset, TinyTokenizer
-├── models.py                       <- TinyVLA + ModelOutput
-├── losses.py                       <- masked_action_loss, FeatureAlignmentLoss
-├── ttc.py                          <- TTCPipeline (K-sample + consensus)
-├── train.py                        <- TinyVLA training entrypoint
-├── train_smolvla.py                <- SmolVLA: runs `lerobot-train` from YAML
-├── eval_isaaclab.py                <- IsaacLab evaluation entrypoint
-├── dryrun.py                       <- VRAM / latency dry-fit
-├── inspect_data.py                 <- session sanity tool
-├── plot_metrics.py                 <- figures for training / eval (paper-style)
-├── allocation/                     <- act/compute/query allocator + 6 baselines (HRI pivot, §7)
-├── calibration/                    <- Result-2 metrics + figures (ECE / decoupling / coverage)
-├── human_study/                    <- study protocol, instruments, reliance, power, offline sim runner
-├── fit_allocator.py                <- fit the allocator (irreducibility + conformal) from calibration logs
-├── tests/                          <- offline test suite (`python -m vla_lab.tests.run_tests`; no pytest)
-└── scripts/
-    ├── collect.sh                  <- **vla_v1** stable reach/grasp/lift (default data collection)
-    ├── collect_v3.sh               <- same as collect.sh (--profile vla_v1); numbered alias for clarity
-    ├── collect_v2.sh               <- **vla_v2** pick-and-place + bins
-    ├── train.sh                    <- TinyVLA: wrapper around `vla_lab.train`
-    ├── train_smolvla.sh            <- SmolVLA: `lerobot-train` (env vars + resume)
-    ├── export_lerobot_dataset.sh   <- Kinova sessions → LeRobot dataset on disk
-    ├── pip_install_smolvla_isaac.sh <- LeRobot into Isaac env (NumPy 1.x workaround)
-    ├── after_smolvla_train.sh      <- optional TensorBoard / plot_metrics hook after SmolVLA run
-    ├── eval.sh                     <- wrapper around `vla_lab.eval_isaaclab`
-    ├── plot.sh                     <- wrapper around `vla_lab.plot_metrics`
-    ├── dryrun.sh                   <- wrapper around `vla_lab.dryrun`
-    │   # --- HRI 2027 pivot (§7): act/compute/query, calibration & human study ---
-    ├── run_tests.sh                <- offline test suite (no Isaac / torch / pytest)
-    ├── calibration_eval.sh         <- Isaac occlusion sweep → per-step calibration records
-    ├── fit_allocator.sh            <- fit allocator_fit.json from calibration logs
-    ├── calibration_analyze.sh      <- Result-2 figures (reliability / decoupling / coverage)
-    ├── human_study_pilot.sh        <- offline study pilot (synthetic robot+human) → analyze
-    ├── human_study_analyze.sh      <- analyze a study log (pilot or real) → reliance/trust figures
-    └── power_analysis.sh           <- sample-size / power from a pilot or effect size
+├── README.md                    <- you are here
+├── data_collection_guide.md     <- THE data-collection reference (pipeline, contract, fixes)
+├── docs/                        <- historical reports (eval-flailing postmortem, design notes)
+│
+├── scripts/                     <- entrypoints (each wraps one command; env-var overridable)
+│   ├── collect_v3.sh            <- data collection: reach/grasp/lift, 15 Hz, DR  ★
+│   ├── train.sh                 <- TinyVLA training                              ★
+│   ├── eval.sh                  <- closed-loop Isaac Lab evaluation              ★
+│   ├── dryrun.sh                <- VRAM/latency sanity for a checkpoint (no Isaac)
+│   ├── export_lerobot_dataset.sh / train_smolvla.sh / after_smolvla_train.sh
+│   ├── run_tests.sh             <- 51 offline tests (allocator/calibration/human study)
+│   ├── sweep_occlusion_eval.sh / fit_allocator.sh / calibration_*.sh
+│   ├── human_study_pilot.sh / human_study_analyze.sh / power_analysis.sh
+│   └── legacy/                  <- superseded collectors (collect.sh 5 Hz, collect_v2 pick-place,
+│                                   collect_temp) — do NOT use without porting the respawn fix
+│
+├── dataset.py                   <- ticks.jsonl → torch Dataset (success-only filter, action chunks)
+├── models.py / losses.py        <- TinyVLA (1.9 M params) + optional DINOv2 alignment
+├── train.py                     <- trainer (AMP, resume, metrics.jsonl)
+├── eval_isaaclab.py             <- eval loop: policy/replay backends, pre-roll, safety clamps, TTC
+├── ttc.py / partial_obs.py      <- K-sample inference + occlusion axes
+├── verify_session.py            <- post-collection session validator  ★ run after every collection
+├── inspect_data.py              <- quick textual dump of a session
+├── repair_gripper_labels.py     <- backfills gripper labels in pre-2026-06 sessions
+├── dryrun.py / plot_metrics.py / stats_utils.py / checkpoint_utils.py
+│
+├── smolvla_bridge/              <- ticks.jsonl ↔ LeRobot dataset + SmolVLA policy wrapper
+├── allocation/ calibration/     <- HRI-2027 act/compute/query allocator + Result-2 calibration
+├── human_study/ baselines/ ttc_methods/  <- study runner, comparison policies
+├── real_robot/                  <- Kinova bridge + safety envelope stubs for sim→real
+├── tests/                       <- offline test suite (run_tests.sh)
+├── configs/                     <- train_tiny.yaml, eval_isaac.yaml, train_smolvla.example.yaml, eval_real.yaml
+│
+├── checkpoints/ datasets/       <- training outputs / LeRobot exports   (artifacts, gitignored)
+├── eval_results/ results/       <- eval + experiment outputs            (artifacts)
+└── paper/                       <- CoRL LaTeX sources
 ```
 
-Nothing outside `vla_lab/` was modified to add this package.
+★ = the four commands you will actually use day-to-day.
 
-## 4. Prerequisites
+## 3. Data collection
 
-The training and inspection tools have **light** dependencies:
+Full reference: **[`data_collection_guide.md`](./data_collection_guide.md)** — read it before
+collecting the final dataset. Short version:
 
 ```bash
-pip install torch torchvision numpy pillow pyyaml
-# For PDF/PNG figures after training (`plot_metrics`, auto-run at train end):
-pip install matplotlib
+# Default: 6 unique-color boxes, cycling targets, domain randomization, 15 Hz ticks
+NUM_EPISODES=40 ./vla_lab/scripts/collect_v3.sh --headless
+
+# Useful overrides (env vars):
+NUM_EPISODES=120 NUM_OBJECTS=6 ./vla_lab/scripts/collect_v3.sh --headless
+TARGET_SELECTION=random ./vla_lab/scripts/collect_v3.sh      # instead of cycle
+DR_SEED=7 ./vla_lab/scripts/collect_v3.sh                    # reproducible randomization
+USE_YCB=1 ./vla_lab/scripts/collect_v3.sh                    # YCB meshes (separate dataset!)
+PLANNER=curobo_v2 ./vla_lab/scripts/collect_v3.sh            # MotionGen instead of scripted
+
+# Watch the first run: respawn readback must CHANGE between episodes, targets must cycle.
 ```
 
-The Isaac Lab evaluation entrypoint additionally needs the same Isaac
-Sim / Isaac Lab environment that the rest of the repo already uses;
-follow the top-level `README.md` to set that up.
+Outputs land in `logs/data_collection/session_<TS>/episode_NNNN/` with `ticks.jsonl`
+(15 Hz states + actions), `images/` (640×640 top-down PNGs), `instruction.json`,
+`episode_summary.json` (success verdict), and `events.jsonl` (full audit trail).
 
-Optional dependencies (only if you want to enable specific features):
+**Rules that keep the data usable** (details + rationale in the guide):
 
-| Feature | Install |
-| --- | --- |
-| DINOv2 feature alignment | `pip install transformers` |
-| SmolVLA fine-tune (LeRobot) | **Dedicated env:** `pip install -r vla_lab/requirements-smolvla.txt`. **Isaac env (`riften`):** `./vla_lab/scripts/pip_install_smolvla_isaac.sh` — see [`smoll-vla-setup.md`](./smoll-vla-setup.md) |
+1. **Verify every session** before training: `python -m vla_lab.verify_session <session_dir>`.
+   It catches the historical failure modes (frozen object layout, degenerate targets, missing
+   gripper labels, missing images) and refuses with exit 1.
+2. **Collect in chunks** (30–60 episodes per run, headless) — long runs have been OOM-killed
+   (exit 137). Each chunk is a separate session; list them all under `data.data_roots`.
+3. **Never mix contracts**: sessions in one training run must share the same `--log-rate-hz`
+   (15), camera config, and start pose. Sessions collected **before 2026-06-11 are not
+   compatible** (camera moved, frozen-layout bug) — retire them.
+4. ~120 episodes (= 20 demos per color) is a sensible floor for the 6-color task.
 
-## 5. End-to-end commands
-
-All commands assume you run them from the **repo root**
-(`kinova-isaac/`), not from inside `vla_lab/`.
-
-### 5.1 Collect data (`vla_v1`)
-
-**Recommendation (current setup):** Prefer **colored boxes** — default `collect_v3.sh` uses `--spawn-mode box` unless you override it. Training uses a **fixed top-down camera only** (no wrist / eye-in-hand camera yet). YCB assets are more diverse in shape and appearance; without a wrist view, policies have a harder time from a single overhead view, so **boxes are the safer default** until wrist cameras are added. YCB commands below are still documented for later or for experiments.
-
-**Command to run (from the repo root `kinova-isaac/`, in your Isaac Lab / Isaac Sim Python env):**
+## 4. Inspect what was collected
 
 ```bash
-# Recommended default: boxes, scripted planner, top-down images
-NUM_EPISODES=20 ./vla_lab/scripts/collect_v3.sh
+# Hard pass/fail + statistics (use this one):
+python -m vla_lab.verify_session logs/data_collection/session_<TS>
+
+# Casual look at episodes/ticks/instructions:
+python -m vla_lab.inspect_data --data-roots logs/data_collection/session_<TS> --print-instructions
+
+# Old sessions (pre-2026-06) only: backfill gripper open/close labels in-place:
+python -m vla_lab.repair_gripper_labels --session logs/data_collection/session_<TS> [--dry-run]
 ```
 
-**Other useful invocations (same repo root):**
+## 5. Training
+
+### 5.1 TinyVLA (default, no Isaac required)
 
 ```bash
-# cuRobo MotionGen instead of scripted straight-line waypoints
-PLANNER=curobo_v2 NUM_EPISODES=20 ./vla_lab/scripts/collect_v3.sh
-
-# More / fewer objects (default in script is 11)
-NUM_OBJECTS=8 NUM_EPISODES=20 ./vla_lab/scripts/collect_v3.sh
-
-# Headless + GPU
-DEVICE=cuda:0 NUM_EPISODES=20 ./vla_lab/scripts/collect_v3.sh --headless
-
-# --- YCB / USD props (optional; prefer boxes until wrist camera exists) ---
-
-# YCB via convenience flag: adds --use-ycb, which forces spawn_mode=usd inside the profile
-# (even if SPAWN_MODE=box were set on the wrapper)
-USE_YCB=1 NUM_EPISODES=20 ./vla_lab/scripts/collect_v3.sh
-
-# Same outcome for assets: pass USD spawn explicitly (no --use-ycb)
-SPAWN_MODE=usd NUM_EPISODES=20 ./vla_lab/scripts/collect_v3.sh
-
-# Local YCB (or any USD prop folders) instead of Nucleus default
-NUM_EPISODES=20 ./vla_lab/scripts/collect_v3.sh --use-ycb --objects-dataset /path/to/YCB
-
-# Original thin wrapper (simpler defaults than collect_v3)
-NUM_EPISODES=10 ./vla_lab/scripts/collect.sh
-```
-
-**`USE_YCB=1` vs `SPAWN_MODE=usd`:** For `collect_v3.sh`, both end up spawning **USD props** from the **same default YCB location** when `--objects-dataset` is empty. The difference: `--use-ycb` forces **`spawn_mode=usd` in Python** after argparse, so it **overrides** a conflicting `--spawn-mode box` on the command line. `SPAWN_MODE=usd` only sets `--spawn-mode usd`; `--use-ycb` is not set.
-
-- Uses **scripted** straight-line waypoints + Diff IK (default `PLANNER=scripted`).
-- Logs go to `logs/data_collection/session_<timestamp>/episode_####/`.
-- Ensure **`--enable_cameras`** stays on for `vla_lab` training data (already in `collect_v3.sh`).
-
-**There is no `collect_v1.sh`.** The stable profile is `vla_v1`, and it is what
-`collect.sh` runs. `collect_v3.sh` adds **curriculum defaults**: more objects
-(default **`NUM_OBJECTS=11`** in the script), a spawn AABB **pulled a bit toward the robot**,
-`--target-selection farthest_no_repeat` (farthest reachable object, not the same as the
-previous episode’s target after a **successful** lift), **straight scripted
-approach** (`--approach-detour-m 0` by default). Optional detour: e.g. `--approach-detour-m 0.08 --approach-detour-safe-z-margin-m 0.04`.
-For YCB props, use **`USE_YCB=1`** or **`--spawn-mode usd`** as above.
-
-This calls `data_collection.collect_data` with the `vla_v1` profile + planner +
-cameras + domain randomization. Each session is written under
-`logs/data_collection/session_<TIMESTAMP>/` with one `episode_NNNN/` folder per
-attempt.
-
-```bash
-# collect_v3: boxes recommended; ~11 objects by default; farthest_no_repeat target selection
-NUM_EPISODES=10 ./vla_lab/scripts/collect_v3.sh
-
-# Original wrapper — simpler defaults than collect_v3 (see vla_lab/scripts/collect.sh)
-NUM_EPISODES=10 ./vla_lab/scripts/collect.sh
-
-# Pick-and-place (`vla_v2`) — see §5.1.1
-NUM_EPISODES=10 ./vla_lab/scripts/collect_v2.sh
-```
-
-`collect_v3.sh` forwards extra flags; see the script for the full default list
-(farthest target, spawn AABB, speeds, `NUM_OBJECTS`). Minimal mental model:
-
-```bash
-python -m data_collection.collect_data \
-  --profile vla_v1 --env reach_to_grasp_VLA --control planner \
-  --planner scripted --device cuda:0 --enable_cameras \
-  --log-rate-hz 5 --num-episodes ${NUM_EPISODES} \
-  --target-selection farthest_no_repeat --approach-detour-m 0 \
-  --spawn-mode box --domain-rand --domain-rand-seed 0 \
-  --logs-root logs/data_collection \
-  ...
-```
-
-You can also call `data_collection.collect_data` directly with any flags you
-want — see the top-level `README.md`. Just make sure `--enable_cameras` is
-set; `vla_lab` requires the per-tick PNGs to train.
-
-#### 5.1.1 Pick-and-place (`vla_v2`)
-
-For the same **top-down-only** setup as `vla_v1`, **colored cubes remain the
-recommended default** until a wrist camera exists; YCB is optional below.
-
-`vla_v2` is a richer scene with **clutter + 3 bins** and a fully scripted
-**pick-and-place** routine. Each episode, the grasp target is the object
-**closest to the robot in XY** (base frame), skipping anything too close to a
-bin so the arm does not fight bin geometry; clutter is also respawned with
-its X range capped **in front of** the bins. You can use **colored cubes**
-(default) or **YCB USD props** from Isaac Nucleus via `--spawn-mode usd`.
-Motion is purely scripted (no cuRobo / MotionGen). Logging format and on-disk
-layout match `vla_v1`, so the same `vla_lab.dataset` reader works without changes.
-
-**Command to run (from the repo root, with a Python that has Isaac Lab /
-`isaaclab` on the path — e.g. your usual Isaac conda env):**
-
-```bash
-NUM_EPISODES=10 ./vla_lab/scripts/collect_v2.sh
-```
-
-Common variations:
-
-```bash
-# Default: 6 clutter boxes + 1 close target + 3 bins, 10 episodes
-NUM_EPISODES=10 ./vla_lab/scripts/collect_v2.sh
-
-# More clutter, headless
-NUM_OBSTACLE_BOXES=8 NUM_EPISODES=20 ./vla_lab/scripts/collect_v2.sh --headless
-
-# Random bin selection per episode
-BIN_SELECTION=random NUM_EPISODES=20 ./vla_lab/scripts/collect_v2.sh
-
-# YCB objects (USD from Isaac Nucleus default path) instead of cubes
-NUM_EPISODES=10 ./vla_lab/scripts/collect_v2.sh --spawn-mode usd
-
-# YCB with an explicit asset folder (optional)
-NUM_EPISODES=10 ./vla_lab/scripts/collect_v2.sh \
-  --spawn-mode usd \
-  --objects-dataset /path/to/YCB
-```
-
-Underneath, the wrapper runs `python -m data_collection.collect_data` with
-`--profile vla_v2`. Equivalent explicit invocation (same defaults as the
-script; add or override flags as needed):
-
-```bash
-python -m data_collection.collect_data \
-  --profile vla_v2 \
-  --env reach_to_grasp_VLA \
-  --control planner \
-  --device cuda:0 \
-  --enable_cameras \
-  --log-rate-hz 5 \
-  --num-episodes 10 \
-  --num-obstacle-boxes 6 \
-  --bin-selection cycle \
-  --planner-speed-mps 0.4 \
-  --planner-waypoint-max-seg-m 0.01 \
-  --max-steps-per-episode 10000 \
-  --domain-rand \
-  --domain-rand-seed 0 \
-  --logs-root logs/data_collection
-
-# Same with YCB / USD props:
-python -m data_collection.collect_data \
-  --profile vla_v2 \
-  --env reach_to_grasp_VLA \
-  --control planner \
-  --device cuda:0 \
-  --enable_cameras \
-  --spawn-mode usd \
-  --log-rate-hz 5 \
-  --num-episodes 10 \
-  --domain-rand \
-  --logs-root logs/data_collection
-```
-
-Each episode writes the same `instruction.json`, `images/`, `ticks.jsonl`,
-and `events.jsonl` artifacts as `vla_v1`, plus a `drop_result` event with the
-final box pose vs. the chosen bin's footprint. See the top-level `README.md`
-for the full list of `vla_v2` knobs (target / bin layout, transit clearance,
-etc.).
-
-### 5.2 Inspect what was collected
-
-```bash
-python -m vla_lab.inspect_data --data-roots logs/data_collection
-python -m vla_lab.inspect_data --data-roots logs/data_collection --print-instructions
-```
-
-This walks every `session_*/episode_*` folder and prints episode count,
-tick count, image coverage, and the unique instruction set. If you see
-"WARNING: no images found" you forgot `--enable_cameras` during
-collection.
-
-### 5.3 Dryrun (VRAM + latency sanity)
-
-This is the spec's Day-3 sanity script. It just builds the model and
-runs forward passes; **no Isaac Lab needed**.
-
-```bash
-# Untrained model, K=4 candidates, iterate 100x
-./vla_lab/scripts/dryrun.sh --iters 100
-
-# Trained checkpoint, deployed K
-./vla_lab/scripts/dryrun.sh --iters 100 --ckpt vla_lab/checkpoints/tiny_v0/last.pt
-
-# CPU sanity run (works anywhere)
-DEVICE=cpu ./vla_lab/scripts/dryrun.sh --iters 8 --warmup 2 --k 1
-```
-
-### 5.4 Train
-
-**Quick reference (always from repo root `kinova-isaac/`):**
-
-| Goal | Command |
-| --- | --- |
-| **TinyVLA** (default) | `./vla_lab/scripts/train.sh` |
-| TinyVLA, custom config | `CONFIG=/path/to/config.yaml ./vla_lab/scripts/train.sh` |
-| **Export** Kinova logs → LeRobot dataset | `./vla_lab/scripts/export_lerobot_dataset.sh --session-roots logs/data_collection/session_YYYYMMDD_HHMMSS --out-dir vla_lab/datasets/lerobot_kinova_v0 --overwrite` |
-| **SmolVLA** (recommended) | `STEPS=20000 ./vla_lab/scripts/train_smolvla.sh` (defaults: dataset `vla_lab/datasets/lerobot_kinova_v0`, checkpoint dir under `vla_lab/checkpoints/`; override with `DATASET_DIR`, `OUT_DIR`, etc.) |
-| **SmolVLA** (YAML) | `python -m vla_lab.train_smolvla --config vla_lab/configs/train_smolvla.example.yaml` |
-| SmolVLA **resume** | `RESUME=true ./vla_lab/scripts/train_smolvla.sh` (same `OUT_DIR` / checkpoint dir as first run) |
-| After SmolVLA train | `RUN_DIR=vla_lab/checkpoints/smolvla_kinova_ft ./vla_lab/scripts/after_smolvla_train.sh` |
-
-TinyVLA needs PyTorch + YAML (+ `matplotlib` for plots). SmolVLA needs LeRobot: use **`pip install -r vla_lab/requirements-smolvla.txt`** in a **dedicated** env, or **`./vla_lab/scripts/pip_install_smolvla_isaac.sh`** in `riften` (NumPy 1.x vs `rerun-sdk` metadata — see [`smoll-vla-setup.md`](./smoll-vla-setup.md)). You also need a **local LeRobot dataset** (export step above). See **§5.4.1**.
-
----
-
-From the **repo root** (`kinova-isaac/`), with a Python env that has PyTorch
-installed (no Isaac Lab required for training).
-
-**Default data:** `vla_lab/configs/train_tiny.yaml` uses a **single** session:
-
-`logs/data_collection/session_20260506_232450`
-
-(Change `data.data_roots` in that YAML if you want a different session or multiple roots.)
-
-**Recommended — start training:**
-
-```bash
-cd /path/to/kinova-isaac
-pip install torch torchvision numpy pillow pyyaml matplotlib   # matplotlib: figures after training
-
+# 1. Point the config at your verified session(s):
+#    vla_lab/configs/train_tiny.yaml  ->  data.data_roots: [logs/data_collection/session_<TS>, ...]
+# 2. Train (checkpoints + metrics.jsonl + plots in vla_lab/checkpoints/tiny_v0/):
 ./vla_lab/scripts/train.sh
+
+# Variants:
+./vla_lab/scripts/train.sh --auto-resume                 # continue from last.pt
+./vla_lab/scripts/train.sh --epochs 50 --batch-size 256  # quick overrides
+python -m vla_lab.train --config vla_lab/configs/train_tiny.yaml --data-roots \
+    logs/data_collection/session_A logs/data_collection/session_B   # multi-session
+
+# Sanity-check a checkpoint's latency/VRAM and action magnitudes (no Isaac):
+./vla_lab/scripts/dryrun.sh --ckpt vla_lab/checkpoints/tiny_v0/last.pt --iters 50 --k 1
 ```
 
-**GPU utilization:** TinyVLA is only ~2M parameters, so the GPU often waits on
-**CPU data loading** (decoding thousands of PNGs). The default config enables
-**larger batches** (`batch_size`), **more DataLoader workers**, **prefetch**,
-**mixed precision (AMP)**, **cuDNN benchmark**, and **torchvision-based image
-decode** (`data.fast_image_io`). Tune `train.batch_size` and `train.num_workers`
-in `train_tiny.yaml`; if you run out of VRAM, lower `batch_size`. For very high
-core-count CPUs you can try `num_workers: 12` or `16`.
+Notes:
 
-Checkpoints, `metrics.jsonl`, and plots go under `vla_lab/checkpoints/tiny_v0/`
-(or whatever `train.out_dir` is set to in the YAML). Override the output dir:
+- `data.success_only: true` (default) trains on successful demonstrations only, using
+  `episode_summary.json` / `events.jsonl`.
+- Action normalization stats are stored in the checkpoint; eval denormalizes automatically.
+- The tokenizer is built from the sessions' instructions — if a color never appears as a
+  target in your data, the model cannot understand it at eval (one more reason for
+  `TARGET_SELECTION=cycle` + verify_session's distribution check).
 
-```bash
-./vla_lab/scripts/train.sh --out-dir vla_lab/checkpoints/my_run
-```
-
-**Explicit module invocation (same as the script):**
+### 5.2 SmolVLA (LeRobot fine-tune)
 
 ```bash
-python -m vla_lab.train --config vla_lab/configs/train_tiny.yaml
-```
+pip install -r vla_lab/requirements-smolvla.txt   # ideally a separate env; see docs/new_changes.md
 
-**Use different data without editing the YAML:**
-
-```bash
-python -m vla_lab.train \
-    --config vla_lab/configs/train_tiny.yaml \
-    --data-roots logs/data_collection \
-    --out-dir vla_lab/checkpoints/all_sessions
-```
-
-**Resume after interruption** (loads optimizer + scheduler + dataloader position):
-
-```bash
-python -m vla_lab.train --config vla_lab/configs/train_tiny.yaml --auto-resume
-# or: python -m vla_lab.train --config ... --resume vla_lab/checkpoints/tiny_v0/last.pt
-```
-
-**Skip automatic plotting** (e.g. no matplotlib):
-
-```bash
-python -m vla_lab.train --config vla_lab/configs/train_tiny.yaml --no-plot-at-end
-```
-
-Output checkpoints live under `vla_lab/checkpoints/<run_name>/`:
-
-- `last.pt`  — latest epoch boundary (full state for `--resume`)
-- `best.pt`  — best validation loss (only if val split is non-empty)
-- `step_*.pt` — periodic snapshots (see `train.save_every_steps` in YAML)
-- `config.json` — frozen hyperparameter dump
-- `metrics.jsonl` — train/val scalars for plotting
-
-After training, figures are written to `<out_dir>/figures/` (learning curves,
-LR schedule, train/val per epoch). Install `matplotlib` for this step.
-
-Regenerate plots (optionally pass eval JSON from §5.5 for success-rate bars):
-
-```bash
-RUN_DIR=vla_lab/checkpoints/tiny_v0 ./vla_lab/scripts/plot.sh --format pdf \
-  --eval-json vla_lab/eval_results/tiny_v0/results_1234567890.json
-```
-
-To enable the optional DINOv2 feature-alignment loss flip
-`train.feature_alignment.enabled: true` in the YAML (or pass a YAML that
-already has it on) — `transformers` must be installed and the teacher
-weights cached.
-
-#### 5.4.1 SmolVLA — LeRobot fine-tune (in-repo wrappers)
-
-SmolVLA training is **LeRobot’s** `lerobot-train`. This repo adds:
-
-- **`vla_lab/smolvla_bridge/convert_kinova_to_lerobot.py`** — `ticks.jsonl` + images → on-disk LeRobot dataset.
-- **`vla_lab/scripts/export_lerobot_dataset.sh`** — thin wrapper around that converter.
-- **`vla_lab/scripts/train_smolvla.sh`** — calls `lerobot-train` with sensible defaults and env overrides.
-- **`vla_lab/train_smolvla.py`** + **`vla_lab/configs/train_smolvla.example.yaml`** — same thing, YAML-driven; supports `--dry-run`.
-
-Official SmolVLA overview: [LeRobot SmolVLA docs](https://huggingface.co/docs/lerobot/smolvla).
-
-**1. Install (once per Python env)**
-
-**Dedicated env (recommended for SmolVLA training):** allows NumPy 2.x if `rerun-sdk` needs it.
-
-```bash
-pip install -r vla_lab/requirements-smolvla.txt
-# Linux: if evdev/pynput fails to build, see §8.5 in smoll-vla-setup.md
-```
-
-**Same env as Isaac Lab** (must keep NumPy 1.x; plain `pip -r` may hang on `resolution-too-deep` or force NumPy 2):
-
-```bash
-./vla_lab/scripts/pip_install_smolvla_isaac.sh
-```
-
-Details: [`smoll-vla-setup.md`](./smoll-vla-setup.md) (NumPy vs `rerun-sdk`, `evdev`, resolver limits).
-
-**2. Export Kinova collection to a LeRobot dataset**
-
-```bash
+# 1. Export ticks → LeRobot dataset (successful episodes only by default):
 ./vla_lab/scripts/export_lerobot_dataset.sh \
-  --session-roots logs/data_collection/session_20260506_232450 \
-  --out-dir vla_lab/datasets/lerobot_kinova_v0 \
-  --overwrite
+    --session-roots logs/data_collection/session_<TS> \
+    --out-dir vla_lab/datasets/lerobot_kinova_v0 --fps 15 --overwrite
+
+# 2. Fine-tune lerobot/smolvla_base on it:
+DATASET_DIR=vla_lab/datasets/lerobot_kinova_v0 STEPS=20000 ./vla_lab/scripts/train_smolvla.sh
+
+# 3. Evaluate with the same Isaac loop (backend switch in the YAML or CLI):
+./vla_lab/scripts/eval.sh --policy-backend smolvla --ckpt vla_lab/checkpoints/smolvla_ft_<TS> \
+    --lerobot-dataset-root vla_lab/datasets/lerobot_kinova_v0
 ```
 
-Point `--session-roots` at one or more `session_*` folders under `logs/data_collection/`. The default paths in `train_smolvla.example.yaml` expect **`vla_lab/datasets/lerobot_kinova_v0`** and `dataset.repo_id: kinova_isaac_vla` (a local label; must match what the converter wrote).
-
-**3. Start training**
-
-From repo root (the script `cd`s there automatically). **Recommended** SmolVLA fine-tune (~20k steps; override `STEPS` as needed):
+## 6. Evaluation (Isaac Lab)
 
 ```bash
-STEPS=20000 ./vla_lab/scripts/train_smolvla.sh
+# Default config (vla_lab/configs/eval_isaac.yaml): 10 episodes, scene mirrors collect_v3
+./vla_lab/scripts/eval.sh --num-episodes 10 --headless --ckpt vla_lab/checkpoints/tiny_v0/last.pt
+
+# With the GUI (watch the behavior):
+./vla_lab/scripts/eval.sh --num-episodes 5 --ckpt vla_lab/checkpoints/tiny_v0/last.pt
+
+# Per-tick action diagnostics (JSONL + console magnitudes, clamp counts):
+./vla_lab/scripts/eval.sh --num-episodes 3 --headless --debug-actions
+
+# Execution-path regression test WITHOUT a policy: open-loop replay of a recorded episode.
+# Expect smooth motion and ~mm-level EE tracking error vs the demo.
+./vla_lab/scripts/eval.sh --replay-episode logs/data_collection/session_<TS>/episode_0000 --headless
+
+# K-sample TTC / act-compute-query controllers: see §8.
 ```
 
-Defaults use **`vla_lab/datasets/lerobot_kinova_v0`**, **`lerobot/smolvla_base`**, and a timestamped checkpoint dir under **`vla_lab/checkpoints/`**. Omitting `STEPS` falls back to the script default (**9824** steps). Override any variable via the environment, for example:
+Results: `vla_lab/eval_results/<run>/results.json` (per-episode success, lift heights,
+latency stats).
 
-```bash
-DATASET_DIR="$(pwd)/vla_lab/datasets/lerobot_kinova_v0" \
-POLICY_PATH=lerobot/smolvla_base \
-DATASET_REPO_ID=kinova_isaac_vla \
-STEPS=20000 BATCH_SIZE=32 DEVICE=cuda \
-OUT_DIR="$(pwd)/vla_lab/checkpoints/smolvla_kinova_ft" \
-./vla_lab/scripts/train_smolvla.sh
-```
+### If eval motion ever looks erratic again
 
-YAML (paths in `train_smolvla.example.yaml`; edit `dataset.root`, `training.output_dir`, etc.):
+`docs/EVAL_DEBUG_REPORT.md` is the postmortem of the 2026-06 "flailing" bug. Checklist:
 
-```bash
-python -m vla_lab.train_smolvla --config vla_lab/configs/train_smolvla.example.yaml
-```
+1. `eval.policy_rate_hz` **must equal** the collection `--log-rate-hz` (15). A mismatch
+   stretches/compresses every action in time (`train_action_rate_hz` rescales + warns).
+2. The eval pre-roll target `eval.start_ee_pos_b` must equal collection's
+   `--start-ee-pos-b` (0.454 0.093 0.210).
+3. Run the `--replay-episode` test above: if replay is smooth, the model is the problem;
+   if not, the execution path is.
+4. `--debug-actions` should show |Δp| ≲ 35 mm per tick and zero safety clamps.
 
-Extra `lerobot-train` flags go at the end of either invocation, e.g. `--wandb.enable=true`. See `lerobot-train --help` for your installed version.
+## 7. The model contract (do not change one side only)
 
-**Training metrics and paper artifacts:** by default, `train_smolvla.sh` / `train_smolvla.py` wrap `lerobot-train` to write **`vla_lab/results/<UTC-date>/<run-name>/`**: `train_metrics.csv`, `train_metrics.jsonl`, `figures/*.pdf` (and PNG where emitted), `train_console.log`, `run_meta.json`, etc. Set **`VLA_LAB_CAPTURE_RESULTS=0`** to skip this wrapper. Full layout and field glossary: [`smoll-vla-setup.md`](./smoll-vla-setup.md) §8.6.
-
-**4. Resume**
-
-Use the **same** `--output_dir` as the first run. With the shell wrapper:
-
-```bash
-RESUME=true OUT_DIR=/path/to/same/checkpoint/dir ./vla_lab/scripts/train_smolvla.sh
-```
-
-Or set `training.resume: true` in the YAML and keep `training.output_dir` fixed.
-
-**5. After training**
-
-Checkpoints and LeRobot metadata live under `OUT_DIR` / `training.output_dir`. Optional:
-
-```bash
-RUN_DIR=vla_lab/checkpoints/smolvla_kinova_ft ./vla_lab/scripts/after_smolvla_train.sh
-```
-
-**6. Isaac eval with a SmolVLA checkpoint**
-
-Use `vla_lab/eval_isaaclab.py` with **`policy_backend: smolvla`** (or CLI equivalent) and pass the LeRobot output directory / checkpoint path your run produced — see `vla_lab/configs/eval_isaac.yaml` and `--help` on `eval_isaaclab.py`.
-
-### 5.5 Evaluate in Isaac Lab
-
-Evaluation reuses the existing `reach_to_grasp_VLA` scene + Cartesian
-velocity controller. The trained policy is plugged in via a custom
-`PolicyInputProvider` that converts each predicted action chunk into per-
-physics-step velocity commands.
-
-```bash
-# Default config: 10 episodes, K=1 (no TTC sampling)
-./vla_lab/scripts/eval.sh --num-episodes 10
-
-# Headless eval with the K=4 sample-and-verify pipeline
-./vla_lab/scripts/eval.sh \
-    --num-episodes 20 \
-    --headless \
-    --ckpt vla_lab/checkpoints/tiny_v0/last.pt
-
-# Without the wrapper:
-./IsaacLab/isaaclab.sh -p vla_lab/eval_isaaclab.py \
-    --config vla_lab/configs/eval_isaac.yaml \
-    --enable_cameras --device cuda:0 --num-episodes 10
-```
-
-Each run writes a `results_<unix_ts>.json` under `eval.out_dir` with:
-
-```jsonc
-{
-  "num_episodes": 10,
-  "num_success": 7,
-  "success_rate": 0.7,
-  "ckpt": "vla_lab/checkpoints/tiny_v0/last.pt",
-  "config": {...},
-  "results": [
-    {"episode_idx": 0, "target_leaf": "Obj_01", "instruction": "...",
-     "z0_target": 0.81, "z_after": 0.93, "success": true,
-     "steps": 2200, "elapsed_s": 31.5},
-    ...
-  ]
-}
-```
-
-Toggle K-sample TTC by editing `ttc.k_action_samples` in
-`vla_lab/configs/eval_isaac.yaml` (1 = no TTC, 4 = the spec's default).
-
-#### Debugging erratic eval behavior
-
-- `eval.policy_rate_hz` **must equal the collection `--log-rate-hz`** of the
-  training session (`collect.sh` = 5 Hz, `collect_v3.sh` = 15 Hz; check the
-  session's `episode_*/metadata.json`). Actions are EE deltas *per logged
-  tick*; running eval at a different rate replays them at the wrong speed.
-  `eval.train_action_rate_hz` lets eval rescale (with a warning) if they differ.
-- `--debug-actions` logs per-policy-tick action magnitudes + EE positions to
-  `out_dir/debug_actions_*.jsonl` and the console.
-- `--replay-episode logs/data_collection/session_X/episode_0000` runs an
-  **open-loop replay** of a recorded episode through the controller (no
-  policy). If replay is smooth and roughly tracks the demo, the execution
-  path is healthy and problems are on the model/observation side.
-- `eval.max_action_dpos_m` / `eval.max_action_drot_rad` clamp runaway
-  per-action deltas and report how often they trigger.
-- Sessions collected before the 2026-06 gripper-state fix log every tick as
-  `open` (the detector averaged finger *tip* joints and used too high a
-  threshold, so stalled-on-object grasps never registered). Repair them with
-  `python -m vla_lab.repair_gripper_labels --session <session_dir>` before
-  training.
-
-## 6. Action / observation contract
-
-This is what the dataset, model, and eval all agree on. Keep this stable
-when extending — it lets us swap models without touching anything else.
-
-| Symbol | Shape | Description |
+| Item | Value | Defined in |
 | --- | --- | --- |
-| Image | `(3, H, W)` float in `[0, 1]` | Top-down camera, resized to `H = W = 224`. |
-| State | `(state_dim,)` float | `[ee_x_b, ee_y_b, ee_z_b, gripper_open_flag]` (state_dim = 4). |
-| Language tokens | `(max_lang_len,)` long, `(max_lang_len,)` long | `lang_ids`, `lang_mask` from `TinyTokenizer`. |
-| Action | `(T, 7)` float | `T = chunk_len = 8`. Per timestep: `[dx, dy, dz, drx, dry, drz, gripper]` in base frame. `gripper ∈ {-1, 0, +1}`. |
+| Observation | one 224×224 RGB (resized from 640×640 top-down) + EE pos + gripper flag | `dataset.py`, camera in `environments/reach_to_grasp_VLA/config.py` |
+| Action | `(8, 7)` chunk of per-tick deltas `[dx,dy,dz,drx,dry,drz,g]`, base frame, `g∈{-1,0,+1}` | `data_collection/core/logger.py` (`action_from_prev`) |
+| Tick rate | **15 Hz** sim time | `collect_v3.sh` ≡ `eval_isaac.yaml policy_rate_hz` |
+| Start pose | EE `(0.454, 0.093, 0.210)` base frame | `--start-ee-pos-b` ≡ `eval.start_ee_pos_b` |
+| Scene | 6×8 cm unique-color boxes, spawn AABB (0.26,−0.34)–(0.52,0.36), ≥0.16 m apart | `collect_v3.sh` ≡ `eval_isaac.yaml` |
 
-The action is exactly what `vla_v1.py` writes as `policy.action_from_prev`
-in `ticks.jsonl`, so the supervised target is always available without
-custom labelling.
+## 8. HRI-2027 act / compute / query experiments
 
-## 7. HRI 2027 pivot — act/compute/query allocator, calibration & human study
-
-> The project has pivoted from the CoRL "TTC under partial observability" framing (§1–§6,
-> still runnable) to an **HRI 2027** contribution. The full memo is
-> [`project_pivot_VLA_HRI2027.md`](./project_pivot_VLA_HRI2027.md). One-sentence thesis:
-> *self-generated uncertainty tells a policy **how** to spend compute, but not **when**
-> compute is useless — and that regime is exactly where it must **ask a human**.*
-
-Inference-time decision-making is reframed from a binary (act vs. compute) gate into a
-**trichotomy — act / compute / query** — governed by visual observability. Three new,
-self-contained packages implement it, all **pure-Python/NumPy at the core** (no torch / Isaac
-/ LeRobot import to load), so the whole thing is runnable and testable offline:
-
-| Package | Memo | What it is |
-| --- | --- | --- |
-| `vla_lab/allocation/` | §3, C3 | The act/compute/query allocator (`allocator.py`), VoC-vs-VoI rule (`value_of_information.py`), conformal escalation (`conformal.py`), uncertainty probes (`uncertainty.py`), the 6 comparison controllers (`baselines.py`: autonomy / fixed-compute / compute-gated / SCALE / KnowNo / INSIGHT), human-query interface (`query.py`), and uncertainty-type transparency (`transparency.py`). Torch policy adapters live in `policy_adapters.py` (imported only by the Isaac glue). |
-| `vla_lab/calibration/` | §4.2–4.3 | "Result 2": ECE, the agreement→correctness **decoupling**, and conformal **coverage under occlusion shift** (`metrics.py`), the per-step record schema (`records.py`), and a figure CLI (`analyze.py`). |
-| `vla_lab/human_study/` | §5 | The study layer: design + counterbalancing (`protocol.py`), NASA-TLX / Jian-2000 / MDMT scoring (`instruments.py`), appropriate-reliance & over-trust (`reliance.py`), power analysis (`power.py`), an offline session runner with synthetic robot+human (`session.py`), and a figure CLI (`analyze.py`). |
-| `vla_lab/fit_allocator.py` | C3 | "Trains" the query branch: fits the irreducibility detector + conformal rule from a calibration log → `allocator_fit.json`. |
-
-`eval_isaaclab.py` gained `--controller / --allocator-fit / --emit-calibration` (and an
-`allocation:` block in `configs/eval_isaac.yaml`) to run any controller inside the existing
-Isaac scene and log calibration records.
-
-### 7.1 Validate offline first (no robot, no humans, no Isaac)
-
-Everything below is pure Python + NumPy (+ matplotlib for figures). Start here — it confirms
-the whole pipeline works before you touch hardware.
+Built on top of the eval loop: at each policy tick a controller decides to **act** (1 forward
+pass), **compute** (K samples + consensus), or **query** the human. See `allocation/`,
+`calibration/`, `human_study/`.
 
 ```bash
-# Run the full offline test suite (51 tests: allocator, calibration, human study, fit).
-./vla_lab/scripts/run_tests.sh
+# Offline first — no Isaac, no robot, ~seconds:
+./vla_lab/scripts/run_tests.sh                       # 51 tests must pass
+./vla_lab/scripts/human_study_pilot.sh               # synthetic end-to-end study + figures
+./vla_lab/scripts/power_analysis.sh                  # sample-size memo
 
-# Pilot the entire human study with a synthetic robot + human, then analyze + plot it.
-# Reproduces the headline: the type-aware allocator cuts over-trust vs. the baselines.
-PARTICIPANTS=12 DESIGN=within ./vla_lab/scripts/human_study_pilot.sh
-#   -> vla_lab/study_runs/pilot/study.jsonl
-#   -> vla_lab/results/human_study/{study_summary.json, *_by_condition.pdf, overtrust_vs_occlusion.pdf}
+# Robot-only calibration sweep ("Result 2", needs Isaac):
+OUT_ROOT=vla_lab/results/calibration_records ./vla_lab/scripts/sweep_occlusion_eval.sh
+./vla_lab/scripts/fit_allocator.sh                   # -> allocator_fit.json
+./vla_lab/scripts/calibration_analyze.sh             # -> reliability/ECE/coverage figures
 
-# Sample-size / power analysis (memo §10). Three modes:
-./vla_lab/scripts/power_analysis.sh --from-log vla_lab/study_runs/pilot/study.jsonl --design paired
-./vla_lab/scripts/power_analysis.sh --d 0.5                 # a continuous paired DV (trust / TLX)
-./vla_lab/scripts/power_analysis.sh --p1 0.88 --p2 0.56     # two reliance proportions
+# Controllers inside eval (same scenes/seeds for comparisons):
+./vla_lab/scripts/eval.sh --controller allocator --allocator-fit vla_lab/results/allocator_fit.json
+./vla_lab/scripts/eval.sh --controller compute_gated   # or: autonomy | fixed_compute | scale | knowno | insight
 ```
 
-### 7.2 Robot-only calibration sweep — "Result 2" (needs Isaac Lab)
+## 9. Known gotchas
 
-This is the empirical heart of the pivot and needs **no humans**. Run the policy across
-occlusion levels, log per-step calibration records, fit the allocator, and make the figures.
+- **NumPy 2.x freezes Isaac collection** — keep `numpy<2` in `riften`.
+- **`--enable_cameras` is required at collection AND eval** (the wrappers pass it). Without
+  it there are no images and the dataset refuses to build.
+- **Exit 137 during collection** = OOM kill → headless + smaller chunks.
+- **Exit 3 during collection** = the respawn watchdog aborted the run (frozen layout
+  protection). Do not bypass; see guide §5.1.
+- `eval_isaaclab.py` must run under the **IsaacLab launcher** (`eval.sh` handles this);
+  plain `python` can't import `isaaclab.app`.
+- Floats in `ticks.jsonl` are **4-decimal strings**; parse with `vla_lab.dataset`.
+- First tick of each episode has `action_from_prev = null` (no previous tick) — handled by
+  the dataset.
+- Sessions collected **before 2026-06-11** have the old camera framing and the frozen-layout
+  bug → don't mix with new data; `tiny_v0` checkpoints predate the fixes entirely.
 
-```bash
-# 1. Sweep occlusion in Isaac, emitting per-step calibration records under OUT_ROOT/*/records.jsonl.
-#    CONTROLLER=compute_gated logs the twin-probe dispersion at every step; --policy-backend smolvla too.
-OUT_ROOT=vla_lab/calibration_runs/run_a NUM_EPISODES=50 \
-  ./vla_lab/scripts/calibration_eval.sh
+## 10. Document index
 
-# 2. Fit the allocator (irreducibility detector + conformal rule) -> allocator_fit.json.
-CALIB='vla_lab/calibration_runs/run_a/*/records.jsonl' \
-OUT=vla_lab/fits/allocator_fit.json \
-  ./vla_lab/scripts/fit_allocator.sh
-
-# 3. Make the Result-2 figures (reliability, ECE-vs-occlusion, agreement-vs-correctness, coverage).
-CALIB='vla_lab/calibration_runs/run_a/*/records.jsonl' \
-  ./vla_lab/scripts/calibration_analyze.sh
-#   -> vla_lab/results/calibration/{calibration_summary.json, reliability_diagram.pdf,
-#      ece_vs_occlusion.pdf, agreement_vs_correctness.pdf, coverage_vs_occlusion.pdf}
-```
-
-### 7.3 Run a controller inside the Isaac eval (needs Isaac Lab)
-
-Once you have `allocator_fit.json`, drop any controller into the normal eval. Either pass
-flags, or set the `allocation:` block in `vla_lab/configs/eval_isaac.yaml`.
-
-```bash
-# The full act/compute/query allocator (query branch unlocked by the fit):
-./vla_lab/scripts/eval.sh \
-  --num-episodes 50 --occlusion-mode bottom_strip --occlusion-fraction 0.5 \
-  --controller allocator --allocator-fit vla_lab/fits/allocator_fit.json
-
-# A baseline for comparison (same scenes/seeds): autonomy | fixed_compute | compute_gated | scale | knowno | insight
-./vla_lab/scripts/eval.sh --num-episodes 50 --controller knowno --allocator-fit vla_lab/fits/allocator_fit.json
-```
-
-The eval JSON gains a `controller_aggregate` block (act/compute/query fractions, query rate,
-mean K, latency). `controller: none` (the default) keeps the legacy TTC path from §5.5.
-
-### 7.4 The real human study
-
-`session.py` is hardware/human-agnostic: the robot loop and the human's answers are *injected*
-into `SessionRunner`. To run for real, replace `SimEpisodeRunner` with the Kinova JACO loop and
-`SimQuestionnaireProvider` with your study front-end, write the JSONL with `StudyLogger`, then
-analyze it exactly like the pilot:
-
-```bash
-LOG=vla_lab/study_runs/study_2026.jsonl ./vla_lab/scripts/human_study_analyze.sh
-```
-
-### 7.5 Command / module quick reference
-
-| Goal | Command |
+| Document | Content |
 | --- | --- |
-| Run all offline tests | `./vla_lab/scripts/run_tests.sh` (or `python -m vla_lab.tests.run_tests`) |
-| Offline study pilot + figures | `./vla_lab/scripts/human_study_pilot.sh` |
-| Power / sample size | `./vla_lab/scripts/power_analysis.sh --from-log <log> --design paired` |
-| Calibration sweep (Isaac) | `OUT_ROOT=... ./vla_lab/scripts/calibration_eval.sh` |
-| Fit the allocator | `CALIB='...' ./vla_lab/scripts/fit_allocator.sh` |
-| Calibration figures | `CALIB='...' ./vla_lab/scripts/calibration_analyze.sh` |
-| Controller eval (Isaac) | `./vla_lab/scripts/eval.sh --controller allocator --allocator-fit <fit>` |
-| Analyze a study log | `LOG=... ./vla_lab/scripts/human_study_analyze.sh` |
-
-All of these honor env-var overrides (e.g. `DEVICE`, `FORMAT=png`, `NUM_EPISODES`); read the
-top of each script for the full list, and pass extra flags through after the script name.
-
-## 8. Known gotchas
-
-- **`--enable_cameras` is required at collection time.** Without it
-  `images/` is empty and the dataset will refuse to construct.
-- **The dataset stringifies all floats** to 4 decimal places. The reader
-  parses this back; any extra post-processing pipelines should do the
-  same (`vla_lab.dataset._to_float_maybe`).
-- **The first tick of every episode has `policy.action_from_prev = None`**
-  because there is no previous tick. The dataset training-frame index
-  skips frames whose chunk would only contain that tick.
-- **`vla_lab/eval_isaaclab.py` must be run with the IsaacLab launcher**
-  (`./IsaacLab/isaaclab.sh -p vla_lab/eval_isaaclab.py ...`). Plain
-  `python` will fail because `isaaclab.app` isn't on the path.
-- **Action stats live in the checkpoint.** If you run eval with a
-  checkpoint that was trained with `normalize_actions: true`, the eval
-  loader will automatically denormalize predicted chunks before sending
-  them to the controller — no manual handling needed.
-
-## 9. Where to look next
-
-- The big picture and the full method are in
-  [`vla_ttc_engineering_spec.md`](./vla_ttc_engineering_spec.md).
-- For the on-disk format of the data we consume, see
-  `data_collection/core/logger.py` (the canonical writer) and the
-  `vla_v1` profile in `data_collection/profiles/vla_v1.py`.
-- For the scene + camera definitions used at collection AND eval time,
-  see `environments/reach_to_grasp_VLA/config.py`.
+| [`data_collection_guide.md`](./data_collection_guide.md) | Pipeline anatomy, data/action contract, 2026-06-11 bug fixes, final-dataset procedure, troubleshooting |
+| [`docs/EVAL_DEBUG_REPORT.md`](./docs/EVAL_DEBUG_REPORT.md) | Postmortem: why eval flailed and how every root cause was fixed |
+| [`docs/new_changes.md`](./docs/new_changes.md) | Eval protocol design notes (Wilson CIs, occlusion axes, SmolVLA comparison) |
+| [`docs/FABLE_INSTRUCTIONS.md`](./docs/FABLE_INSTRUCTIONS.md) | Historical task brief for the eval debug (context for the report) |

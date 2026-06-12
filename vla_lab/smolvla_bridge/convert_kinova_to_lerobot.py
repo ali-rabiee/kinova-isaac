@@ -21,7 +21,7 @@ from typing import Any, Dict, Sequence
 import numpy as np
 from PIL import Image
 
-from vla_lab.dataset import discover_episodes, split_episodes
+from vla_lab.dataset import EpisodeRecord, discover_episodes, split_episodes
 
 from .action_obs_contract import (
     ACTION_KEY,
@@ -81,6 +81,7 @@ def convert(
     train_only: bool,
     drop_no_image: bool,
     overwrite: bool,
+    success_only: bool = True,
 ) -> Dict[str, Any]:
     try:
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -91,7 +92,7 @@ def convert(
         ) from exc
 
     roots = [Path(p) for p in session_roots]
-    episodes = discover_episodes(roots)
+    episodes = discover_episodes(roots, success_only=success_only)
     if not episodes:
         raise RuntimeError(f"No episodes found under roots: {[str(r) for r in roots]}")
 
@@ -200,6 +201,11 @@ def main() -> int:
     )
     p.add_argument("--keep-empty-image-frames", action="store_true", help="Allow black frames when PNG missing")
     p.add_argument("--overwrite", action="store_true", help="Delete out-dir if it exists.")
+    p.add_argument(
+        "--include-failed",
+        action="store_true",
+        help="Also export failed/truncated/unknown-outcome episodes (default: successful lifts only).",
+    )
     args = p.parse_args()
 
     manifest = convert(
@@ -212,6 +218,7 @@ def main() -> int:
         train_only=bool(args.train_only),
         drop_no_image=not bool(args.keep_empty_image_frames),
         overwrite=bool(args.overwrite),
+        success_only=not bool(args.include_failed),
     )
     print(json.dumps(manifest, indent=2))
     return 0

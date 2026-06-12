@@ -157,13 +157,17 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
         "--target-selection",
         type=str,
         default="first",
-        choices=["first", "random", "farthest", "farthest_no_repeat"],
+        choices=["first", "cycle", "random", "farthest", "farthest_no_repeat"],
         help=(
             "How to choose the target when no --target-prim/--target-index is provided. "
+            "'cycle' (recommended for VLA data): deterministic round-robin over all objects, so every "
+            "object/color/index appears equally often — required for full language coverage. "
+            "'first' is a legacy alias of the same round-robin behavior. "
             "'farthest' = among objects inside the workspace XY box (see --workspace-min/max-x/y and "
             "--target-reach-margin-m), pick the largest base-frame XY distance from the robot base. "
             "'farthest_no_repeat' = same, but after a successful lift the next episode cannot pick "
-            "the same object again (when at least two candidates exist)."
+            "the same object again — note this tends to ALTERNATE between the two farthest objects "
+            "and starves the rest (observed: 2 unique targets in a 20-episode session)."
         ),
     )
     parser.add_argument(
@@ -227,6 +231,34 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     # declare the final approach "done" before we are allowed to close, leading to hover/requeue loops.
     parser.add_argument("--tolerance", type=float, default=0.005, help="Waypoint tolerance for planner control (m)")
     parser.add_argument("--stabilize-steps", type=int, default=300, help="Hold steps before first plan (physics settle)")
+    # Canonical episode start pose (base frame). Before tick logging starts, the EE is
+    # driven here with a scripted (unlogged) pre-roll and actively held during the
+    # stabilize window. Without this, episodes begin with the arm slowly sagging from
+    # the freshly written default joint state (~14 ticks of instruction-independent
+    # drift logged as actions). The default matches `eval.start_ee_pos_b` in
+    # vla_lab/configs/eval_isaac.yaml so train and eval start from the same pose.
+    parser.add_argument(
+        "--start-ee-pos-b",
+        type=float,
+        nargs=3,
+        default=[0.454, 0.093, 0.210],
+        help="Canonical EE start position in base frame (m). Must match eval's start_ee_pos_b.",
+    )
+    parser.add_argument(
+        "--no-start-preroll",
+        action="store_true",
+        help="Disable the scripted pre-roll to --start-ee-pos-b (restores legacy sagging starts).",
+    )
+    parser.add_argument("--preroll-max-steps", type=int, default=600, help="Max physics steps for the start pre-roll.")
+    parser.add_argument("--preroll-tol-m", type=float, default=0.01, help="Convergence tolerance (m) for the start pre-roll.")
+    parser.add_argument(
+        "--log-stabilize-ticks",
+        action="store_true",
+        help=(
+            "Also write ticks during the per-episode stabilize hold. Default: skipped, because those "
+            "frames are idle (no commanded motion) and dilute the dataset with do-nothing actions."
+        ),
+    )
     parser.add_argument("--gripper-open-steps", type=int, default=10, help="Steps to open gripper before approach")
     parser.add_argument("--gripper-close-steps", type=int, default=60, help="Steps to close gripper at grasp")
     parser.add_argument(
@@ -526,6 +558,11 @@ def run(args: argparse.Namespace) -> int:
         _dr_cam_prim_path = None
 
     _dr_light_prim_path = "/World/Light"
+    # Light baseline is cached on first use. Re-reading the current intensity/color each
+    # episode compounds the randomization (a multiplicative random walk): after ~100
+    # episodes the scene drifts arbitrarily dark/bright and colors saturate.
+    _dr_base_light_intensity: Optional[float] = None
+    _dr_base_light_color: Optional[tuple[float, float, float]] = None
     _dr_seed_base = None
     try:
         # Use user-provided seed when available; otherwise sample once per run.
@@ -542,6 +579,7 @@ def run(args: argparse.Namespace) -> int:
         Off by default; enabled via --domain-rand.
         Returns the sampled parameters dict when applied.
         """
+        nonlocal _dr_base_light_intensity, _dr_base_light_color
         if not domain_rand_enabled:
             return None
         try:
@@ -566,18 +604,21 @@ def run(args: argparse.Namespace) -> int:
             prim = stage.GetPrimAtPath(str(_dr_light_prim_path))
             if prim.IsValid():
                 dome = UsdLux.DomeLight(prim)
-                # Read current as baseline if possible
-                base_int = None
-                base_col = None
-                try:
-                    base_int = float(dome.GetIntensityAttr().Get())
-                except Exception:
-                    base_int = 2000.0
-                try:
-                    c = dome.GetColorAttr().Get()
-                    base_col = (float(c[0]), float(c[1]), float(c[2]))
-                except Exception:
-                    base_col = (0.75, 0.75, 0.75)
+                # Read the baseline ONCE (before any randomization touched the light) and
+                # cache it; every episode then randomizes around the same stable baseline.
+                if _dr_base_light_intensity is None:
+                    try:
+                        _dr_base_light_intensity = float(dome.GetIntensityAttr().Get())
+                    except Exception:
+                        _dr_base_light_intensity = 2000.0
+                if _dr_base_light_color is None:
+                    try:
+                        c = dome.GetColorAttr().Get()
+                        _dr_base_light_color = (float(c[0]), float(c[1]), float(c[2]))
+                    except Exception:
+                        _dr_base_light_color = (0.75, 0.75, 0.75)
+                base_int = float(_dr_base_light_intensity)
+                base_col = tuple(_dr_base_light_color)
 
                 mult_min = float(getattr(args, "domain_rand_light_intensity_mult_min", 0.5))
                 mult_max = float(getattr(args, "domain_rand_light_intensity_mult_max", 1.5))
@@ -777,6 +818,19 @@ def run(args: argparse.Namespace) -> int:
     except Exception:
         pass
 
+    # Box identity is conveyed ONLY by color (no visible digits). With more boxes than
+    # palette colors, colors repeat and instructions like "pick up the red box" (or
+    # "box 7", which is visually identical to "box 1") become ungroundable.
+    if str(getattr(args, "spawn_mode", "usd")) == "box" and len(spawned_paths) > len(BOX_COLORS):
+        print("=" * 100)
+        print(
+            f"[VLA_V1][WARNING] {len(spawned_paths)} boxes spawned but the color palette has only "
+            f"{len(BOX_COLORS)} colors — colors repeat, so color/number instructions are AMBIGUOUS. "
+            f"Use --num-objects <= {len(BOX_COLORS)} for clean language grounding. "
+            "Color- and number-specific instruction templates are disabled for this run."
+        )
+        print("=" * 100)
+
     def _prim_label(prim_path: str) -> str:
         """Best-effort: map a prim path to a human label using ObjectLoader's id_to_label mapping.
 
@@ -917,7 +971,7 @@ def run(args: argparse.Namespace) -> int:
                 return random.choice(candidates)
             except Exception:
                 return candidates[0]
-        elif sel == "first":
+        elif sel in ("first", "cycle"):
             # Proper episode-to-episode cycling (non-repeating when possible).
             # If we have a previous target and it's still a valid candidate, pick the *next* one.
             if len(candidates) == 0:
@@ -959,6 +1013,12 @@ def run(args: argparse.Namespace) -> int:
             "Please pick up the {label}.",
             "Move to the {label} and pick it up.",
         ]
+        # Color/number-specific templates are only well-grounded while every spawned box
+        # has a unique color (boxes carry no visible digits — color IS the identity).
+        colors_unique = len(spawned_paths) <= len(BOX_COLORS)
+        if not colors_unique:
+            box_idx = None
+            color_name = None
         # Add more specific box templates when possible.
         if box_idx is not None:
             templates += [
@@ -1014,11 +1074,6 @@ def run(args: argparse.Namespace) -> int:
             return None
         return None
 
-    # Cache for Isaac Sim core prim wrappers used during respawn (box mode).
-    # We use `isaacsim.core.prims.RigidPrim` because it is physics-aware and survives repeated `sim.reset()`
-    # better than raw tensor views in this script.
-    _respawn_rigidprims: dict[str, object] = {}
-
     def _rerandomize_object_poses(
         paths: list[str],
         *,
@@ -1028,6 +1083,15 @@ def run(args: argparse.Namespace) -> int:
 
         This avoids PhysX GPU tensor crashes that can happen if we destroy and recreate
         dynamic rigid bodies while tensor views exist.
+
+        IMPORTANT: with the GPU pipeline + Fabric, PhysX tensor-view writes are the only
+        reliable teleport path (USD / `isaacsim.core.prims.RigidPrim` pose writes are ignored
+        for dynamic bodies while the sim is playing). `RigidBodyView.set_transforms` and
+        `set_velocities` REQUIRE the `indices` argument in current Isaac Sim builds — an
+        earlier version of this code omitted it, and the resulting TypeError was swallowed,
+        silently freezing the object layout for entire sessions (every episode identical).
+        The episode loop now verifies the teleport by reading poses back; see
+        `object_respawn_mismatch` events.
 
         Args:
             paths: Object root prim paths (e.g. /World/Origin1/Objects/Obj_01).
@@ -1044,7 +1108,8 @@ def run(args: argparse.Namespace) -> int:
             import torch
             import importlib
             from isaacsim.core.simulation_manager import SimulationManager
-        except Exception:
+        except Exception as imp_err:
+            print(f"[VLA_V1][RESPAWN][ERROR] required modules unavailable: {imp_err}")
             return None
 
         # Best-effort: locate the *actual* rigid body prim under each object root.
@@ -1055,21 +1120,14 @@ def run(args: argparse.Namespace) -> int:
         UsdPhysics = None
         omni_usd = None
         sim_utils = None
-        RigidPrim = None
         try:
             UsdPhysics = importlib.import_module("pxr.UsdPhysics")
             omni_usd = importlib.import_module("omni.usd")
             sim_utils = importlib.import_module("isaaclab.sim")
-            try:
-                # Physics-aware rigid prim wrapper (teleport + velocities) backed by SimulationManager tensor views.
-                RigidPrim = importlib.import_module("isaacsim.core.prims").RigidPrim
-            except Exception:
-                RigidPrim = None
         except Exception:
             UsdPhysics = None
             omni_usd = None
             sim_utils = None
-            RigidPrim = None
 
         # Bounds are in meters relative to parent prim; in this env parent is /World/Origin1.
         # IMPORTANT: keep using the configured Z spawn band (often well above the table) so objects
@@ -1144,62 +1202,7 @@ def run(args: argparse.Namespace) -> int:
         except Exception:
             origin0 = None
 
-        def _teleport_via_rigidprim(
-            *,
-            rb_prim_path: str,
-            pos_xyz: tuple[float, float, float],
-            quat_wxyz: tuple[float, float, float, float],
-        ) -> bool:
-            """Teleport a rigid prim using `isaacsim.core.prims.RigidPrim` (box mode only).
-
-            This does NOT call sim.reset() and does not delete/recreate prims.
-            """
-            if RigidPrim is None:
-                return False
-            try:
-                import numpy as np
-
-                key = str(rb_prim_path)
-                rp = _respawn_rigidprims.get(key)
-                if rp is None:
-                    # reset_xform_properties=False avoids rewriting xformOpOrder on every init.
-                    rp = RigidPrim(prim_paths_expr=str(rb_prim_path), name=f"respawn_{key.split('/')[-1]}", reset_xform_properties=False)
-                    _respawn_rigidprims[key] = rp
-
-                # Ensure physics handles are valid after sim.reset().
-                try:
-                    if hasattr(rp, "initialize"):
-                        rp.initialize()
-                except Exception:
-                    pass
-
-                pos = np.array([[float(pos_xyz[0]), float(pos_xyz[1]), float(pos_xyz[2])]], dtype=np.float32)
-                ori = np.array(
-                    [[float(quat_wxyz[0]), float(quat_wxyz[1]), float(quat_wxyz[2]), float(quat_wxyz[3])]],
-                    dtype=np.float32,
-                )
-
-                # Teleport pose (RigidPrim uses scalar-first quaternions: wxyz).
-                try:
-                    rp.set_world_poses(positions=pos, orientations=ori)
-                except TypeError:
-                    # Some versions accept positional args.
-                    rp.set_world_poses(pos, ori)
-
-                # Zero velocities (GPU-safe): [vx,vy,vz, wx,wy,wz]
-                try:
-                    rp.set_velocities(np.zeros((1, 6), dtype=np.float32))
-                except Exception:
-                    # Best-effort fallback
-                    try:
-                        rp.set_linear_velocities(np.zeros((1, 3), dtype=np.float32))
-                        rp.set_angular_velocities(np.zeros((1, 3), dtype=np.float32))
-                    except Exception:
-                        pass
-                return True
-            except Exception:
-                return False
-
+        failed_paths: list[str] = []
         for prim_path, pos, yaw in zip(paths, positions, yaws):
             try:
                 rb_path = str(prim_path)
@@ -1228,24 +1231,6 @@ def run(args: argparse.Namespace) -> int:
                 except Exception:
                     rb_path = str(prim_path)
 
-                # Box mode: RigidPrim can report success but not commit poses after sim.reset(); never skip
-                # the tensor-view path below (that was leaving objects frozen across episodes).
-                try:
-                    if str(getattr(args, "spawn_mode", "usd")) == "box":
-                        qw, qx, qy, qz = _yaw_quat_wxyz(yaw)
-                        px, py, pz = float(pos[0]), float(pos[1]), float(pos[2])
-                        if origin0 is not None and origin0.numel() >= 3:
-                            px += float(origin0[0].item())
-                            py += float(origin0[1].item())
-                            pz += float(origin0[2].item())
-                        _teleport_via_rigidprim(
-                            rb_prim_path=str(rb_path),
-                            pos_xyz=(float(px), float(py), float(pz)),
-                            quat_wxyz=(float(qw), float(qx), float(qy), float(qz)),
-                        )
-                except Exception:
-                    pass
-
                 rb_view = sim_view.create_rigid_body_view(str(rb_path))
                 # Resolve a usable rigid-body view:
                 # - Some spawners produce a rigid-body on a child prim or instance proxy.
@@ -1266,11 +1251,9 @@ def run(args: argparse.Namespace) -> int:
                     # If we still can't read transforms, skip this object.
                     t0 = None
                 # If still empty, skip (keeps episode alive).
-                try:
-                    if t0 is not None and hasattr(t0, "shape") and int(getattr(t0, "shape")[0]) == 0:
-                        continue
-                except Exception:
-                    pass
+                if t0 is None or (hasattr(t0, "shape") and int(getattr(t0, "shape")[0]) == 0):
+                    failed_paths.append(str(prim_path))
+                    continue
                 qw, qx, qy, qz = _yaw_quat_wxyz(yaw)
                 # RigidBodyView transform format: [x,y,z,qx,qy,qz,qw]
                 px, py, pz = float(pos[0]), float(pos[1]), float(pos[2])
@@ -1282,26 +1265,44 @@ def run(args: argparse.Namespace) -> int:
                 dev = sim.device
                 n = 1
                 try:
-                    if t0 is not None and hasattr(t0, "device"):
+                    if hasattr(t0, "device"):
                         dev = t0.device
-                    if t0 is not None and hasattr(t0, "shape"):
-                        n = int(getattr(t0, "shape")[0])
-                        n = max(1, n)
+                    if hasattr(t0, "shape"):
+                        n = max(1, int(getattr(t0, "shape")[0]))
                 except Exception:
                     dev = sim.device
                     n = 1
                 tf = torch.tensor([[px, py, pz, float(qx), float(qy), float(qz), float(qw)]], device=dev)
                 if n != 1:
                     tf = tf.repeat(int(n), 1)
-                if hasattr(rb_view, "set_transforms"):
+                # `indices` is REQUIRED by current omni.physics.tensors (same pattern as
+                # IsaacLab's RigidObject.write_root_pose_to_sim). Keep a no-indices retry
+                # for older API builds.
+                idx = torch.arange(int(n), dtype=torch.long, device=dev)
+                try:
+                    rb_view.set_transforms(tf, indices=idx)
+                except TypeError:
                     rb_view.set_transforms(tf)
-                if hasattr(rb_view, "set_linear_velocities"):
-                    rb_view.set_linear_velocities(torch.zeros((int(n), 3), device=dev))
-                if hasattr(rb_view, "set_angular_velocities"):
-                    rb_view.set_angular_velocities(torch.zeros((int(n), 3), device=dev))
-            except Exception:
-                # Best-effort: skip failures (keeps episode alive)
+                # Zero velocities so teleported objects do not keep momentum: [vx,vy,vz,wx,wy,wz].
+                try:
+                    zeros6 = torch.zeros((int(n), 6), device=dev)
+                    try:
+                        rb_view.set_velocities(zeros6, indices=idx)
+                    except TypeError:
+                        rb_view.set_velocities(zeros6)
+                except Exception as vel_err:
+                    print(f"[VLA_V1][RESPAWN][WARN] could not zero velocities for {prim_path}: {vel_err}")
+            except Exception as tp_err:
+                # Do NOT fail silently: a swallowed teleport error is exactly how the
+                # frozen-layout bug went unnoticed for a full session.
+                print(f"[VLA_V1][RESPAWN][WARN] teleport failed for {prim_path}: {type(tp_err).__name__}: {tp_err}")
+                failed_paths.append(str(prim_path))
                 continue
+        if failed_paths:
+            print(
+                f"[VLA_V1][RESPAWN][WARN] teleport failed for {len(failed_paths)}/{len(paths)} objects: "
+                f"{[p.split('/')[-1] for p in failed_paths]}"
+            )
         return list(zip(positions, yaws))
 
     # Camera sensor for image capture (same pattern as vla_v0)
@@ -1325,12 +1326,6 @@ def run(args: argparse.Namespace) -> int:
 
     # Reset sim and robot
     def _reset_sim_and_robot() -> None:
-        # Cached `isaacsim.core.prims.RigidPrim` instances go stale across `sim.reset()`; reusing them
-        # makes respawn teleports silently fail so objects (and grasp OBB poses) freeze between episodes.
-        try:
-            _respawn_rigidprims.clear()
-        except Exception:
-            pass
         sim.reset()
         origin0 = torch.tensor(scene_origins[0], device=sim.device)
         root_state = robot.data.default_root_state.clone()
@@ -1562,6 +1557,7 @@ def run(args: argparse.Namespace) -> int:
         ee_link_name=str(getattr(args, "ee_link", "j2n6s300_end_effector")),
         arm_joint_regex=controller.config.arm_joint_regex,
         log_joint_data=True,  # Enable joint positions/velocities for VLA training
+        gripper_joint_regex=str(getattr(controller.config, "gripper_joint_regex", "") or "") or None,
     )
     # Create initial logger (for non-planner modes)
     # In planner mode, a new logger will be created for each episode
@@ -1726,6 +1722,39 @@ def run(args: argparse.Namespace) -> int:
         # Keep a per-cycle object layout so episodes 0..N-1 share poses, then we reshuffle.
         cycle_object_poses: Optional[list[tuple[tuple[float, float, float], float]]] = None
 
+        # Respawn watchdog: a silent teleport failure means every episode shares one frozen
+        # layout (zero scene diversity) — worse than no data. Abort after repeated mismatches.
+        respawn_mismatch_streak = 0
+        respawn_abort = False
+
+        def _write_episode_summary(
+            logger: "SessionLogWriter",
+            *,
+            episode_idx: int,
+            steps: int,
+            images: int,
+            truncated: bool,
+        ) -> None:
+            """One-file episode verdict so dataset builders can filter without parsing events."""
+            try:
+                import json as _json
+
+                summary = {
+                    "episode_idx": int(episode_idx),
+                    "success": bool(vla_planner_state.get("episode_lift_success", False)),
+                    "truncated": bool(truncated),
+                    "grasp_attempts": int(vla_planner_state.get("attempt_idx", 0)) + 1,
+                    "steps": int(steps),
+                    "ticks": int(logger.tick_idx),
+                    "images": int(images),
+                    "target_prim": str(vla_planner_state.get("target_prim", "") or ""),
+                    "target_label": _prim_label(str(vla_planner_state.get("target_prim", "") or "")),
+                    "language_command": str(vla_planner_state.get("language_command", "") or ""),
+                }
+                (logger.root / "episode_summary.json").write_text(_json.dumps(summary, indent=2))
+            except Exception as sum_err:
+                print(f"[VLA_V1][WARN] could not write episode_summary.json: {sum_err}")
+
         for ep in range(num_episodes):
             if not simulation_app.is_running():
                 print(f"[VLA_V1][EP] Simulation stopped, ending at episode {ep}/{num_episodes}")
@@ -1810,7 +1839,10 @@ def run(args: argparse.Namespace) -> int:
                                 )
                             except Exception:
                                 pass
-                            # Best-effort verification: read back current PhysX poses after one step.
+                            # Verification: read back current PhysX poses after one step and compare
+                            # with the intended teleport targets. Objects were just placed in the air,
+                            # so XY must match within a few cm; a large mismatch on most objects means
+                            # the teleport silently failed (frozen layout — the data would be junk).
                             try:
                                 sim.step(render=False)
                                 robot.update(dt)
@@ -1832,6 +1864,61 @@ def run(args: argparse.Namespace) -> int:
                                     )
                                 except Exception:
                                     pass
+
+                                # Intended teleports are world XY = parent-relative XY + origin offset
+                                # (origin is (0,0,0) for the single-origin scene).
+                                _ox, _oy = 0.0, 0.0
+                                try:
+                                    _ox = float(scene_origins[0][0])
+                                    _oy = float(scene_origins[0][1])
+                                except Exception:
+                                    _ox, _oy = 0.0, 0.0
+                                import math as _math
+
+                                mismatch_tol_m = 0.05
+                                n_checked = 0
+                                n_mismatch = 0
+                                worst_dev = 0.0
+                                for p, (ipos, _yaw) in zip(spawned_paths, new_poses):
+                                    leaf = str(p).split("/")[-1]
+                                    act = actual_xy.get(leaf)
+                                    if act is None:
+                                        continue
+                                    n_checked += 1
+                                    dev = _math.hypot(float(act[0]) - (float(ipos[0]) + _ox), float(act[1]) - (float(ipos[1]) + _oy))
+                                    worst_dev = max(worst_dev, dev)
+                                    if dev > mismatch_tol_m:
+                                        n_mismatch += 1
+                                respawn_ok = not (n_checked > 0 and n_mismatch > n_checked // 2)
+                                if respawn_ok:
+                                    respawn_mismatch_streak = 0
+                                else:
+                                    respawn_mismatch_streak += 1
+                                    msg = (
+                                        f"[VLA_V1][RESPAWN][ERROR] teleport verification FAILED at ep={int(ep)}: "
+                                        f"{n_mismatch}/{n_checked} objects are >{mismatch_tol_m*100:.0f}cm from their intended XY "
+                                        f"(worst {worst_dev:.3f}m). The object layout is NOT being re-randomized."
+                                    )
+                                    print("=" * 100)
+                                    print(msg)
+                                    print("=" * 100)
+                                    session_logger.log_event(
+                                        "object_respawn_mismatch",
+                                        {
+                                            "episode_idx": int(ep),
+                                            "n_mismatch": int(n_mismatch),
+                                            "n_checked": int(n_checked),
+                                            "worst_dev_m": float(worst_dev),
+                                            "streak": int(respawn_mismatch_streak),
+                                        },
+                                    )
+                                    if respawn_mismatch_streak >= 2:
+                                        print(
+                                            "[VLA_V1][RESPAWN][FATAL] Respawn verification failed on consecutive episodes. "
+                                            "Aborting collection: every episode would share one frozen object layout, "
+                                            "which produces worthless training data. Fix the teleport path before recollecting."
+                                        )
+                                        respawn_abort = True
                             except Exception:
                                 pass
                         else:
@@ -1841,6 +1928,13 @@ def run(args: argparse.Namespace) -> int:
                             )
                     else:
                         _rerandomize_object_poses(spawned_paths, poses=cycle_object_poses)
+
+                if respawn_abort:
+                    try:
+                        session_logger.close()
+                    except Exception:
+                        pass
+                    break
 
                 # HARD reset controller + follower per episode to avoid leftover impulses after sim.reset()
                 try:
@@ -1870,6 +1964,52 @@ def run(args: argparse.Namespace) -> int:
                             pass
                         sim.step(render=False)
                         robot.update(dt)
+
+                # Scripted pre-roll (unlogged): drive the EE to the canonical start pose so
+                # every episode's tick 0 begins from the same settled, actively-held pose —
+                # the same pose eval pre-rolls to. This removes the passive "sag" drift that
+                # used to occupy the first ~14 ticks of every episode.
+                episode_start_pos_b: Optional[tuple[float, float, float]] = None
+                if not bool(getattr(args, "no_start_preroll", False)):
+                    try:
+                        _sp = getattr(args, "start_ee_pos_b", None)
+                        if _sp is not None and len(_sp) == 3:
+                            episode_start_pos_b = (float(_sp[0]), float(_sp[1]), float(_sp[2]))
+                    except Exception:
+                        episode_start_pos_b = None
+                if episode_start_pos_b is not None:
+                    try:
+                        controller.set_mode("translate")
+                        preroll_tol = float(getattr(args, "preroll_tol_m", 0.01))
+                        preroll_cap = int(getattr(args, "preroll_max_steps", 600))
+                        wp.set_waypoints_b([episode_start_pos_b])
+                        n_preroll = 0
+                        for _ in range(preroll_cap):
+                            if not simulation_app.is_running():
+                                break
+                            ee_b = get_ee_pos_base_frame(robot, str(getattr(args, "ee_link", "j2n6s300_end_effector")))
+                            if ee_b is not None:
+                                dxp = float(ee_b[0]) - episode_start_pos_b[0]
+                                dyp = float(ee_b[1]) - episode_start_pos_b[1]
+                                dzp = float(ee_b[2]) - episode_start_pos_b[2]
+                                if (dxp * dxp + dyp * dyp + dzp * dzp) ** 0.5 <= preroll_tol:
+                                    break
+                                wp.set_current_pose_b(ee_b)
+                            controller.step(robot, dt)
+                            sim.step(render=False)
+                            robot.update(dt)
+                            n_preroll += 1
+                        wp.set_waypoints_b([])
+                        session_logger.log_event(
+                            "preroll_done",
+                            {
+                                "episode_idx": int(ep),
+                                "steps": int(n_preroll),
+                                "target_b": [float(v) for v in episode_start_pos_b],
+                            },
+                        )
+                    except Exception as preroll_err:
+                        print(f"[VLA_V1][PREROLL][WARN] start pre-roll failed: {preroll_err}")
 
                 # Apply domain randomization once per episode (after reset/respawn/settle).
                 try:
@@ -2055,7 +2195,21 @@ def run(args: argparse.Namespace) -> int:
                         stab_left = int(vla_planner_state.get("stabilize_left", 0))
                         if stab_left > 0:
                             vla_planner_state["stabilize_left"] = stab_left - 1
-                            # Skip state machine when stabilizing - just hold position
+                            # Skip state machine when stabilizing - just hold position.
+                            # During the episode-INITIAL stabilize (no ticks logged yet), actively
+                            # pin the EE to the canonical start pose so it cannot sag before tick 0.
+                            # (Mid-episode retry stabilizes keep the legacy hold-in-place behavior:
+                            # re-queuing the start pose there would yank the arm across the scene.)
+                            try:
+                                if (
+                                    episode_start_pos_b is not None
+                                    and session_logger.tick_idx == 0
+                                    and len(getattr(wp, "_waypoints_b", [])) == 0
+                                ):
+                                    controller.set_mode("translate")
+                                    wp.set_waypoints_b([episode_start_pos_b])
+                            except Exception:
+                                pass
                         else:
                             stage = str(vla_planner_state.get("stage", "idle"))
 
@@ -2736,7 +2890,14 @@ def run(args: argparse.Namespace) -> int:
 
                             if str(vla_planner_state.get("stage", "")) == "done":
                                 session_logger.log_event("episode_end", {"episode_idx": int(ep), "steps": int(steps)})
-                                print(f"[VLA_V1][EP] end ep={ep} steps={steps} attempts={int(vla_planner_state.get('attempt_idx', 0))} ticks={session_logger.tick_idx} images={images_captured_episode}")
+                                print(f"[VLA_V1][EP] end ep={ep} steps={steps} attempts={int(vla_planner_state.get('attempt_idx', 0))} ticks={session_logger.tick_idx} images={images_captured_episode} success={bool(vla_planner_state.get('episode_lift_success', False))}")
+                                _write_episode_summary(
+                                    session_logger,
+                                    episode_idx=int(ep),
+                                    steps=int(steps),
+                                    images=int(images_captured_episode),
+                                    truncated=False,
+                                )
                                 # Track totals before closing
                                 total_ticks += session_logger.tick_idx
                                 total_images += images_captured_episode
@@ -2772,6 +2933,15 @@ def run(args: argparse.Namespace) -> int:
                     accum += dt
                     if accum + 1e-9 >= period:
                         accum = 0.0
+
+                    # Do not log ticks during the stabilize hold (idle frames teach the policy
+                    # to do nothing; on retries they pause the trajectory). Opt back in with
+                    # --log-stabilize-ticks. The arm holds position across the gap, so the
+                    # next logged tick's action_from_prev stays ≈ 0 (no discontinuity).
+                    if do_tick and int(vla_planner_state.get("stabilize_left", 0)) > 0 and not bool(
+                        getattr(args, "log_stabilize_ticks", False)
+                    ):
+                        do_tick = False
 
                     if do_tick:
                         objs_raw = []
@@ -2848,6 +3018,13 @@ def run(args: argparse.Namespace) -> int:
                 if str(vla_planner_state.get("stage", "")) != "done":
                     session_logger.log_event("episode_end", {"episode_idx": int(ep), "steps": int(steps), "truncated": True})
                     print(f"[VLA_V1][EP] end ep={ep} (truncated) steps={steps} ticks={session_logger.tick_idx} images={images_captured_episode}")
+                    _write_episode_summary(
+                        session_logger,
+                        episode_idx=int(ep),
+                        steps=int(steps),
+                        images=int(images_captured_episode),
+                        truncated=True,
+                    )
                     # Track totals before closing
                     total_ticks += session_logger.tick_idx
                     total_images += images_captured_episode
@@ -2876,6 +3053,11 @@ def run(args: argparse.Namespace) -> int:
                     pass
                 # Continue to next episode
                 continue
+
+    if control_mode == "planner" and respawn_abort:
+        print(f"\n[VLA_V1] Data collection ABORTED (respawn verification failed). Session: {session_folder}")
+        simulation_app.close()
+        return 3
 
     print(f"\n[VLA_V1] Data collection completed!")
     if control_mode == "planner":

@@ -248,7 +248,7 @@ Each episode logs the same artifacts as `vla_v1`:
 Run from repo root:
 
 ```bash
-NUM_EPISODES=10 ./vla_lab/scripts/collect_v2.sh
+NUM_EPISODES=10 ./vla_lab/scripts/legacy/collect_v2.sh
 ```
 
 Useful overrides (all forwarded as `--`-style flags or env vars to the
@@ -256,10 +256,10 @@ underlying `data_collection.collect_data`):
 
 ```bash
 # More clutter, headless on a chosen GPU
-NUM_OBSTACLE_BOXES=8 DEVICE=cuda:0 NUM_EPISODES=20 ./vla_lab/scripts/collect_v2.sh --headless
+NUM_OBSTACLE_BOXES=8 DEVICE=cuda:0 NUM_EPISODES=20 ./vla_lab/scripts/legacy/collect_v2.sh --headless
 
 # Random bin selection per episode (instead of cycling 1, 2, 3, 1, 2, 3...)
-BIN_SELECTION=random NUM_EPISODES=20 ./vla_lab/scripts/collect_v2.sh
+BIN_SELECTION=random NUM_EPISODES=20 ./vla_lab/scripts/legacy/collect_v2.sh
 ```
 
 Underneath, the wrapper expands to:

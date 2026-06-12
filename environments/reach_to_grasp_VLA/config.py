@@ -41,21 +41,31 @@ class CameraConfig:
 @dataclass
 class TopDownCameraConfig:
     """Top-down camera configuration for VLA environment.
-    
+
+    IMPORTANT: this config is shared by data collection (vla_v1/collect_v3) AND
+    eval (vla_lab/eval_isaaclab.py). It is part of the trained model's contract:
+    do NOT mix sessions recorded with different camera configs in one training
+    run, and do not change it between collecting data and evaluating a model.
+
     To adjust the camera view:
     - position: (x, y, z) - Camera location. Higher z = more overhead view.
-      Default: (0.0, 0.0, 2.0) = directly above robot base at 2.0m height
-    - target: (x, y, z) - Point the camera looks at. 
-      Default: (0.4, 0.0, 0.8) = workspace center at table surface height
+    - target: (x, y, z) - Point the camera looks at (informational; the camera
+      looks straight down).
     - fov: Field of view in degrees. Higher = wider view, lower = zoomed in.
-      Default: 70.0 degrees for good workspace coverage
     """
 
     prim_path: str = "/World/Origin1/TopDownCamera"
-    position: Tuple[float, float, float] = (0.4, 0.0, 4.0)  # Directly above table center, ~1.7m above table surface for wider overview
-    target: Tuple[float, float, float] = (0.4, 0.0, 0.8)  # Looking at workspace center at table surface (table top at z=0.8)
+    # 2026-06-11: z lowered 4.0 → 2.2 (~1.4 m above the table top). At z=4.0 the
+    # workspace covered only ~17% of the frame and an 8 cm box was ~4 px after the
+    # 224×224 training resize — too small for reliable color/identity grounding.
+    # At z=2.2 the spawn region + robot fill most of the frame (box ≈ 10 px @224)
+    # while domain-rand jitter (z ±0.10 m, yaw ±20°, fov ±5°) still keeps the full
+    # workspace in view. Sessions recorded at z=4.0 (e.g. session_20260607_115038)
+    # are visually incompatible with this framing.
+    position: Tuple[float, float, float] = (0.4, 0.0, 2.2)  # directly above the workspace center
+    target: Tuple[float, float, float] = (0.4, 0.0, 0.8)  # workspace center at table surface (table top at z~0.8)
     resolution: Tuple[int, int] = (640, 640)
-    fov: float = 65.0  # degrees - wider FOV to see more of the workspace and robot
+    fov: float = 65.0  # degrees
 
 
 DEFAULT_SCENE = SceneConfig(

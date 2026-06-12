@@ -1,7 +1,7 @@
 """Real-robot deployment stubs (Kinova Gen 3 class naming in LeRobot export metadata).
 
 This is a **baseline wiring** surface: plug in your ROS/pyKinova stack where marked.
-`new_changes.md` calls for safety bounds + policy stepping; we keep imports light so
+`docs/new_changes.md` calls for safety bounds + policy stepping; we keep imports light so
 the module imports even without ROS.
 """
 

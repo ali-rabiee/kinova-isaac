@@ -1,7 +1,7 @@
 """Partial-observability helpers for sim/real camera streams (occlusion / masking).
 
 Used by `eval_isaaclab.py` for the **single-camera / degraded sensing** ablations
-described in `new_changes.md` (external-only vs occluded workspace regions).
+described in `docs/new_changes.md` (external-only vs occluded workspace regions).
 """
 
 from __future__ import annotations
