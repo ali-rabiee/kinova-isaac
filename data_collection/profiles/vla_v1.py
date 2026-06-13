@@ -417,6 +417,17 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
         help="Planner execution linear speed (m/s). Used only for --control planner.",
     )
     parser.add_argument(
+        "--jog-velocity-gain",
+        type=float,
+        default=1.0,
+        help=(
+            "Under-relaxation gain on the Diff-IK joint-velocity command "
+            "(qdot = gain * (q_des - q)/dt). 1.0 = deadbeat (can orbit/shake with the soft "
+            "Jaco actuators); <1.0 damps the tracking loop for smoother reaching. Also scales "
+            "effective jog speed by this factor, so the realized speed is gain*--planner-speed-mps."
+        ),
+    )
+    parser.add_argument(
         "--planner-waypoint-max-seg-m",
         type=float,
         default=0.01,
@@ -1372,6 +1383,7 @@ def run(args: argparse.Namespace) -> int:
         device=str(sim.device),
         use_relative_mode=True,
         linear_speed_mps=float(linear_speed_mps),
+        jog_velocity_gain=float(getattr(args, "jog_velocity_gain", 1.0)),
         workspace_min=(
             float(getattr(args, "workspace_min_x", 0.20)),
             float(getattr(args, "workspace_min_y", -0.45)),

@@ -13,6 +13,17 @@
 #   - no fixed --domain-rand-seed: each session gets fresh randomization (sampled values are
 #     still logged per episode in events.jsonl). Set DR_SEED=<int> to reproduce a session.
 #
+# 2026-06-12 fixes:
+#   - grasp targeting now uses the object's LIVE PhysX pose. The OBB grasp provider read the
+#     legacy USD stage, which is stale under the GPU/Fabric pipeline (physics teleport+settle
+#     write to PhysX, not USD). The arm was reaching each object's initial-spawn pose (~0.3 m
+#     off), closing on empty air, so the box never lifted and episodes never ended. See
+#     motion_generation/grasp_estimation/obb.py.
+#   - --jog-velocity-gain 0.5: under-relaxes the Diff-IK velocity command so the arm no longer
+#     orbits/shakes around its path (the soft Jaco actuators make the deadbeat gain=1.0 loop
+#     under-damped). Also halves effective reach speed; raise toward 1.0 if too slow, lower if
+#     still shaky. Eval is unaffected (keeps gain=1.0 and realizes the policy delta at full scale).
+#
 # Override defaults via env vars or CLI args:
 #   NUM_EPISODES=120 ./vla_lab/scripts/collect_v3.sh --headless
 #   NUM_OBJECTS=4 NUM_EPISODES=20 ./vla_lab/scripts/collect_v3.sh
@@ -70,6 +81,7 @@ exec python -m data_collection.collect_data \
   --spawn-min-robot-dist 0.26 \
   --min-distance 0.16 \
   --planner-speed-mps 0.58 \
+  --jog-velocity-gain 0.5 \
   --planner-waypoint-max-seg-m 0.022 \
   --settle-steps 72 \
   --stabilize-steps 200 \

@@ -17,6 +17,98 @@ class ObbGraspPoseProvider(GraspPoseProvider):
 
     def __init__(self, *, align_to_min_width: bool = True) -> None:
         self._align_to_min_width = align_to_min_width
+        # Cache of root prim path -> PhysX rigid-body view, used to read the *live* object
+        # pose. See `_live_world_translation` for why this is necessary.
+        self._rigid_view_cache: dict[str, object] = {}
+
+    # ------------------------------------------------------------------
+    # Live-pose correction
+    #
+    # `_compute_world_obb_xy` derives the grasp point from `UsdGeom.BBoxCache`, i.e. the
+    # *legacy USD stage*. Under the GPU/Fabric pipeline that this project runs, physics
+    # (object respawn teleports + gravity settling) writes to PhysX/Fabric, NOT to the
+    # legacy USD stage. So the USD bbox reflects each object's INITIAL authored spawn pose,
+    # not where it actually rests — they can differ by tens of cm. Targeting the stale pose
+    # makes the arm close on empty air (failed grasp, object never lifts, episode never ends).
+    #
+    # Fix: read the object's live rigid-body translation from PhysX (same mechanism the
+    # data-collection ObjectsTracker uses, which is known to be correct) and shift the
+    # USD-derived OBB by that displacement. Shape/orientation are pose-invariant for a rigid
+    # body, so only the translation delta is needed. Falls back to the unshifted USD pose if
+    # PhysX is unavailable (no worse than the previous behavior).
+    # ------------------------------------------------------------------
+    def _resolve_rigid_path(self, prim_path: str):
+        """Return the prim path carrying RigidBodyAPI (root or first matching child), or None."""
+        try:
+            UsdPhysics = importlib.import_module("pxr.UsdPhysics")
+            omni_usd = importlib.import_module("omni.usd")
+            sim_utils = importlib.import_module("isaaclab.sim")
+        except Exception:
+            return None
+        try:
+            stage = omni_usd.get_context().get_stage()
+            root_prim = stage.GetPrimAtPath(prim_path)
+            if not root_prim.IsValid():
+                return None
+            # Common case (box spawner): the rigid body is the root prim itself.
+            if root_prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                return str(prim_path)
+            get_all = getattr(sim_utils, "get_all_matching_child_prims", None)
+            if callable(get_all):
+                rigids = get_all(
+                    prim_path,
+                    predicate=lambda p: p.HasAPI(UsdPhysics.RigidBodyAPI),
+                    traverse_instance_prims=True,
+                )
+                if rigids:
+                    return rigids[0].GetPath().pathString
+        except Exception:
+            return None
+        return None
+
+    def _live_world_translation(self, rigid_path: str):
+        """Live world translation (x, y, z) of the rigid body via PhysX; None on failure."""
+        try:
+            SimulationManager = importlib.import_module("isaacsim.core.simulation_manager").SimulationManager
+        except Exception:
+            return None
+        try:
+            view = self._rigid_view_cache.get(rigid_path)
+            if view is None:
+                view = SimulationManager.get_physics_sim_view().create_rigid_body_view(rigid_path)
+                self._rigid_view_cache[rigid_path] = view
+            tf = view.get_transforms()
+            if tf is None or (hasattr(tf, "shape") and int(tf.shape[0]) == 0):
+                return None
+            row = tf.clone()[0]
+            return (float(row[0].item()), float(row[1].item()), float(row[2].item()))
+        except Exception:
+            return None
+
+    def _usd_world_translation(self, rigid_path: str):
+        """Stale world translation (x, y, z) of the rigid body from the legacy USD stage."""
+        try:
+            UsdGeom = importlib.import_module("pxr.UsdGeom")
+            omni_usd = importlib.import_module("omni.usd")
+            stage = omni_usd.get_context().get_stage()
+            prim = stage.GetPrimAtPath(rigid_path)
+            if not prim.IsValid():
+                return None
+            t = UsdGeom.XformCache().GetLocalToWorldTransform(prim).ExtractTranslation()
+            return (float(t[0]), float(t[1]), float(t[2]))
+        except Exception:
+            return None
+
+    def _live_shift(self, prim_path: str) -> Tuple[float, float, float]:
+        """Displacement (live PhysX - stale USD) to add to a USD-derived world point."""
+        rigid_path = self._resolve_rigid_path(prim_path)
+        if rigid_path is None:
+            return (0.0, 0.0, 0.0)
+        live = self._live_world_translation(rigid_path)
+        usd = self._usd_world_translation(rigid_path)
+        if live is None or usd is None:
+            return (0.0, 0.0, 0.0)
+        return (live[0] - usd[0], live[1] - usd[1], live[2] - usd[2])
 
     def _compute_world_obb_xy(self, *, prim_path: str) -> Tuple[Tuple[float, float, float], float, float, float]:
         """Return (pos_w_m, yaw_rad, extent_major, extent_minor) from world OBB in XY.
@@ -38,6 +130,10 @@ class ObbGraspPoseProvider(GraspPoseProvider):
         prim = stage.GetPrimAtPath(prim_path)
         if not prim.IsValid():
             raise RuntimeError(f"[MG][GRASP] Invalid prim path: {prim_path}")
+
+        # Displacement from the stale USD pose (what BBoxCache below reads) to the live
+        # PhysX pose. Added to the returned grasp point so we target where the object IS.
+        live_shift = self._live_shift(prim_path)
 
         bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default"], useExtentsHint=True)
         bbox = bbox_cache.ComputeWorldBound(prim)  # GfBBox3d
@@ -105,8 +201,12 @@ class ObbGraspPoseProvider(GraspPoseProvider):
                 cx_a = 0.5 * (amn[0] + amx[0])
                 cy_a = 0.5 * (amn[1] + amx[1])
                 cz_a = amx[2] # Top Z
-                pos = (float(cx_a), float(cy_a), float(cz_a))
-                
+                pos = (
+                    float(cx_a) + live_shift[0],
+                    float(cy_a) + live_shift[1],
+                    float(cz_a) + live_shift[2],
+                )
+
                 if adx <= ady:
                     extent_minor = adx
                     extent_major = ady
@@ -128,7 +228,11 @@ class ObbGraspPoseProvider(GraspPoseProvider):
 
         # Top Z in world: center_z + sum_i |axis_i.z| * half_i
         top_z = float(c_world[2]) + (abs(az[2]) * hz + abs(ax[2]) * hx + abs(ay[2]) * hy)
-        pos = (float(c_world[0]), float(c_world[1]), float(top_z))
+        pos = (
+            float(c_world[0]) + live_shift[0],
+            float(c_world[1]) + live_shift[1],
+            float(top_z) + live_shift[2],
+        )
 
         return pos, yaw, float(extent_major), float(extent_minor)
 

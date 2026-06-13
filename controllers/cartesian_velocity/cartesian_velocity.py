@@ -18,6 +18,15 @@ class CartesianVelocityJogConfig(ArmControllerConfig):
     """Config for Cartesian velocity jogging using Differential IK and gripper control."""
 
     linear_speed_mps: float = 0.05
+    # Under-relaxation gain on the Diff-IK joint-velocity command:
+    #   qdot = jog_velocity_gain * (q_des - q_arm) / dt
+    # 1.0 = deadbeat (try to reach the IK target in a single step). With the very soft Jaco
+    # actuators this loop is under-damped and the EE visibly orbits/oscillates around its
+    # path. A value < 1.0 damps the tracking loop for smooth, non-shaky motion.
+    # NOTE: this also scales the realized per-step EE motion, so the *effective* jog speed is
+    # `jog_velocity_gain * linear_speed_mps`. Used during scripted data collection; eval keeps
+    # the default 1.0 so a trained policy's per-action delta is realized at full scale.
+    jog_velocity_gain: float = 1.0
     ik_method: Literal["pinv", "svd", "trans", "dls"] = "dls"
     hold_orientation: bool = True
     # Gripper settings (migrated to kinova.GripperConfig; legacy fields kept for backward compat)
@@ -201,7 +210,9 @@ class CartesianVelocityJogController(ArmController):
         self._diff_ik.ee_pos_des[:] = pos_des
         self._diff_ik.ee_quat_des[:] = quat_des
         q_des = self._diff_ik.compute(ee_pos_b, ee_quat_b, jac, q_arm)
-        qdot_arm = (q_des - q_arm) / dt
+        # Under-relax the deadbeat velocity command to damp the IK tracking loop (smoother,
+        # less shaky motion). gain=1.0 reproduces the original deadbeat behavior.
+        qdot_arm = float(self.config.jog_velocity_gain) * (q_des - q_arm) / dt
         # Clamp joint velocities that would push further into nearby joint limits
         qdot_arm = self.safety.clamp_qdot_near_limits(qdot_arm, q_arm, q_lower, q_upper)
 
