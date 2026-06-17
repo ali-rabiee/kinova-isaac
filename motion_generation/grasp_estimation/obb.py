@@ -19,7 +19,23 @@ class ObbGraspPoseProvider(GraspPoseProvider):
         self._align_to_min_width = align_to_min_width
         # Cache of root prim path -> PhysX rigid-body view, used to read the *live* object
         # pose. See `_live_world_translation` for why this is necessary.
+        #
+        # IMPORTANT: these views are bound to a specific PhysX sim view and go STALE across
+        # `sim.reset()` (the same reason the data-collection ObjectsTracker is recreated every
+        # episode). A view cached in episode N keeps returning episode-N's pose forever, so the
+        # 2nd time an object is targeted the grasp aims ~20-25 cm off (where the box used to be)
+        # and the grasp misses. Callers MUST call `reset()` after every `sim.reset()` so the
+        # cache is rebuilt against the live sim view.
         self._rigid_view_cache: dict[str, object] = {}
+
+    def reset(self) -> None:
+        """Drop cached PhysX rigid-body views (call after every sim.reset()).
+
+        Cached views are tied to the sim view that existed when they were created and return
+        stale transforms once the sim has been reset. Clearing forces `_live_world_translation`
+        to recreate them against the current sim view on next use.
+        """
+        self._rigid_view_cache.clear()
 
     # ------------------------------------------------------------------
     # Live-pose correction

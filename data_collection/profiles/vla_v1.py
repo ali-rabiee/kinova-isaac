@@ -2050,6 +2050,17 @@ def run(args: argparse.Namespace) -> int:
                     # Keep the previous tracker as a fallback.
                     pass
 
+                # Same staleness affects the grasp pose provider: it caches PhysX rigid-body views
+                # to read each object's LIVE pose, and those views go stale across `sim.reset()`.
+                # Without this, the 2nd time an object is targeted the cached view returns the pose
+                # from the first time it was grasped, so the arm reaches ~20-25 cm off the box and
+                # the grasp misses (manifested as "first object-cycle succeeds, later cycles fail").
+                try:
+                    if hasattr(grasp_provider, "reset"):
+                        grasp_provider.reset()
+                except Exception:
+                    pass
+
                 obj_z_by_leaf: dict[str, float] = {}
                 object_pos_b_by_leaf: dict[str, tuple[float, float, float]] = {}
                 try:

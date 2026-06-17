@@ -24,6 +24,26 @@
 #     under-damped). Also halves effective reach speed; raise toward 1.0 if too slow, lower if
 #     still shaky. Eval is unaffected (keeps gain=1.0 and realizes the policy delta at full scale).
 #
+# 2026-06-17 fixes (success rate 7% -> ~90%; see vla_lab/docs/DATA_COLLECTION_FIX_REPORT.md):
+#   - --ee-z-offset-m 0.0 (was 0.08): the URDF puts the j2n6s300_end_effector frame AT the
+#     fingertip working level, not 8 cm above it. The old 0.08 lifted every grasp ~8 cm too
+#     high, so the fingers only skimmed the box top and the object never lifted (dz_from_start
+#     ~= 0, the dominant failure). With offset 0 the grasp target is the object top directly.
+#   - --grasp-depth -0.04 + --close-if-within-m 0.025: aim the EE at the box mid-height and
+#     CLOSE ON CONTACT. The arm descends until the open fingers contact the box (~2 cm above a
+#     centre goal), where the closing fingertips cup the box body. The old 7 mm close gate was
+#     tighter than that contact distance, so the arm hovered/stalled and timed out instead of
+#     closing (approach_stall / approach_timeout). 0.025 m lets it close where the fingers
+#     actually reach the object.
+#   - --grasp-depth-step 0 (was -0.02): the adaptive retry used to drive the wrist DEEPER each
+#     attempt, jamming the open fingers into the box and making retries worse. With the geometry
+#     fixed, retries re-grasp at the same good height and now recover instead of degrading.
+#   - OBB grasp-pose cache fix (motion_generation/grasp_estimation/obb.py + the per-episode
+#     grasp_provider.reset() in data_collection/profiles/vla_v1.py): the provider cached PhysX
+#     rigid-body views that go stale across sim.reset(), so the 2nd time an object was targeted
+#     the grasp aimed ~20-25 cm off (where the box used to be) and missed. Now cleared per
+#     episode like the ObjectsTracker. This was masked by the ee_z_offset bug before.
+#
 # Override defaults via env vars or CLI args:
 #   NUM_EPISODES=120 ./vla_lab/scripts/collect_v3.sh --headless
 #   NUM_OBJECTS=4 NUM_EPISODES=20 ./vla_lab/scripts/collect_v3.sh
@@ -91,9 +111,11 @@ exec python -m data_collection.collect_data \
   --target-selection "${TARGET_SELECTION}" \
   --approach-detour-m 0 \
   --max-steps-per-episode 8000 \
-  --grasp-depth -0.07 \
+  --ee-z-offset-m 0.0 \
+  --grasp-depth -0.04 \
+  --grasp-depth-step 0 \
   --tolerance 0.007 \
-  --close-if-within-m 0.007 \
+  --close-if-within-m 0.025 \
   --domain-rand \
   --respawn-every-n-episodes 1 \
   --logs-root "${LOGS_ROOT}" \

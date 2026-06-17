@@ -20,7 +20,8 @@ exact procedure (with verification) for collecting a final dataset.
 >
 > Then list the verified sessions under `data.data_roots` in
 > `vla_lab/configs/train_tiny.yaml` and train. **Do not mix in sessions collected before
-> 2026-06-11** — the camera framing changed and old sessions carry the frozen-layout bug.
+> 2026-06-17** — older sessions carry the grasp bugs fixed in §5.7 (success ~7%) and, before
+> 2026-06-11, the camera-framing change and frozen-layout bug.
 
 ---
 
@@ -60,7 +61,7 @@ the routine; each tick saves a 640×640 PNG from the top-down camera.
 
 | Layer | File | Role |
 | --- | --- | --- |
-| Scripted planner | `motion_generation/planners/scripted.py` | 3 waypoints: pregrasp (+10 cm), grasp (top + `ee_z_offset` 8 cm − 7 cm depth), lift (+15 cm) |
+| Scripted planner | `motion_generation/planners/scripted.py` | 3 waypoints: pregrasp (+10 cm above object top), grasp (object top − 4 cm = box mid-height; `--ee-z-offset-m 0`), lift (+15 cm). See §5.7 for why the offset is 0. |
 | OBB grasp provider | `motion_generation/grasp_estimation/obb.py` | object top-center from the world-space bounding box, recomputed at plan time |
 | Waypoint follower | `controllers/input/waypoint_follower.py` | emits per-physics-step deltas capped at speed·dt ≈ 2.4 mm, pops waypoints within 7 mm |
 | Cartesian controller | `controllers/cartesian_velocity/cartesian_velocity.py` | damped-least-squares Diff-IK → joint velocity targets + gravity compensation; workspace clamps; holds EE orientation |
@@ -206,6 +207,37 @@ At camera z = 4.0 the workspace covered ~17 % of the frame; an 8 cm box was ~4 p
 box at 224×224, full workspace + robot still in frame under all DR jitter). This is the main
 reason old and new sessions must not be mixed.
 
+### 5.7 Grasp aimed too high + stale grasp-pose cache (2026-06-17, **proven**, raised success 7% → ~90%)
+
+Two grasp bugs (not motion/training bugs) caused the 7% success rate. Full write-up:
+`vla_lab/docs/DATA_COLLECTION_FIX_REPORT.md`.
+
+**(a) `--ee-z-offset-m 0.08` lifted every grasp ~8 cm too high.** The offset exists to account
+for the EE link sitting above the fingertip TCP, but the URDF shows the `j2n6s300_end_effector`
+frame is essentially *at* the fingertip level (`joint_end_effector` z = −0.16 from `link_6`;
+finger bases at −0.115). So the grasp target was `object_top + 0.08 − 0.07 = top + 0.01` — the
+fingers skimmed the box top, got no enveloping grip, and the object never lifted
+(`dz_from_start ≈ 0.000` in 433/600 episodes; **zero `empty_close`** — the fingers always
+touched the box, just couldn't hold it). Fix: `--ee-z-offset-m 0.0` + grasp at mid-height
+(`--grasp-depth -0.04`) and **close on contact** (`--close-if-within-m 0.025`: the 7 mm gate
+was tighter than where the open fingers contact an 8 cm box, so the arm stalled/timed out
+instead of closing). `--grasp-depth-step 0` stops the retry from jamming the wrist deeper.
+
+**(b) The OBB grasp provider cached PhysX views that go stale across `sim.reset()`.**
+`ObbGraspPoseProvider` reads each object's live PhysX pose but cached the rigid-body views and
+never refreshed them — the same staleness that forces the per-episode `ObjectsTracker`
+recreation (§5.1 / the comment at the tracker re-init). So the **2nd time** an object was
+targeted the grasp aimed ~20–25 cm off (where the box was the *first* time), and missed. This
+was masked by (a) before. Measured: with the geometry fixed, the **first** object-cycle grasped
+6/6 and the **second** cycle 0/6 until the cache was cleared. Fix:
+`ObbGraspPoseProvider.reset()` (clears `_rigid_view_cache`), called every episode from
+`vla_v1.py` next to the tracker recreation.
+
+> These are collection-side only. The data/action contract, camera, 15 Hz rate, start pose, and
+> the **8 cm box** are unchanged, so eval (`eval_isaac.yaml`, which runs the policy not the
+> scripted grasp) is unaffected. Still: **do not mix pre-2026-06-17 sessions** with new ones —
+> the old ones are ~7% success and carry both bugs.
+
 ### Previously fixed (2026-06-10, kept for reference)
 
 - **Gripper labels never fired** (logger averaged finger-tip joints; threshold too high) —
@@ -230,8 +262,10 @@ and policy that handle all 6 colors comfortably, aim for **≥ 20 demos per colo
 episodes** total. Successful episodes average ~90–150 ticks (~6–10 s of robot time), ~40 MB
 of PNGs each → ~5 GB / 120 episodes.
 
-Collection runs slower than real time (~4×); expect roughly **1.5–2.5 min per episode**
-headless.
+Collection runs slower than real time (~4×). Since the 2026-06-17 grasp fix (§5.7) most
+episodes now succeed on the first attempt in ~60–110 ticks, so a **successful** episode is
+roughly **20–40 s** headless; only the occasional retried/failed episode approaches the old
+1.5–2.5 min. A 40-episode chunk is typically ~20–30 min.
 
 ### 6.3 Run (chunked)
 
@@ -297,8 +331,10 @@ Profile flags worth knowing (see `data_collection/profiles/vla_v1.py` for all):
 | `--log-rate-hz` | 15 | tick/action rate — **part of the model contract** |
 | `--planner-speed-mps` | 0.58 | EE speed during execution (→ per-tick deltas ~10–25 mm) |
 | `--start-ee-pos-b` | 0.454 0.093 0.210 | canonical start pose — must equal eval's |
-| `--grasp-depth` / `--pregrasp` / `--lift` | −0.07 / 0.10 / 0.15 | routine geometry (m, relative to object top + 8 cm `--ee-z-offset-m`) |
-| `--close-if-within-m` / `--tolerance` | 0.007 / 0.007 | grasp gate / waypoint tolerance (keep tolerance ≤ close gate) |
+| `--ee-z-offset-m` | **0.0** | EE-link→fingertip offset. **0** is correct (the `end_effector` frame is at fingertip level per the URDF); the old 0.08 aimed grasps ~8 cm too high — see §5.7. |
+| `--grasp-depth` / `--pregrasp` / `--lift` | **−0.04** / 0.10 / 0.15 | routine geometry (m, relative to object top). −0.04 puts the EE at the 8 cm box's mid-height so the fingertips cup the body. |
+| `--grasp-depth-step` | **0** | per-retry depth change. 0 = retry at the same height (the old −0.02 jammed the wrist deeper each attempt). |
+| `--close-if-within-m` / `--tolerance` | **0.025** / 0.007 | close-on-contact gate / waypoint tolerance. 0.025 closes when the open fingers reach the box (the old 0.007 stalled/timed-out above it); keep tolerance ≤ close gate. |
 | `--max-grasp-attempts` | 3 | within-episode retries before the episode is marked failed |
 | `--max-steps-per-episode` | 8000 | hard cap (33 s sim) — prevents infinite hover |
 | `--no-start-preroll`, `--log-stabilize-ticks` | off | restore legacy (worse) start behavior |
