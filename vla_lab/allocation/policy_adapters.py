@@ -25,6 +25,15 @@ def _features(dispersion: float, obs: Dict[str, Any], chunk: Any) -> Dict[str, f
     feats: Dict[str, float] = {"dispersion": float(dispersion)}
     if isinstance(obs, dict) and obs.get("occlusion_fraction") is not None:
         feats["occlusion_fraction"] = float(obs["occlusion_fraction"])
+    # Uncertainty-source features (2026-07 intent/perception decomposition): the
+    # eval loop precomputes these per tick (see vla_lab.intent) and drops them
+    # into obs so fitted allocators and the intent-aware controller can use them.
+    for key in ("intent_entropy", "intent_top2_margin", "cross_view_disagreement", "instruction_ambiguous"):
+        if isinstance(obs, dict) and obs.get(key) is not None:
+            try:
+                feats[key] = float(obs[key])
+            except (TypeError, ValueError):
+                pass
     try:
         c = chunk.detach().float()
         feats["chunk_l2"] = float(c.pow(2).mean().sqrt().item())
@@ -70,6 +79,19 @@ class TTCComputeBranch:
             img = img[0]
         return img.to(self.device), st.to(self.device)
 
+    def _extra_model_kwargs(self, obs: Dict[str, Any]) -> Dict[str, Any]:
+        """Optional wrist stream + camera-set mask, batched for B=1 forwards."""
+        kw: Dict[str, Any] = {}
+        w = obs.get("image_wrist") if isinstance(obs, dict) else None
+        if w is not None:
+            if w.dim() == 4:
+                w = w[0]
+            kw["image_wrist"] = w.to(self.device).unsqueeze(0)
+        cp = obs.get("camera_present") if isinstance(obs, dict) else None
+        if cp is not None:
+            kw["camera_present"] = cp.to(self.device).view(1, -1)
+        return kw
+
     def _denorm(self, chunk: torch.Tensor) -> torch.Tensor:
         if self.action_stats is not None:
             return self.action_stats.denormalize(chunk.detach().cpu()).to(self.device)
@@ -80,7 +102,8 @@ class TTCComputeBranch:
         t0 = time.time()
         img, st = self._tensors(obs)
         ids, attn = self._encode(instruction)
-        out = self.model.forward(img.unsqueeze(0), st.unsqueeze(0), ids.unsqueeze(0), attn.unsqueeze(0), noise_std=0.0)
+        kw = self._extra_model_kwargs(obs)
+        out = self.model.forward(img.unsqueeze(0), st.unsqueeze(0), ids.unsqueeze(0), attn.unsqueeze(0), noise_std=0.0, **kw)
         chunk = out.actions.squeeze(0)
         return ComputeResult(chunk=self._denorm(chunk), dispersion=0.0, k_used=1, forward_ms=(time.time() - t0) * 1000.0)
 
@@ -89,8 +112,9 @@ class TTCComputeBranch:
         t0 = time.time()
         img, st = self._tensors(obs)
         ids, attn = self._encode(instruction)
-        a0 = self.model.forward(img.unsqueeze(0), st.unsqueeze(0), ids.unsqueeze(0), attn.unsqueeze(0), noise_std=0.0).actions.squeeze(0)
-        a1 = self.model.forward(img.unsqueeze(0), st.unsqueeze(0), ids.unsqueeze(0), attn.unsqueeze(0), noise_std=self.gating_noise_std).actions.squeeze(0)
+        kw = self._extra_model_kwargs(obs)
+        a0 = self.model.forward(img.unsqueeze(0), st.unsqueeze(0), ids.unsqueeze(0), attn.unsqueeze(0), noise_std=0.0, **kw).actions.squeeze(0)
+        a1 = self.model.forward(img.unsqueeze(0), st.unsqueeze(0), ids.unsqueeze(0), attn.unsqueeze(0), noise_std=self.gating_noise_std, **kw).actions.squeeze(0)
         disp = twin_dispersion(a0, a1)
         return ProbeResult(
             dispersion=disp, act_chunk=self._denorm(a0), features=_features(disp, obs, a0), forward_ms=(time.time() - t0) * 1000.0,
@@ -101,8 +125,9 @@ class TTCComputeBranch:
         t0 = time.time()
         img, st = self._tensors(obs)
         ids, attn = self._encode(instruction)
+        kw = self._extra_model_kwargs(obs)
         cands = self.model.sample_actions(
-            img.unsqueeze(0), st.unsqueeze(0), ids.unsqueeze(0), attn.unsqueeze(0), k=int(k), noise_std=self.noise_std
+            img.unsqueeze(0), st.unsqueeze(0), ids.unsqueeze(0), attn.unsqueeze(0), k=int(k), noise_std=self.noise_std, **kw
         ).squeeze(1)
         best, scores = select_from_candidates(cands, self.selection)
         disp = chunk_dispersion(cands)

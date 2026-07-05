@@ -68,6 +68,37 @@ class TopDownCameraConfig:
     fov: float = 65.0  # degrees
 
 
+@dataclass
+class WristCameraConfig:
+    """Eye-in-hand (wrist) camera rigidly mounted on the end-effector link.
+
+    Added 2026-07 for the wrist-camera data profile (collect_v4 / profile vla_v4).
+    Like TopDownCameraConfig this is part of a trained model's contract: sessions
+    recorded with different wrist mounts/FOVs must not be mixed in one training run.
+
+    The camera prim is created as a CHILD of the EE link prim, so it tracks the
+    arm automatically. `offset_pos` / `offset_rpy_deg` are the mount calibration
+    (hand-eye extrinsics) expressed in the EE-link frame; on the real robot,
+    replace them with your measured hand-eye calibration. Both are dumped into
+    each episode's `cameras.json` together with the pinhole intrinsics.
+
+    Frame conventions: USD cameras look down their local -Z with +Y up. The EE
+    frame `j2n6s300_end_effector` sits at fingertip working level with +Z as the
+    tool/approach axis, so `offset_rpy_deg=(180, 0, 0)` points the camera along
+    the approach direction (at whatever the gripper is about to grasp) and
+    `offset_pos` pulls it back toward the wrist and off the finger axis.
+    """
+
+    prim_path: str = "/World/Origin1/Robot/j2n6s300_end_effector/WristCamera"
+    parent_link: str = "j2n6s300_end_effector"
+    # Mount pose in the EE-link frame (meters / degrees, applied as USD RotateXYZ).
+    offset_pos: Tuple[float, float, float] = (0.0, -0.055, -0.11)
+    offset_rpy_deg: Tuple[float, float, float] = (180.0, 0.0, 0.0)
+    resolution: Tuple[int, int] = (640, 640)
+    # Wide FOV, RealSense-D405-like (the common real wrist camera).
+    fov: float = 87.0
+
+
 DEFAULT_SCENE = SceneConfig(
     robot_default_joint_pos={
         "j2n6s300_joint_1": 0*np.pi, # j2n6s300_joint_1: [-inf, inf]
@@ -88,5 +119,6 @@ DEFAULT_SCENE = SceneConfig(
 
 DEFAULT_CAMERA = CameraConfig()
 DEFAULT_TOP_DOWN_CAMERA = TopDownCameraConfig()
+DEFAULT_WRIST_CAMERA = WristCameraConfig()
 
 

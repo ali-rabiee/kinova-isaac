@@ -78,16 +78,26 @@ class SmolVLAIsaacPolicy:
         rgb_chw_float: torch.Tensor,
         state6: torch.Tensor,
         instruction: str,
+        wrist_rgb_chw_float: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Return (T, 7) float32 on self.device: 6D EE delta + gripper (0)."""
+        """Return (T, 7) float32 on self.device: 6D EE delta + gripper (0).
+
+        When ``wrist_rgb_chw_float`` is given (collect_v4 / wrist evals), it is
+        routed into camera slot 2; the overhead view fills slots 1 and 3
+        (mirrors the exporter's --wrist routing). Without it, all three slots
+        duplicate the overhead view — the original single-camera behavior.
+        """
 
         # rgb_chw_float: (3,H,W) in [0,1]
         img = rgb_chw_float.unsqueeze(0).to(self.device, dtype=torch.float32)
         st = state6.flatten()[:6].float().unsqueeze(0).to(self.device)
 
+        wimg = None
+        if wrist_rgb_chw_float is not None:
+            wimg = wrist_rgb_chw_float.unsqueeze(0).to(self.device, dtype=torch.float32)
         obs: dict[str, Any] = {STATE_KEY: st}
-        for k in CAMERA_KEYS:
-            obs[k] = img.clone()
+        for i, k in enumerate(CAMERA_KEYS):
+            obs[k] = wimg.clone() if (wimg is not None and i == 1) else img.clone()
         obs["task"] = [instruction]
 
         batch = self._preprocessor(obs)
@@ -107,6 +117,7 @@ class SmolVLAIsaacPolicy:
         instruction: str,
         k: int,
         base_seed: int = 1337,
+        wrist_rgb_chw_float: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Draw K candidates (K, T, 7) using different RNG seeds (flow sampling noise)."""
 
@@ -124,7 +135,10 @@ class SmolVLAIsaacPolicy:
             except Exception:
                 pass
             out.append(
-                self.predict_chunk_phys(rgb_chw_float=rgb_chw_float, state6=state6, instruction=instruction)
+                self.predict_chunk_phys(
+                    rgb_chw_float=rgb_chw_float, state6=state6, instruction=instruction,
+                    wrist_rgb_chw_float=wrist_rgb_chw_float,
+                )
             )
         return torch.stack(out, dim=0)
 
@@ -137,6 +151,7 @@ class SmolVLAIsaacPolicy:
         instruction: str,
         ttc_cfg_dict: Dict[str, Any],
         latency_log: Optional[List[Dict[str, Any]]] = None,
+        wrist_rgb_chw_float: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """TTC + gating (twin / noisy-pair) matching `vla_lab.ttc.TTCPipeline` semantics."""
 
@@ -180,7 +195,7 @@ class SmolVLAIsaacPolicy:
             except Exception:
                 pass
             self.reset()
-            a0 = self.predict_chunk_phys(rgb_chw_float=rgb_chw_float, state6=state6, instruction=instruction)
+            a0 = self.predict_chunk_phys(rgb_chw_float=rgb_chw_float, state6=state6, instruction=instruction, wrist_rgb_chw_float=wrist_rgb_chw_float)
             # Second probe: low noise (LeRobot uses internal sampling; approximate via fresh seed).
             try:
                 torch.manual_seed(1)
@@ -189,7 +204,7 @@ class SmolVLAIsaacPolicy:
             except Exception:
                 pass
             self.reset()
-            a1 = self.predict_chunk_phys(rgb_chw_float=rgb_chw_float, state6=state6, instruction=instruction)
+            a1 = self.predict_chunk_phys(rgb_chw_float=rgb_chw_float, state6=state6, instruction=instruction, wrist_rgb_chw_float=wrist_rgb_chw_float)
             forward_ms += (time.time() - t_fw0) * 1000.0
             uncertainty = float(twin_sample_uncertainty(a0, a1).item())
             k_eff = uncertainty_gate_effective_k(
@@ -213,7 +228,7 @@ class SmolVLAIsaacPolicy:
             except Exception:
                 pass
             self.reset()
-            a0 = self.predict_chunk_phys(rgb_chw_float=rgb_chw_float, state6=state6, instruction=instruction)
+            a0 = self.predict_chunk_phys(rgb_chw_float=rgb_chw_float, state6=state6, instruction=instruction, wrist_rgb_chw_float=wrist_rgb_chw_float)
             try:
                 torch.manual_seed(101)
                 if torch.cuda.is_available():
@@ -221,7 +236,7 @@ class SmolVLAIsaacPolicy:
             except Exception:
                 pass
             self.reset()
-            a1 = self.predict_chunk_phys(rgb_chw_float=rgb_chw_float, state6=state6, instruction=instruction)
+            a1 = self.predict_chunk_phys(rgb_chw_float=rgb_chw_float, state6=state6, instruction=instruction, wrist_rgb_chw_float=wrist_rgb_chw_float)
             forward_ms += (time.time() - t_fw0) * 1000.0
             uncertainty = float(twin_sample_uncertainty(a0, a1).item())
             k_eff = uncertainty_gate_effective_k(
@@ -245,13 +260,14 @@ class SmolVLAIsaacPolicy:
             except Exception:
                 pass
             self.reset()
-            a_det = self.predict_chunk_phys(rgb_chw_float=rgb_chw_float, state6=state6, instruction=instruction)
+            a_det = self.predict_chunk_phys(rgb_chw_float=rgb_chw_float, state6=state6, instruction=instruction, wrist_rgb_chw_float=wrist_rgb_chw_float)
             rest = self.predict_chunk_phys_k(
                 rgb_chw_float=rgb_chw_float,
                 state6=state6,
                 instruction=instruction,
                 k=int(k_eff - 1),
                 base_seed=2048,
+                wrist_rgb_chw_float=wrist_rgb_chw_float,
             )
             candidates = torch.cat([a_det.unsqueeze(0), rest], dim=0)
         else:
@@ -261,6 +277,7 @@ class SmolVLAIsaacPolicy:
                 instruction=instruction,
                 k=int(k_eff),
                 base_seed=2048,
+                wrist_rgb_chw_float=wrist_rgb_chw_float,
             )
         forward_ms += (time.time() - t_fw1) * 1000.0
 

@@ -36,10 +36,12 @@ def _execute_query(
     instruction: str,
     options: Optional[Sequence[str]],
     oracle_answer: Optional[str],
+    question: Optional[str] = None,
 ):
     """Ask, fold the answer into the instruction, then take one forward on the refined task."""
 
-    question, opts = formulate_question(instruction, options)
+    default_q, opts = formulate_question(instruction, options)
+    question = question or default_q
     ans: QueryAnswer = query_interface.ask(question, opts)
     refined = refine_instruction(instruction, ans)
     res = cb.act(obs, refined)
@@ -214,6 +216,78 @@ class InsightController(Controller):
         )
 
 
+class IntentRoutedController(Controller):
+    """Route by uncertainty SOURCE (2026-07 intent/perception decomposition).
+
+    Uses the per-tick features the eval loop injects into ``obs`` (see
+    ``vla_lab.intent``): ``intent_entropy`` (which goal does the human mean?)
+    and ``cross_view_disagreement`` (do the overhead and wrist views agree?).
+
+    Priority:
+      1. intent uncertainty high  -> QUERY with a goal-clarification question
+         (compute cannot resolve WHICH object is meant — only the human can);
+      2. perception uncertainty high (probe dispersion or cross-view
+         disagreement) -> COMPUTE best-of-K (reducible with samples/views);
+      3. both low -> ACT.
+    """
+
+    def __init__(
+        self,
+        compute_branch,
+        query_interface: QueryInterface,
+        *,
+        tau_intent: float = 0.5,
+        tau_disp: float = 0.02,
+        tau_view: float = 0.08,
+        k: int = 4,
+        transparency: Optional[TransparencyConfig] = None,
+        name: str = "intent_allocator",
+    ) -> None:
+        self.cb = compute_branch
+        self.query = query_interface
+        self.tau_intent = float(tau_intent)
+        self.tau_disp = float(tau_disp)
+        self.tau_view = float(tau_view)
+        self.k = max(1, int(k))
+        self.transparency = transparency or TransparencyConfig(enabled=True, signal_type=True)
+        self.name = name
+
+    def decide(self, obs: Any, *, instruction: str, options=None, oracle_answer=None) -> Decision:
+        t0 = time.time()
+        probe = self.cb.probe(obs, instruction)
+        feats = dict(probe.features)
+        intent_u = float(feats.get("intent_entropy", 0.0))
+        view_dis = float(feats.get("cross_view_disagreement", 0.0))
+
+        if intent_u >= self.tau_intent:
+            question = "I'm not sure which object you mean. Which one should I pick up?"
+            res, question, ans, correct = _execute_query(
+                self.cb, obs, self.query, instruction, options, oracle_answer, question=question
+            )
+            return Decision(
+                action=QUERY, chunk=res.chunk, dispersion=float(probe.dispersion), k_used=1, queried=True,
+                query_question=question, query_answer=ans.text, query_answer_correct=correct,
+                query_latency_s=float(ans.latency_s), irreducible_score=intent_u,
+                transparency_message=render_message(QUERY, self.transparency),
+                uncertainty_type="intent", latency_ms=(time.time() - t0) * 1000.0, controller=self.name,
+            )
+
+        if float(probe.dispersion) > self.tau_disp or view_dis > self.tau_view:
+            res = self.cb.compute(obs, instruction, self.k)
+            return Decision(
+                action=COMPUTE, chunk=res.chunk, dispersion=float(res.dispersion), k_used=int(res.k_used),
+                transparency_message=render_message(COMPUTE, self.transparency),
+                uncertainty_type="perception", latency_ms=(time.time() - t0) * 1000.0, controller=self.name,
+            )
+
+        res = self.cb.act(obs, instruction)
+        return Decision(
+            action=ACT, chunk=res.chunk, dispersion=float(probe.dispersion), k_used=1,
+            transparency_message=render_message(ACT, self.transparency),
+            uncertainty_type="none", latency_ms=(time.time() - t0) * 1000.0, controller=self.name,
+        )
+
+
 def build_controller(
     kind: str,
     *,
@@ -225,9 +299,10 @@ def build_controller(
 ) -> Controller:
     """Factory: map a string ``kind`` to a configured controller.
 
-    ``kind`` ∈ {autonomy, fixed_compute, compute_gated, scale, knowno, insight, allocator}.
-    KnowNo / INSIGHT / allocator require a ``query_interface``; KnowNo/INSIGHT and the
-    allocator read their conformal / trigger model from ``fit``.
+    ``kind`` ∈ {autonomy, fixed_compute, compute_gated, scale, knowno, insight, allocator,
+    intent_allocator}. KnowNo / INSIGHT / allocator / intent_allocator require a
+    ``query_interface``; KnowNo/INSIGHT and the allocator read their conformal / trigger
+    model from ``fit``.
     """
 
     k = str(kind).lower().strip().replace("-", "_")
@@ -262,4 +337,16 @@ def build_controller(
         if query_interface is None:
             raise ValueError("allocator requires a query_interface")
         return ActComputeQueryAllocator(compute_branch, query_interface, fit=fit, transparency=transparency)
+    if k in ("intent_allocator", "intent_routed", "intent"):
+        if query_interface is None:
+            raise ValueError("intent_allocator requires a query_interface")
+        return IntentRoutedController(
+            compute_branch,
+            query_interface,
+            tau_intent=float(overrides.get("tau_intent", 0.5)),
+            tau_disp=float(overrides.get("tau_disp", fit.value_params.act_dispersion_tau)),
+            tau_view=float(overrides.get("tau_view", 0.08)),
+            k=int(overrides.get("k", fit.k_compute)),
+            transparency=transparency,
+        )
     raise ValueError(f"unknown controller kind: {kind!r}")

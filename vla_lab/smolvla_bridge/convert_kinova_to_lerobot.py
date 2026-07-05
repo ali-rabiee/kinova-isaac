@@ -82,6 +82,7 @@ def convert(
     drop_no_image: bool,
     overwrite: bool,
     success_only: bool = True,
+    use_wrist: bool = False,
 ) -> Dict[str, Any]:
     try:
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -137,6 +138,13 @@ def convert(
                 if drop_no_image:
                     continue
                 img = np.zeros((h, w, 3), dtype=np.uint8)
+            wrist_img = None
+            if use_wrist:
+                wrist_img = _load_image_hwc_uint8(ep, tick_t.wrist_image_rel, (h, w))
+                if wrist_img is None:
+                    if drop_no_image:
+                        continue  # wrist requested but frame missing -> skip (mixed session?)
+                    wrist_img = np.zeros((h, w, 3), dtype=np.uint8)
             act = pack_action_six(tick_next.action_from_prev)
             if act is None:
                 continue
@@ -147,8 +155,10 @@ def convert(
                 ACTION_KEY: act,
                 "task": task,
             }
-            for key in CAMERA_KEYS:
-                frame[key] = img.copy()
+            # Slot routing (matches policy_wrapper): camera2 = wrist when exported,
+            # otherwise all three slots duplicate the overhead view (legacy).
+            for i, key in enumerate(CAMERA_KEYS):
+                frame[key] = wrist_img.copy() if (wrist_img is not None and i == 1) else img.copy()
             ds.add_frame(frame)
             frames_written += 1
             added = True
@@ -172,9 +182,12 @@ def convert(
         "frames_exported": frames_written,
         "git_rev": _git_rev(repo_root),
         "lerobot_version": _lerobot_version(),
+        "use_wrist": bool(use_wrist),
         "notes": (
-            "Action is 6D delta pose (no gripper). Three camera keys duplicate the same RGB. "
-            "Pairing: obs at tick t, action = action_from_prev at tick t+1."
+            ("Action is 6D delta pose (no gripper). camera2 = WRIST view, camera1/camera3 = overhead. "
+             if use_wrist else
+             "Action is 6D delta pose (no gripper). Three camera keys duplicate the same RGB. ")
+            + "Pairing: obs at tick t, action = action_from_prev at tick t+1."
         ),
     }
     (out_dir / "kinova_export_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -206,6 +219,12 @@ def main() -> int:
         action="store_true",
         help="Also export failed/truncated/unknown-outcome episodes (default: successful lifts only).",
     )
+    p.add_argument(
+        "--wrist",
+        action="store_true",
+        help="Route the wrist view (vla_v4/collect_v4 sessions) into camera2; overhead fills camera1/camera3. "
+        "Eval must then run with `smolvla_cameras: both` so the wrapper feeds the same slots.",
+    )
     args = p.parse_args()
 
     manifest = convert(
@@ -219,6 +238,7 @@ def main() -> int:
         drop_no_image=not bool(args.keep_empty_image_frames),
         overwrite=bool(args.overwrite),
         success_only=not bool(args.include_failed),
+        use_wrist=bool(args.wrist),
     )
     print(json.dumps(manifest, indent=2))
     return 0

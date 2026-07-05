@@ -19,6 +19,12 @@ MODULES: List[str] = [
     "test_calibration",
     "test_human_study",
     "test_fit_allocator",
+    # 2026-07 intent/feedback/wrist additions. test_feedback is torch-free;
+    # test_intent/test_multicam skip their torch-dependent cases when torch
+    # is unavailable (the suite stays runnable anywhere).
+    "test_feedback",
+    "test_intent",
+    "test_multicam",
 ]
 
 

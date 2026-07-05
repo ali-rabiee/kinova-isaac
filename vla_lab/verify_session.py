@@ -15,6 +15,9 @@ It validates the properties that have silently failed in the past:
                            gripper close labels present (catches the gripper-state
                            logger bug).
 5. Logging contract      — log_rate_hz consistent across episodes, images on disk.
+6. Wrist camera          — for vla_v4/collect_v4 sessions: wrist images present in
+                           every episode (no mixed contract), files on disk, and
+                           per-episode cameras.json calibration recorded.
 
 Exit code 0 = session looks usable; 1 = hard failure (do not train on it); the
 report explains each finding. Pure stdlib — no torch / Isaac required.
@@ -82,6 +85,12 @@ def verify_session(session_dir: Path, *, min_success_rate: float = 0.7, idle_dp_
     close_labels_per_ep: List[int] = []
     close_state_ticks = 0
 
+    # Wrist camera (vla_v4 / collect_v4 sessions). Absent in single-camera sessions.
+    wrist_ticks = 0
+    wrist_images_missing = 0
+    eps_with_wrist = 0
+    eps_with_cameras_json = 0
+
     for ep_dir in ep_dirs:
         # outcome: episode_summary.json preferred, else events.jsonl
         success: Optional[bool] = None
@@ -147,6 +156,7 @@ def verify_session(session_dir: Path, *, min_success_rate: float = 0.7, idle_dp_
         total_ticks += len(ticks)
         n_close_labels = 0
         first_moving: Optional[int] = None
+        ep_wrist_ticks = 0
         for i, t in enumerate(ticks):
             afp = (t.get("policy") or {}).get("action_from_prev")
             if isinstance(afp, dict):
@@ -166,9 +176,19 @@ def verify_session(session_dir: Path, *, min_success_rate: float = 0.7, idle_dp_
                     total_images_missing += 1
             else:
                 total_images_missing += 1
+            wimg = (t.get("image_wrist") or {}).get("path")
+            if wimg:
+                ep_wrist_ticks += 1
+                if not (ep_dir / wimg).exists():
+                    wrist_images_missing += 1
         if first_moving is not None:
             leading_idle.append(first_moving)
         close_labels_per_ep.append(n_close_labels)
+        wrist_ticks += ep_wrist_ticks
+        if ep_wrist_ticks > 0:
+            eps_with_wrist += 1
+        if (ep_dir / "cameras.json").exists():
+            eps_with_cameras_json += 1
 
     n_eps = len(ep_dirs)
     print(f"[verify] session: {session_dir}")
@@ -260,6 +280,29 @@ def verify_session(session_dir: Path, *, min_success_rate: float = 0.7, idle_dp_
             hard_failures.append(msg + " (>10% of ticks).")
         else:
             warnings.append(msg + ".")
+
+    # wrist camera contract (vla_v4 sessions)
+    if eps_with_wrist > 0:
+        print(
+            f"[verify] wrist camera: {eps_with_wrist}/{n_eps} episodes, {wrist_ticks} wrist ticks, "
+            f"{eps_with_cameras_json}/{n_eps} cameras.json"
+        )
+        if eps_with_wrist < n_eps:
+            hard_failures.append(
+                f"only {eps_with_wrist}/{n_eps} episodes have wrist images — mixed camera contract inside "
+                "one session; do not train a wrist-consuming model on it."
+            )
+        if wrist_images_missing:
+            msg = f"{wrist_images_missing} ticks reference missing wrist image files"
+            if wrist_images_missing > max(1, wrist_ticks) // 10:
+                hard_failures.append(msg + " (>10% of wrist ticks).")
+            else:
+                warnings.append(msg + ".")
+        if eps_with_cameras_json < n_eps:
+            warnings.append(
+                f"cameras.json missing in {n_eps - eps_with_cameras_json}/{n_eps} episodes — wrist calibration "
+                "(hand-eye extrinsics + intrinsics) will not be recoverable for those episodes."
+            )
 
     # ------------------------------------------------------------------ report
     print()

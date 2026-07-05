@@ -34,6 +34,15 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--domain-rand-light-intensity-mult-min", type=float, default=0.5, help="Min multiplier for dome light intensity.")
     parser.add_argument("--domain-rand-light-intensity-mult-max", type=float, default=1.5, help="Max multiplier for dome light intensity.")
     parser.add_argument("--domain-rand-light-color-jitter", type=float, default=0.15, help="Per-channel RGB jitter for dome light color (0..1).")
+    # Wrist (eye-in-hand) camera. Off by default so collect_v3/vla_v1 sessions are unchanged;
+    # profile vla_v4 (collect_v4.sh) turns it on. Records images/wrist_XXXXXX.png per tick,
+    # an `image_wrist` tick key, and per-episode camera calibration in cameras.json.
+    parser.add_argument(
+        "--wrist-camera",
+        action="store_true",
+        default=False,
+        help="Also record the wrist camera (DEFAULT_WRIST_CAMERA in the env config). Requires --enable_cameras.",
+    )
     # vla_v1: nudge default spawn region slightly away from the robot to reduce "too-close" grasps.
     # (These args are registered by scripts/cli.add_demo_cli_args before this profile hook runs.)
     try:
@@ -549,6 +558,21 @@ def run(args: argparse.Namespace) -> int:
     if enable_cameras and DEFAULT_TOP_DOWN_CAMERA is not None:
         create_topdown_camera(DEFAULT_TOP_DOWN_CAMERA)
         print(f"[VLA_V1] Top-down camera created at: {DEFAULT_TOP_DOWN_CAMERA.prim_path}")
+
+    # Optional wrist (eye-in-hand) camera — opt-in via --wrist-camera (profile vla_v4).
+    # Created as a child prim of the EE link so it tracks the arm automatically.
+    DEFAULT_WRIST_CAMERA = getattr(env_cfg_mod, "DEFAULT_WRIST_CAMERA", None)
+    wrist_camera_requested = bool(getattr(args, "wrist_camera", False))
+    wrist_camera_enabled = enable_cameras and wrist_camera_requested and DEFAULT_WRIST_CAMERA is not None
+    if wrist_camera_requested and not wrist_camera_enabled:
+        print(
+            "[VLA_V1][WARN] --wrist-camera requested but unavailable "
+            f"(enable_cameras={enable_cameras}, DEFAULT_WRIST_CAMERA={'set' if DEFAULT_WRIST_CAMERA is not None else 'missing'})."
+        )
+    if wrist_camera_enabled:
+        create_wrist_camera = getattr(importlib.import_module("environments.utils.camera"), "create_wrist_camera")
+        create_wrist_camera(DEFAULT_WRIST_CAMERA)
+        print(f"[VLA_V1] Wrist camera created at: {DEFAULT_WRIST_CAMERA.prim_path}")
 
     # -----------------------------
     # Domain randomization helpers
@@ -1335,6 +1359,34 @@ def run(args: argparse.Namespace) -> int:
             print(f"[VLA_V1] ERROR: Failed to create Camera object: {create_err}")
             camera_sensor = None
 
+    # Wrist camera sensor (same attach-to-existing-prim pattern as the top-down sensor).
+    wrist_sensor = None
+    if wrist_camera_enabled:
+        try:
+            wrist_camera_cfg = CameraCfg(
+                prim_path=DEFAULT_WRIST_CAMERA.prim_path,
+                offset=CameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
+                spawn=None,
+                data_types=["rgb"],
+                width=DEFAULT_WRIST_CAMERA.resolution[0],
+                height=DEFAULT_WRIST_CAMERA.resolution[1],
+            )
+            wrist_sensor = Camera(cfg=wrist_camera_cfg)
+            print(f"[VLA_V1] Wrist camera sensor created: {wrist_camera_cfg.width}x{wrist_camera_cfg.height}")
+        except Exception as create_err:
+            print(f"[VLA_V1] ERROR: Failed to create wrist Camera object: {create_err}")
+            wrist_sensor = None
+
+    def _reset_wrist_sensor() -> None:
+        """Best-effort wrist sensor reset; called wherever the top-down sensor resets."""
+        nonlocal wrist_sensor
+        if wrist_sensor is not None:
+            try:
+                wrist_sensor.reset()
+            except Exception as e:
+                print(f"[VLA_V1] ERROR: Wrist camera sensor reset failed: {e}")
+                wrist_sensor = None
+
     # Reset sim and robot
     def _reset_sim_and_robot() -> None:
         sim.reset()
@@ -1355,6 +1407,7 @@ def run(args: argparse.Namespace) -> int:
         except Exception as e:
             print(f"[VLA_V1] ERROR: Camera sensor reset failed post sim.reset: {e}")
             camera_sensor = None
+    _reset_wrist_sensor()
 
     # Apply domain randomization once for non-episode runs (keyboard/idle). Planner mode applies per episode.
     # This is done after sim.reset so camera/light prims exist and are stable.
@@ -1367,6 +1420,7 @@ def run(args: argparse.Namespace) -> int:
                     camera_sensor.reset()
                 except Exception:
                     pass
+            _reset_wrist_sensor()
     except Exception:
         pass
 
@@ -1577,7 +1631,7 @@ def run(args: argparse.Namespace) -> int:
 
     images_dir = session_logger.root / "images"
     # Only create the images directory if cameras are enabled (avoid filesystem churn in non-camera runs).
-    if camera_sensor is not None:
+    if camera_sensor is not None or wrist_sensor is not None:
         images_dir.mkdir(exist_ok=True)
     image_format = getattr(args, "image_format", "png")
 
@@ -1637,6 +1691,11 @@ def run(args: argparse.Namespace) -> int:
                         # Only update camera when we render (otherwise the render product may not advance).
                         if bool(do_render):
                             camera_sensor.update(dt)
+                except Exception:
+                    pass
+            if wrist_sensor is not None and bool(do_render):
+                try:
+                    wrist_sensor.update(dt)
                 except Exception:
                     pass
 
@@ -1706,6 +1765,16 @@ def run(args: argparse.Namespace) -> int:
                     except Exception:
                         image_path = None
 
+                wrist_image_path = None
+                if wrist_sensor is not None:
+                    from data_collection.core.camera_rig import save_rgb_tick_image
+
+                    wrist_image_path = save_rgb_tick_image(
+                        wrist_sensor,
+                        images_dir=images_dir,
+                        filename=f"wrist_{session_logger.tick_idx:06d}.{image_format}",
+                    )
+
                 session_logger.write_tick(
                     robot=robot,
                     controller=controller,
@@ -1713,6 +1782,7 @@ def run(args: argparse.Namespace) -> int:
                     last_user_cmd=mux_input.last_cmd,
                     cfg=tick_cfg,
                     image_path=image_path,
+                    wrist_image_path=wrist_image_path,
                 )
     else:
         # Planner mode runs episode loops (reset + respawn) and ends each episode after lift.
@@ -1746,6 +1816,7 @@ def run(args: argparse.Namespace) -> int:
             steps: int,
             images: int,
             truncated: bool,
+            wrist_images: int = 0,
         ) -> None:
             """One-file episode verdict so dataset builders can filter without parsing events."""
             try:
@@ -1759,6 +1830,7 @@ def run(args: argparse.Namespace) -> int:
                     "steps": int(steps),
                     "ticks": int(logger.tick_idx),
                     "images": int(images),
+                    "wrist_images": int(wrist_images),
                     "target_prim": str(vla_planner_state.get("target_prim", "") or ""),
                     "target_label": _prim_label(str(vla_planner_state.get("target_prim", "") or "")),
                     "language_command": str(vla_planner_state.get("language_command", "") or ""),
@@ -1779,10 +1851,11 @@ def run(args: argparse.Namespace) -> int:
                 # Episode folders go inside the session folder
                 session_logger = SessionLogWriter(root=session_folder, session_name=f"episode_{ep:04d}")
                 images_dir = session_logger.root / "images"
-                if camera_sensor is not None:
+                if camera_sensor is not None or wrist_sensor is not None:
                     images_dir.mkdir(exist_ok=True)
                 image_format = getattr(args, "image_format", "png")
                 images_captured_episode = 0
+                wrist_images_captured_episode = 0
                 
                 # Write metadata for this episode
                 session_logger.write_metadata(
@@ -1803,6 +1876,7 @@ def run(args: argparse.Namespace) -> int:
                         camera_sensor.reset()
                     except Exception:
                         pass
+                _reset_wrist_sensor()
 
                 # IMPORTANT: PhysX views are not reliably populated immediately after `sim.reset()`.
                 # If we try to create rigid-body views and teleport *before* the first post-reset step,
@@ -2024,15 +2098,35 @@ def run(args: argparse.Namespace) -> int:
                         print(f"[VLA_V1][PREROLL][WARN] start pre-roll failed: {preroll_err}")
 
                 # Apply domain randomization once per episode (after reset/respawn/settle).
+                _dr_sample = None
                 try:
-                    _apply_domain_randomization(ep_idx=int(ep), logger=session_logger)
+                    _dr_sample = _apply_domain_randomization(ep_idx=int(ep), logger=session_logger)
                     if camera_sensor is not None:
                         try:
                             camera_sensor.reset()
                         except Exception:
                             pass
+                    _reset_wrist_sensor()
                 except Exception:
                     pass
+
+                # Per-episode camera calibration (intrinsics + extrinsics, post-DR actuals).
+                # Written for every planner episode so downstream tools can rely on it;
+                # the wrist block is present only when the wrist camera is recording.
+                try:
+                    from data_collection.core.camera_rig import build_cameras_calibration
+
+                    _calib = build_cameras_calibration(
+                        topdown_cfg=DEFAULT_TOP_DOWN_CAMERA if camera_sensor is not None else None,
+                        wrist_cfg=DEFAULT_WRIST_CAMERA if wrist_sensor is not None else None,
+                        dr_camera_sample=(_dr_sample or {}).get("camera") if isinstance(_dr_sample, dict) else None,
+                    )
+                    if ("overhead" in _calib) or ("wrist" in _calib):
+                        import json as _json
+
+                        (session_logger.root / "cameras.json").write_text(_json.dumps(_calib, indent=2))
+                except Exception as calib_err:
+                    print(f"[VLA_V1][WARN] could not write cameras.json: {calib_err}")
 
                 # Re-init per-episode follower state to avoid leftover queued waypoints/gripper commands.
                 wp.set_waypoints_b([])
@@ -2920,6 +3014,7 @@ def run(args: argparse.Namespace) -> int:
                                     steps=int(steps),
                                     images=int(images_captured_episode),
                                     truncated=False,
+                                    wrist_images=int(wrist_images_captured_episode),
                                 )
                                 # Track totals before closing
                                 total_ticks += session_logger.tick_idx
@@ -2950,6 +3045,11 @@ def run(args: argparse.Namespace) -> int:
                             if hasattr(camera_sensor, "update"):
                                 if bool(do_render):
                                     camera_sensor.update(dt)
+                        except Exception:
+                            pass
+                    if wrist_sensor is not None and bool(do_render):
+                        try:
+                            wrist_sensor.update(dt)
                         except Exception:
                             pass
 
@@ -3029,6 +3129,18 @@ def run(args: argparse.Namespace) -> int:
                             except Exception:
                                 image_path = None
 
+                        wrist_image_path = None
+                        if wrist_sensor is not None:
+                            from data_collection.core.camera_rig import save_rgb_tick_image
+
+                            wrist_image_path = save_rgb_tick_image(
+                                wrist_sensor,
+                                images_dir=images_dir,
+                                filename=f"wrist_{session_logger.tick_idx:06d}.{image_format}",
+                            )
+                            if wrist_image_path is not None:
+                                wrist_images_captured_episode += 1
+
                         session_logger.write_tick(
                             robot=robot,
                             controller=controller,
@@ -3036,6 +3148,7 @@ def run(args: argparse.Namespace) -> int:
                             last_user_cmd=mux_input.last_cmd,
                             cfg=tick_cfg,
                             image_path=image_path,
+                            wrist_image_path=wrist_image_path,
                         )
                 # If we hit the max steps, still end the episode cleanly.
                 if str(vla_planner_state.get("stage", "")) != "done":
@@ -3047,6 +3160,7 @@ def run(args: argparse.Namespace) -> int:
                         steps=int(steps),
                         images=int(images_captured_episode),
                         truncated=True,
+                        wrist_images=int(wrist_images_captured_episode),
                     )
                     # Track totals before closing
                     total_ticks += session_logger.tick_idx

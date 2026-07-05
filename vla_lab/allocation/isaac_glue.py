@@ -123,12 +123,18 @@ def build_eval_harness(
     ttc_cfg: Optional[Dict[str, Any]] = None,
     alloc_cfg: Optional[Dict[str, Any]] = None,
     fit_path: Optional[str] = None,
+    query_interface: Any = None,
 ) -> EvalControllerHarness:
-    """One-call construction used by ``eval_isaaclab.py``."""
+    """One-call construction used by ``eval_isaaclab.py``.
+
+    ``query_interface`` overrides the alloc_cfg-built one — used when a
+    feedback channel is active so robot-initiated queries and unsolicited
+    corrections come from the SAME (simulated or live) human.
+    """
 
     alloc_cfg = dict(alloc_cfg or {})
     cb = build_compute_branch(policy_backend, tiny=tiny, smol=smol, device=device, ttc_cfg=ttc_cfg)
-    qi = build_query_interface(alloc_cfg)
+    qi = query_interface if query_interface is not None else build_query_interface(alloc_cfg)
     fit = AllocatorFit.load(fit_path) if fit_path else AllocatorFit.default()
     transp = TransparencyConfig.from_dict(alloc_cfg.get("transparency", {})) if alloc_cfg.get("transparency") else TransparencyConfig(enabled=False)
     controller = build_controller(

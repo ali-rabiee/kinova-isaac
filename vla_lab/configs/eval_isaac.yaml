@@ -8,6 +8,16 @@ observability_mode: external_only
 occlusion:
   mode: none               # none | bottom_strip | top_strip | center_box | random_patch
   fraction: 0.35
+  camera: overhead         # which view the mask hits: overhead | wrist | both
+
+# Camera set fed to the policy (2026-07 wrist camera). null = the checkpoint's
+# camera_set (single-camera checkpoints keep the original behavior). A strict
+# subset of a two-camera checkpoint runs the missing-view ablation:
+#   --cameras overhead | wrist | both     (CLI override)
+# For the SmolVLA backend, `smolvla_cameras: both` means the LeRobot dataset was
+# exported with --wrist (camera2 = wrist view).
+# cameras: null
+# smolvla_cameras: overhead
 
 # Policy runner: "tiny" = `vla_lab.train` checkpoint; "smolvla" = LeRobot Hub id or local dir.
 policy_backend: tiny
@@ -67,12 +77,35 @@ ttc:
   log_jsonl: null
   latency_log: null
 
+# Human-intent uncertainty + real-time semantic feedback (2026-07; see README §9-10).
+# All defaults keep the legacy behavior (no feedback, intent estimator only
+# when a controller/feedback is active).
+# intent:
+#   every_n_ticks: 1        # 0 = off; counterfactual sweep is ~n_objects tiny forwards
+#   temperature: 0.02
+#   lexical_prior_weight: 0.75
+#   geometric_weight: 0.5
+# eval.instruction_ambiguity: none   # none | half | full — colorless instructions drive intent uncertainty
+# feedback:
+#   channel: none           # none | scripted (simulated human) | console (your keyboard)
+#   accuracy: 0.95          # scripted human quality knobs -------------------
+#   latency_ticks: 3
+#   specificity: color      # color | directional | vague
+#   noise_rate: 0.0
+#   seed: 0
+#   trust_threshold: 0.55   # fusion: reliability >= this -> apply corrections
+#   ignore_threshold: 0.30  # reliability < this -> ignore
+#   fusion_verify: true     # false = trust-all ablation
+#   nudge_step_m: 0.02
+#   nudge_horizon_ticks: 5
+#   auto_resume_ticks: 45
+
 # Act/compute/query controller (HRI-2027 pivot; see README §7).
 # `controller: none` keeps the legacy TTC path above. Any other value routes each policy tick
 # through vla_lab/allocation (the act/compute/query trichotomy). CLI overrides:
 # --controller, --allocator-fit, --emit-calibration.
 allocation:
-  controller: none          # none | autonomy | fixed_compute | compute_gated | scale | knowno | insight | allocator
+  controller: none          # none | autonomy | fixed_compute | compute_gated | scale | knowno | insight | allocator | intent_allocator
   fit_path: null            # allocator_fit.json from `python -m vla_lab.fit_allocator` (unlocks query / INSIGHT / KnowNo)
   emit_calibration: null    # JSONL path: write per-step calibration records for vla_lab.calibration.analyze
   # Query interface used when a controller escalates to a human:

@@ -148,6 +148,7 @@ class SessionLogWriter:
         last_user_cmd: Optional[torch.Tensor],
         cfg: TickLoggingConfig,
         image_path: Optional[str] = None,
+        wrist_image_path: Optional[str] = None,
     ) -> None:
         now_ms = int(time.time() * 1000)
         self._resolve_robot_indices(robot, cfg.ee_link_name, cfg.arm_joint_regex)
@@ -448,6 +449,11 @@ class SessionLogWriter:
         # Add image path if provided
         if image_path is not None:
             record["image"] = {"path": image_path}
+        # Wrist (eye-in-hand) camera image, when a wrist camera is recording
+        # (profile vla_v4 / --wrist-camera). Absent in single-camera sessions,
+        # so existing tooling that reads only `image` keeps working unchanged.
+        if wrist_image_path is not None:
+            record["image_wrist"] = {"path": wrist_image_path}
 
         self.ticks_f.write(json.dumps(_format_numbers(record, ndigits=4)) + "\n")
         self.tick_idx += 1

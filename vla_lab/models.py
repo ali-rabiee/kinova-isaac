@@ -31,6 +31,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+CAMERA_NAMES = ("overhead", "wrist")
+
+
 @dataclass
 class TinyVLAConfig:
     image_size: int = 224
@@ -50,6 +53,26 @@ class TinyVLAConfig:
     max_lang_len: int = 24
     dropout: float = 0.05
     noise_std: float = 0.0  # train-time bottleneck noise; set >0 to encourage diversity
+    # Camera set consumed by the policy, in stream order. ("overhead",) is the
+    # original single-camera contract (old checkpoints load unchanged);
+    # ("wrist",) and ("overhead", "wrist") enable the camera-set ablations.
+    # The vision encoder is SHARED across streams; each stream gets a learned
+    # camera-ID embedding (only materialized when len(cameras) > 1).
+    cameras: Tuple[str, ...] = ("overhead",)
+    # Train-time per-sample camera dropout (needs len(cameras) > 1): each stream
+    # is zeroed with this probability (at least one stream always survives).
+    # This is what lets a two-camera policy keep working when one view is
+    # missing/occluded at eval — the "one camera + our method" story.
+    camera_dropout: float = 0.0
+
+    def __post_init__(self) -> None:
+        cams = tuple(str(c) for c in self.cameras)
+        for c in cams:
+            if c not in CAMERA_NAMES:
+                raise ValueError(f"Unknown camera '{c}'; expected subset of {CAMERA_NAMES}")
+        if len(set(cams)) != len(cams) or not cams:
+            raise ValueError(f"cameras must be a non-empty set of unique names, got {cams}")
+        self.cameras = cams
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -70,6 +93,8 @@ class TinyVLAConfig:
             "max_lang_len": self.max_lang_len,
             "dropout": self.dropout,
             "noise_std": self.noise_std,
+            "cameras": list(self.cameras),
+            "camera_dropout": self.camera_dropout,
         }
 
     @classmethod
@@ -92,6 +117,8 @@ class TinyVLAConfig:
             max_lang_len=int(d.get("max_lang_len", 24)),
             dropout=float(d.get("dropout", 0.05)),
             noise_std=float(d.get("noise_std", 0.0)),
+            cameras=tuple(d.get("cameras", ("overhead",))),
+            camera_dropout=float(d.get("camera_dropout", 0.0)),
         )
 
 
@@ -233,11 +260,17 @@ class TinyVLA(nn.Module):
     def __init__(self, cfg: TinyVLAConfig) -> None:
         super().__init__()
         self.cfg = cfg
-        self.vision = VisionEncoder(cfg)
+        self.vision = VisionEncoder(cfg)  # shared across camera streams
         self.language = LanguageEncoder(cfg)
         self.state_enc = StateEncoder(cfg)
         self.token_norm = nn.LayerNorm(cfg.embed_dim)
         self.decoder = ActionDecoder(cfg)
+        # Camera-ID embedding: only materialized for multi-camera configs so
+        # single-camera state dicts (all pre-wrist checkpoints) stay identical.
+        if len(cfg.cameras) > 1:
+            self.camera_embed = nn.Parameter(torch.zeros(len(cfg.cameras), cfg.embed_dim))
+        else:
+            self.camera_embed = None
 
     @torch.no_grad()
     def num_parameters(self, trainable_only: bool = True) -> int:
@@ -245,24 +278,79 @@ class TinyVLA(nn.Module):
             p.numel() for p in self.parameters() if (not trainable_only) or p.requires_grad
         )
 
+    def _camera_streams(
+        self,
+        image: Optional[torch.Tensor],
+        image_wrist: Optional[torch.Tensor],
+        camera_present: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Encode the configured camera set into one (B, n_cams*Nv, D) token sequence.
+
+        - `image` feeds the "overhead" stream, `image_wrist` the "wrist" stream.
+        - A stream whose input is None is encoded from zeros (blind view).
+        - `camera_present`: optional (B, n_cams) 0/1 mask; a 0 zeroes that
+          stream's tokens (missing frame at eval / camera-set ablation).
+        - Train-time camera dropout zeroes random streams per sample, keeping
+          at least one stream alive.
+        """
+
+        ref = image if image is not None else image_wrist
+        if ref is None:
+            raise ValueError("TinyVLA.forward needs `image` and/or `image_wrist`")
+        b = ref.size(0)
+        by_name = {"overhead": image, "wrist": image_wrist}
+        n_cams = len(self.cfg.cameras)
+
+        keep = None
+        if camera_present is not None:
+            keep = camera_present.to(device=ref.device, dtype=ref.dtype).view(b, n_cams)
+        if self.training and n_cams > 1 and float(self.cfg.camera_dropout) > 0.0:
+            drop = (torch.rand(b, n_cams, device=ref.device) < float(self.cfg.camera_dropout))
+            # Never drop every stream of a sample: revive one random stream.
+            all_dropped = drop.all(dim=1)
+            if bool(all_dropped.any()):
+                revive = torch.randint(n_cams, (int(all_dropped.sum()),), device=ref.device)
+                drop[all_dropped.nonzero(as_tuple=True)[0], revive] = False
+            keep_drop = (~drop).to(ref.dtype)
+            keep = keep_drop if keep is None else keep * keep_drop
+
+        streams = []
+        for ci, name in enumerate(self.cfg.cameras):
+            x = by_name.get(name)
+            if x is None:
+                x = ref.new_zeros(b, self.cfg.in_channels, self.cfg.image_size, self.cfg.image_size)
+            tok = self.vision(x)  # (B, Nv, D)
+            if self.camera_embed is not None:
+                tok = tok + self.camera_embed[ci].view(1, 1, -1)
+            if keep is not None:
+                tok = tok * keep[:, ci].view(b, 1, 1)
+            streams.append(tok)
+        return torch.cat(streams, dim=1)
+
     def forward(
         self,
-        image: torch.Tensor,
-        state: torch.Tensor,
-        lang_ids: torch.Tensor,
-        lang_mask: torch.Tensor,
+        image: Optional[torch.Tensor] = None,
+        state: torch.Tensor = None,
+        lang_ids: torch.Tensor = None,
+        lang_mask: torch.Tensor = None,
         noise: Optional[torch.Tensor] = None,
         noise_std: Optional[float] = None,
+        image_wrist: Optional[torch.Tensor] = None,
+        camera_present: Optional[torch.Tensor] = None,
     ) -> ModelOutput:
         """Standard forward pass.
 
+        - `image` / `image_wrist`: overhead / wrist RGB. Which are consumed is
+          set by `cfg.cameras`; a configured-but-missing stream is fed zeros.
+        - `camera_present`: optional (B, n_cams) 0/1 stream mask (see
+          `_camera_streams`), used for camera-set ablations at eval.
         - `noise`: optional (B, n_tokens, D) tensor added to the fused
           token sequence (the bottleneck) to draw stochastic candidates.
         - `noise_std`: convenience override for the per-call sampling std
           (used for K-sampling at inference). Ignored if `noise` is given.
         """
 
-        img_tok = self.vision(image)                        # (B, Nv, D)
+        img_tok = self._camera_streams(image, image_wrist, camera_present)  # (B, n*Nv, D)
         lang_tok = self.language(lang_ids, lang_mask)       # (B, L, D)
         st_tok = self.state_enc(state)                      # (B, 1, D)
 
@@ -286,16 +374,21 @@ class TinyVLA(nn.Module):
         full_mask[:, nv : nv + l] = lang_mask == 0  # True where language token is pad
 
         actions = self.decoder(memory, memory_key_padding_mask=full_mask)
-        return ModelOutput(actions=actions, features=img_tok, bottleneck=memory)
+        # `features` stays the FIRST stream's tokens (B, Nv, D) so the DINOv2
+        # feature-alignment loss keeps its single-view contract for any camera set.
+        n_first = img_tok.size(1) // len(self.cfg.cameras)
+        return ModelOutput(actions=actions, features=img_tok[:, :n_first], bottleneck=memory)
 
     def sample_actions(
         self,
-        image: torch.Tensor,
-        state: torch.Tensor,
-        lang_ids: torch.Tensor,
-        lang_mask: torch.Tensor,
+        image: Optional[torch.Tensor] = None,
+        state: torch.Tensor = None,
+        lang_ids: torch.Tensor = None,
+        lang_mask: torch.Tensor = None,
         k: int = 1,
         noise_std: float = 0.1,
+        image_wrist: Optional[torch.Tensor] = None,
+        camera_present: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Return K candidate action chunks of shape (K, B, T, A).
 
@@ -304,11 +397,17 @@ class TinyVLA(nn.Module):
         """
 
         if k <= 1:
-            out = self.forward(image, state, lang_ids, lang_mask, noise_std=0.0)
+            out = self.forward(
+                image, state, lang_ids, lang_mask, noise_std=0.0,
+                image_wrist=image_wrist, camera_present=camera_present,
+            )
             return out.actions.unsqueeze(0)
         outs = []
         for _ in range(int(k)):
-            out = self.forward(image, state, lang_ids, lang_mask, noise_std=noise_std)
+            out = self.forward(
+                image, state, lang_ids, lang_mask, noise_std=noise_std,
+                image_wrist=image_wrist, camera_present=camera_present,
+            )
             outs.append(out.actions)
         return torch.stack(outs, dim=0)
 

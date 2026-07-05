@@ -188,6 +188,8 @@ class TTCPipeline:
         state: torch.Tensor,
         lang_ids: torch.Tensor,
         lang_mask: torch.Tensor,
+        image_wrist: Optional[torch.Tensor] = None,
+        camera_present: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         was_unbatched = image.dim() == 3
         if was_unbatched:
@@ -195,6 +197,11 @@ class TTCPipeline:
             state = state.unsqueeze(0)
             lang_ids = lang_ids.unsqueeze(0)
             lang_mask = lang_mask.unsqueeze(0)
+        if image_wrist is not None and image_wrist.dim() == 3:
+            image_wrist = image_wrist.unsqueeze(0)
+        if camera_present is not None and camera_present.dim() == 1:
+            camera_present = camera_present.unsqueeze(0)
+        cam_kw = {"image_wrist": image_wrist, "camera_present": camera_present}
 
         t_total0 = time.time()
         forward_ms = 0.0
@@ -211,9 +218,9 @@ class TTCPipeline:
         gmode = _normalize_gating_label(gate_mode)
         if k_max > 1 and gmode == "twin_uncertainty":
             t0 = time.time()
-            out0 = self.model.forward(image, state, lang_ids, lang_mask, noise_std=0.0)
+            out0 = self.model.forward(image, state, lang_ids, lang_mask, noise_std=0.0, **cam_kw)
             out1 = self.model.forward(
-                image, state, lang_ids, lang_mask, noise_std=float(self.cfg.gating_noise_std)
+                image, state, lang_ids, lang_mask, noise_std=float(self.cfg.gating_noise_std), **cam_kw
             )
             forward_ms += (time.time() - t0) * 1000.0
             a0 = out0.actions.squeeze(0)
@@ -249,8 +256,8 @@ class TTCPipeline:
         elif k_max > 1 and gmode == "noisy_pair":
             t0 = time.time()
             gn = float(self.cfg.gating_noise_std)
-            out0 = self.model.forward(image, state, lang_ids, lang_mask, noise_std=gn)
-            out1 = self.model.forward(image, state, lang_ids, lang_mask, noise_std=gn)
+            out0 = self.model.forward(image, state, lang_ids, lang_mask, noise_std=gn, **cam_kw)
+            out1 = self.model.forward(image, state, lang_ids, lang_mask, noise_std=gn, **cam_kw)
             forward_ms += (time.time() - t0) * 1000.0
             a0 = out0.actions.squeeze(0)
             a1 = out1.actions.squeeze(0)
@@ -287,7 +294,7 @@ class TTCPipeline:
 
         t0 = time.time()
         if k_eff > 1 and self.cfg.include_deterministic_candidate:
-            a_det = self.model.forward(image, state, lang_ids, lang_mask, noise_std=0.0).actions.squeeze(0)
+            a_det = self.model.forward(image, state, lang_ids, lang_mask, noise_std=0.0, **cam_kw).actions.squeeze(0)
             stoch = self.model.sample_actions(
                 image=image,
                 state=state,
@@ -295,6 +302,7 @@ class TTCPipeline:
                 lang_mask=lang_mask,
                 k=int(k_eff - 1),
                 noise_std=float(self.cfg.noise_std),
+                **cam_kw,
             )
             if stoch.size(1) != 1:
                 raise ValueError("TTCPipeline.predict_action_chunk supports B=1 only.")
@@ -308,6 +316,7 @@ class TTCPipeline:
                 lang_mask=lang_mask,
                 k=int(k_eff),
                 noise_std=float(self.cfg.noise_std),
+                **cam_kw,
             )
             if candidates.size(1) != 1:
                 raise ValueError("TTCPipeline.predict_action_chunk supports B=1 only.")

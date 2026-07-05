@@ -230,6 +230,12 @@ def main() -> int:
         action_stats = compute_action_stats(train_eps)
         print(f"[train] action stats: mean={action_stats.mean.tolist()}, std={action_stats.std.tolist()}")
 
+    # Camera set: data.cameras wins, falling back to model.cameras, then overhead-only
+    # (the pre-wrist behavior). Recorded into the checkpoint as `camera_set` so eval
+    # can build/verify the same cameras.
+    cameras = tuple(str(c) for c in data_cfg.get("cameras", model_cfg.get("cameras", ["overhead"])))
+    print(f"[train] camera set: {list(cameras)}")
+
     ds_cfg = DatasetConfig(
         image_size=int(data_cfg.get("image_size", 224)),
         chunk_len=int(data_cfg.get("chunk_len", model_cfg.get("chunk_len", 8))),
@@ -237,7 +243,25 @@ def main() -> int:
         action_dim=int(data_cfg.get("action_dim", model_cfg.get("action_dim", 7))),
         drop_no_image=bool(data_cfg.get("drop_no_image", True)),
         fast_image_io=bool(data_cfg.get("fast_image_io", True)),
+        cameras=cameras,
     )
+
+    # Action-rate contract: read log_rate_hz from the sessions' metadata so the
+    # checkpoint carries it (eval warns/rescales when policy_rate_hz differs).
+    rates = set()
+    for ep in episodes:
+        mp = ep.folder / "metadata.json"
+        try:
+            rates.add(int(json.loads(mp.read_text()).get("config", {}).get("log_rate_hz", 0)))
+        except Exception:
+            continue
+    rates.discard(0)
+    action_rate_hz: Optional[int] = None
+    if len(rates) == 1:
+        action_rate_hz = int(next(iter(rates)))
+        print(f"[train] action rate (from session metadata): {action_rate_hz} Hz")
+    elif len(rates) > 1:
+        print(f"[train] WARNING: mixed log_rate_hz across sessions: {sorted(rates)} — do not mix contracts!")
 
     train_ds = KinovaSessionDataset(train_eps, tokenizer, ds_cfg, action_stats=action_stats, train=True)
     val_ds: Optional[KinovaSessionDataset] = None
@@ -299,6 +323,7 @@ def main() -> int:
     model_cfg["chunk_len"] = ds_cfg.chunk_len
     model_cfg["action_dim"] = ds_cfg.action_dim
     model_cfg["state_dim"] = ds_cfg.state_dim
+    model_cfg["cameras"] = list(cameras)
 
     cfg_obj = TinyVLAConfig.from_dict(model_cfg)
     model = TinyVLA(cfg_obj).to(device)
@@ -373,6 +398,11 @@ def main() -> int:
             "model_config": cfg_obj.to_dict(),
             "tokenizer": tokenizer.to_dict(),
             "action_stats": action_stats.to_dict() if action_stats else None,
+            # Contract fields (new 2026-07): which cameras the policy consumes and
+            # the tick rate its action deltas assume. Eval reads these to build the
+            # right sensors and to check policy_rate_hz compatibility.
+            "camera_set": list(cameras),
+            "action_rate_hz": action_rate_hz,
             "feature_alignment_state": fa_loss.state_dict() if fa_loss is not None else None,
             "feature_alignment_config": {**fa_cfg_dict, "enabled": bool(fa_cfg.enabled)},
             "optimizer_state": optim.state_dict(),
@@ -531,10 +561,12 @@ def main() -> int:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             with _forward_ctx():
                 out = model(
-                    image=batch["image"],
+                    image=batch.get("image"),
                     state=batch["state"],
                     lang_ids=batch["lang_ids"],
                     lang_mask=batch["lang_mask"],
+                    image_wrist=batch.get("image_wrist"),
+                    camera_present=batch.get("camera_present"),
                 )
 
                 act_loss = masked_action_loss(
@@ -542,7 +574,9 @@ def main() -> int:
                 )
                 fa_l = torch.zeros((), device=device)
                 if fa_loss is not None and fa_cfg.enabled:
-                    fa_l = fa_loss(out.features, batch["image"])
+                    # features = first camera stream; align against that camera's pixels.
+                    fa_ref = batch.get("image") if cameras[0] == "overhead" else batch.get("image_wrist")
+                    fa_l = fa_loss(out.features, fa_ref)
 
                 loss = act_loss + fa_weight * fa_l
 
@@ -607,10 +641,12 @@ def main() -> int:
                     batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
                     with _forward_ctx():
                         out = model(
-                            image=batch["image"],
+                            image=batch.get("image"),
                             state=batch["state"],
                             lang_ids=batch["lang_ids"],
                             lang_mask=batch["lang_mask"],
+                            image_wrist=batch.get("image_wrist"),
+                            camera_present=batch.get("camera_present"),
                         )
                         losses.append(
                             float(

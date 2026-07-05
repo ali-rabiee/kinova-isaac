@@ -51,10 +51,17 @@ class MockComputeBranch:
     def probe(self, obs: Any, instruction: str) -> ProbeResult:
         self.calls["probe"] += 1
         d = self._disp(obs)
+        feats = {"dispersion": d, "occlusion_fraction": self._occ(obs)}
+        # Mirror policy_adapters._features: intent/perception decomposition keys
+        # flow from obs into the probe features (2026-07 intent axis).
+        if isinstance(obs, dict):
+            for key in ("intent_entropy", "intent_top2_margin", "cross_view_disagreement", "instruction_ambiguous"):
+                if obs.get(key) is not None:
+                    feats[key] = float(obs[key])
         return ProbeResult(
             dispersion=d,
             act_chunk=self._chunk(0),
-            features={"dispersion": d, "occlusion_fraction": self._occ(obs)},
+            features=feats,
         )
 
     def compute(self, obs: Any, instruction: str, k: int) -> ComputeResult:

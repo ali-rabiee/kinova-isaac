@@ -85,6 +85,8 @@ class TickRecord:
     gripper_state: str  # "open" / "close"
     # Action-from-prev is None for tick 0 of each episode.
     action_from_prev: Optional[Tuple[float, float, float, float, float, float, int]]
+    # Wrist (eye-in-hand) image, recorded by vla_v4/collect_v4 sessions only.
+    wrist_image_rel: Optional[str] = None
 
 
 @dataclass
@@ -178,6 +180,12 @@ def _parse_ticks(ticks_path: Path) -> List[TickRecord]:
             except Exception:
                 image_rel = None
 
+            wrist_image_rel = None
+            try:
+                wrist_image_rel = rec.get("image_wrist", {}).get("path")
+            except Exception:
+                wrist_image_rel = None
+
             ee_pos = tuple(rec["robot"]["ee_pose_b"]["position_m"])  # type: ignore[index]
             ee_quat = tuple(rec["robot"]["ee_pose_b"]["orientation_wxyz"])  # type: ignore[index]
             grip_state = str(rec["robot"]["gripper"]["state"])  # type: ignore[index]
@@ -210,6 +218,7 @@ def _parse_ticks(ticks_path: Path) -> List[TickRecord]:
                     ee_quat_b=tuple(float(v) for v in ee_quat),  # type: ignore[arg-type]
                     gripper_state=grip_state,
                     action_from_prev=action,
+                    wrist_image_rel=wrist_image_rel,
                 )
             )
     return out
@@ -470,6 +479,12 @@ class DatasetConfig:
     drop_no_image: bool = True
     # If True (default), use torchvision.io.read_image when available (often faster than PIL).
     fast_image_io: bool = True
+    # Camera set consumed by samples, in stream order; must match the model's
+    # `cameras`. ("overhead",) is the original single-camera contract; adding
+    # "wrist" requires a vla_v4/collect_v4 session (ticks carry `image_wrist`).
+    # Sample keys: "image" iff "overhead" requested, "image_wrist" iff "wrist"
+    # requested, plus "camera_present" (n_cams,) flags for loadable frames.
+    cameras: Tuple[str, ...] = ("overhead",)
 
 
 class KinovaSessionDataset(Dataset):
@@ -510,21 +525,43 @@ class KinovaSessionDataset(Dataset):
             except Exception:
                 self._fast_io = False
 
+        cams = tuple(str(c) for c in cfg.cameras)
+        for c in cams:
+            if c not in ("overhead", "wrist"):
+                raise ValueError(f"DatasetConfig.cameras: unknown camera '{c}'")
+        self._cameras = cams
+
         self._index: List[Tuple[int, int]] = []
+        n_missing_wrist = 0
         for ep_idx, ep in enumerate(episodes):
             n = len(ep.ticks)
             if n <= 1:
                 continue
             for t in range(n - 1):
                 tick = ep.ticks[t]
-                if cfg.drop_no_image and not tick.image_rel:
-                    continue
+                if cfg.drop_no_image:
+                    if "overhead" in cams and not tick.image_rel:
+                        continue
+                    if "wrist" in cams and not tick.wrist_image_rel:
+                        n_missing_wrist += 1
+                        continue
                 self._index.append((ep_idx, t))
 
         if not self._index:
-            raise RuntimeError(
-                "KinovaSessionDataset: no usable training frames found. Did you collect "
-                "data with `--enable_cameras` so images are written to disk?"
+            hint = (
+                "Did you collect data with `--enable_cameras` so images are written to disk?"
+            )
+            if "wrist" in cams and n_missing_wrist > 0:
+                hint = (
+                    f"{n_missing_wrist} frames had no wrist image. The 'wrist' camera requires a "
+                    "vla_v4 session (collect_v4.sh); single-camera collect_v3 sessions cannot "
+                    "train a wrist-consuming model."
+                )
+            raise RuntimeError(f"KinovaSessionDataset: no usable training frames found. {hint}")
+        if "wrist" in cams and n_missing_wrist > 0:
+            print(
+                f"[dataset] dropped {n_missing_wrist} frames without wrist images "
+                f"(kept {len(self._index)}) — mixing collect_v3 and collect_v4 sessions?"
             )
 
     def __len__(self) -> int:
@@ -600,7 +637,6 @@ class KinovaSessionDataset(Dataset):
         ep = self.episodes[ep_idx]
         tick = ep.ticks[t]
 
-        image = self._load_image(ep, tick.image_rel)
         state = self._state(tick)
         actions, mask = self._action_chunk(ep, t)
         ids, attn = self.tokenizer.encode(ep.instruction)
@@ -608,14 +644,21 @@ class KinovaSessionDataset(Dataset):
         if self.action_stats is not None:
             actions = self.action_stats.normalize(actions)
 
-        return {
-            "image": image,
+        sample: Dict[str, torch.Tensor] = {
             "state": state,
             "lang_ids": ids,
             "lang_mask": attn,
             "actions": actions,
             "action_mask": mask,
         }
+        present: List[float] = []
+        for cam in self._cameras:
+            rel = tick.image_rel if cam == "overhead" else tick.wrist_image_rel
+            key = "image" if cam == "overhead" else "image_wrist"
+            sample[key] = self._load_image(ep, rel)
+            present.append(1.0 if (rel and (ep.folder / rel).exists()) else 0.0)
+        sample["camera_present"] = torch.tensor(present, dtype=torch.float32)
+        return sample
 
 
 def split_episodes(

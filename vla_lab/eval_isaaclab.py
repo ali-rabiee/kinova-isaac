@@ -115,7 +115,7 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="act/compute/query controller: none|autonomy|fixed_compute|compute_gated|scale|"
-        "knowno|insight|allocator (default none = legacy TTC path).",
+        "knowno|insight|allocator|intent_allocator (default none = legacy TTC path).",
     )
     parser.add_argument(
         "--allocator-fit",
@@ -146,6 +146,54 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Open-loop replay: path to a collected episode_XXXX dir; feeds its recorded "
         "action_from_prev sequence through the controller, bypassing the policy.",
+    )
+
+    # --- camera-set ablations (2026-07 wrist camera) ---------------------------
+    parser.add_argument(
+        "--cameras",
+        type=str,
+        default=None,
+        help="Camera set fed to the policy: overhead|wrist|both (default: the checkpoint's "
+        "camera_set). A strict subset of a multi-camera checkpoint runs the missing-view "
+        "ablation via the camera_present mask.",
+    )
+    parser.add_argument(
+        "--occlusion-camera",
+        type=str,
+        default=None,
+        help="Which view the occlusion mask applies to: overhead|wrist|both (default overhead).",
+    )
+    # --- human-intent uncertainty + real-time feedback -------------------------
+    parser.add_argument(
+        "--instruction-ambiguity",
+        type=str,
+        default=None,
+        help="none|half|full — replace episode instructions with colorless templates "
+        "('Pick up the box.') never / ~50%% of episodes / always. Drives intent uncertainty.",
+    )
+    parser.add_argument(
+        "--intent-every-n-ticks",
+        type=int,
+        default=None,
+        help="Compute the intent/perception decomposition every N policy ticks "
+        "(0 = off; default 1 when a controller or feedback channel is active, tiny backend).",
+    )
+    parser.add_argument(
+        "--feedback-channel",
+        type=str,
+        default=None,
+        help="none|scripted|console — real-time human interjections (vla_lab.feedback). "
+        "'scripted' simulates a human with the quality knobs below; 'console' reads your keyboard.",
+    )
+    parser.add_argument("--feedback-accuracy", type=float, default=None, help="Simulated human: P(correct reference).")
+    parser.add_argument("--feedback-latency-ticks", type=int, default=None, help="Simulated human: delivery delay (policy ticks).")
+    parser.add_argument("--feedback-specificity", type=str, default=None, help="Simulated human: color|directional|vague.")
+    parser.add_argument("--feedback-noise-rate", type=float, default=None, help="Simulated human: P(chatter instead of a correction).")
+    parser.add_argument("--feedback-seed", type=int, default=None, help="Simulated human RNG seed.")
+    parser.add_argument(
+        "--no-fusion-verify",
+        action="store_true",
+        help="Trust-all ablation: apply corrections directly instead of verifying low-reliability ones.",
     )
 
     # Defer adding Isaac AppLauncher args to after we know we want to launch.
@@ -514,6 +562,52 @@ def main() -> int:
 
     occ_mode = str(args.occlusion_mode) if args.occlusion_mode is not None else str(occlusion_cfg.get("mode", "none"))
     occ_frac = float(args.occlusion_fraction) if args.occlusion_fraction is not None else float(occlusion_cfg.get("fraction", 0.35))
+    occ_camera = str(args.occlusion_camera if args.occlusion_camera is not None else occlusion_cfg.get("camera", "overhead")).lower()
+    if occ_camera not in ("overhead", "wrist", "both"):
+        print(f"[eval] ERROR: --occlusion-camera must be overhead|wrist|both, got {occ_camera!r}")
+        return 2
+
+    def _parse_camera_set(raw: Any) -> Optional[Tuple[str, ...]]:
+        if raw is None:
+            return None
+        s = str(raw).lower().strip().replace(" ", "")
+        if s in ("both", "overhead+wrist", "overhead,wrist", "wrist,overhead"):
+            return ("overhead", "wrist")
+        if s in ("overhead", "topdown", "external"):
+            return ("overhead",)
+        if s in ("wrist", "eye_in_hand"):
+            return ("wrist",)
+        raise ValueError(f"unknown --cameras value {raw!r} (use overhead|wrist|both)")
+
+    eval_cameras_req = _parse_camera_set(args.cameras if args.cameras is not None else eval_cfg.get("cameras"))
+
+    # Human-intent + feedback config (YAML `feedback:` / `intent:` blocks + CLI overrides).
+    fb_cfg = dict(cfg.get("feedback") or {})
+    if args.feedback_channel is not None:
+        fb_cfg["channel"] = args.feedback_channel
+    if args.feedback_accuracy is not None:
+        fb_cfg["accuracy"] = float(args.feedback_accuracy)
+    if args.feedback_latency_ticks is not None:
+        fb_cfg["latency_ticks"] = int(args.feedback_latency_ticks)
+    if args.feedback_specificity is not None:
+        fb_cfg["specificity"] = str(args.feedback_specificity)
+    if args.feedback_noise_rate is not None:
+        fb_cfg["noise_rate"] = float(args.feedback_noise_rate)
+    if args.feedback_seed is not None:
+        fb_cfg["seed"] = int(args.feedback_seed)
+    if args.no_fusion_verify:
+        fb_cfg["fusion_verify"] = False
+    fb_channel_kind = str(fb_cfg.get("channel", "none")).lower()
+
+    intent_cfg = dict(cfg.get("intent") or {})
+    if args.intent_every_n_ticks is not None:
+        intent_cfg["every_n_ticks"] = int(args.intent_every_n_ticks)
+    ambig_mode = str(
+        args.instruction_ambiguity if args.instruction_ambiguity is not None else eval_cfg.get("instruction_ambiguity", "none")
+    ).lower()
+    if ambig_mode not in ("none", "half", "full"):
+        print(f"[eval] ERROR: --instruction-ambiguity must be none|half|full, got {ambig_mode!r}")
+        return 2
 
     out_dir = Path(eval_cfg.get("out_dir", "vla_lab/eval_results/tiny_v0"))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -565,6 +659,9 @@ def main() -> int:
     tokenizer = None
     pipeline = None
     smol_policy = None
+    model = None
+    model_cameras: Tuple[str, ...] = ("overhead",)
+    ckpt_action_rate: Optional[int] = None
 
     tiny_ttc_latencies: List[Dict[str, Any]] = []
 
@@ -589,6 +686,8 @@ def main() -> int:
         ttc_live = TTCConfig.from_dict(ttc_cfg_dict)
         ttc_live.latency_buffer = tiny_ttc_latencies
         pipeline = TTCPipeline(model, ttc_live)
+        model_cameras = tuple(ckpt.get("camera_set") or tiny_model_cfg_obj.cameras)
+        ckpt_action_rate = ckpt.get("action_rate_hz")
         k_ttc = int(ttc_cfg_dict.get("k_action_samples", 1))
         print(
             f"[eval] loaded TinyVLA {ckpt_path}  params={model.num_parameters():,}  "
@@ -611,6 +710,98 @@ def main() -> int:
             f"gating={ttc_cfg_dict.get('gating', 'none')}"
         )
 
+    # ------------------------------------------------------------------
+    # Camera-set resolution: which streams the MODEL expects (checkpoint)
+    # vs which views EVAL feeds it. A strict subset runs the missing-view
+    # ablation (the dropped stream is masked via camera_present).
+    # ------------------------------------------------------------------
+    if policy_backend == "smolvla" and replay_dir is None:
+        model_cameras = _parse_camera_set(cfg.get("smolvla_cameras", "overhead")) or ("overhead",)
+    eval_cameras: Tuple[str, ...] = eval_cameras_req or model_cameras
+    bad = [c for c in eval_cameras if c not in model_cameras]
+    if bad and replay_dir is None:
+        print(
+            f"[eval] ERROR: --cameras {list(eval_cameras)} is not a subset of the model's "
+            f"camera set {list(model_cameras)} (a single-camera checkpoint cannot consume the other view)."
+        )
+        simulation_app.close()
+        return 2
+    if replay_dir is None:
+        print(f"[eval] cameras: model={list(model_cameras)}  eval={list(eval_cameras)}  occlusion_camera={occ_camera}")
+
+    # ------------------------------------------------------------------
+    # Real-time feedback channel + intent estimator (2026-07 human-intent axis)
+    # ------------------------------------------------------------------
+    from vla_lab.feedback import (
+        ConsoleFeedbackChannel,
+        FusionConfig,
+        ReliabilityTracker,
+        ScriptedFeedbackChannel,
+        SimulatedHuman,
+        SimulatedHumanConfig,
+        fuse,
+        parse_utterance,
+    )
+    from vla_lab.intent import IntentEstimator, cross_view_disagreement
+
+    feedback_on = fb_channel_kind not in ("", "none", "off") and replay_dir is None
+    sim_human_cfg = SimulatedHumanConfig(
+        accuracy=float(fb_cfg.get("accuracy", 0.95)),
+        latency_ticks=int(fb_cfg.get("latency_ticks", 3)),
+        specificity=str(fb_cfg.get("specificity", "color")),
+        noise_rate=float(fb_cfg.get("noise_rate", 0.0)),
+        react_cos=float(fb_cfg.get("react_cos", 0.85)),
+        react_dist_m=float(fb_cfg.get("react_dist_m", 0.30)),
+        min_gap_ticks=int(fb_cfg.get("min_gap_ticks", 20)),
+        query_latency_s=float(fb_cfg.get("query_latency_s", alloc_cfg.get("query_latency_s", 3.0))),
+        seed=int(fb_cfg.get("seed", 0)),
+    )
+    fusion_cfg = FusionConfig(
+        trust_threshold=float(fb_cfg.get("trust_threshold", 0.55)),
+        ignore_threshold=float(fb_cfg.get("ignore_threshold", 0.30)),
+        verify_enabled=bool(fb_cfg.get("fusion_verify", True)),
+    )
+    reliability = ReliabilityTracker(
+        alpha0=float(fb_cfg.get("reliability_alpha0", 2.0)),
+        beta0=float(fb_cfg.get("reliability_beta0", 1.0)),
+    )
+    console_channel = ConsoleFeedbackChannel() if (feedback_on and fb_channel_kind in ("console", "stdin", "keyboard")) else None
+    fb_channel = console_channel  # scripted channels are rebuilt per episode (they need the true target)
+
+    class _LiveHumanQueryInterface:
+        """Routes robot-initiated queries to the CURRENT feedback channel's human."""
+
+        name = "feedback_channel"
+
+        def __init__(self) -> None:
+            self.channel = None
+
+        def ask(self, question, options=None):
+            if self.channel is not None and getattr(self.channel, "supports_ask", False):
+                return self.channel.ask(question, options)
+            raise RuntimeError("feedback channel cannot answer queries")
+
+    live_qi = _LiveHumanQueryInterface() if feedback_on else None
+    nudge_step_m = float(fb_cfg.get("nudge_step_m", 0.02))
+    nudge_horizon_ticks = int(fb_cfg.get("nudge_horizon_ticks", 5))
+    auto_resume_ticks = int(fb_cfg.get("auto_resume_ticks", 45))
+    if feedback_on:
+        print(f"[eval] feedback channel={fb_channel_kind!r}  human={sim_human_cfg.to_dict() if fb_channel_kind == 'scripted' else 'live'}")
+        print(f"[eval] fusion={fusion_cfg.to_dict()}")
+
+    intent_every = int(intent_cfg.get("every_n_ticks", 1 if (use_controller or feedback_on) else 0))
+    intent_estimator = None
+    if intent_every > 0 and policy_backend == "tiny" and replay_dir is None and tokenizer is not None:
+        intent_estimator = IntentEstimator(
+            model,
+            tokenizer,
+            device=device,
+            temperature=float(intent_cfg.get("temperature", 0.02)),
+            lexical_prior_weight=float(intent_cfg.get("lexical_prior_weight", 0.75)),
+            geometric_weight=float(intent_cfg.get("geometric_weight", 0.5)),
+        )
+        print(f"[eval] intent estimator ON (every {intent_every} tick(s))  ambiguity={ambig_mode}")
+
     # Build the act/compute/query controller harness over the loaded policy (if requested).
     harness = None
     if use_controller and replay_dir is not None:
@@ -631,6 +822,7 @@ def main() -> int:
             ttc_cfg=ttc_cfg_dict,
             alloc_cfg=alloc_cfg,
             fit_path=str(allocator_fit_path) if allocator_fit_path else None,
+            query_interface=live_qi,  # None unless a feedback channel is active
         )
         print(f"[eval] controller={controller_kind!r}  fit={allocator_fit_path}  emit_calibration={emit_calibration}")
 
@@ -653,6 +845,14 @@ def main() -> int:
     robot = scene_entities["kinova_j2n6s300"]
     if enable_cameras and DEFAULT_TOP_DOWN_CAMERA is not None:
         create_topdown_camera(DEFAULT_TOP_DOWN_CAMERA)
+    # Wrist camera prim (2026-07): only when the eval camera set consumes it.
+    use_wrist = enable_cameras and ("wrist" in eval_cameras) and replay_dir is None
+    if use_wrist:
+        from environments.reach_to_grasp_VLA.config import DEFAULT_WRIST_CAMERA
+        from environments.utils.camera import create_wrist_camera
+
+        create_wrist_camera(DEFAULT_WRIST_CAMERA)
+        print(f"[eval] wrist camera created at {DEFAULT_WRIST_CAMERA.prim_path}")
 
     # Object loader (mirrors `vla_v1.py` but stripped down for evaluation).
     BOX_COLORS = ["red", "blue", "yellow", "purple", "orange", "cyan"]
@@ -713,11 +913,34 @@ def main() -> int:
             print(f"[eval] ERROR: could not create Camera sensor: {e}; policy will see BLACK images.")
             camera_sensor = None
 
+    wrist_sensor: Optional[Camera] = None
+    if use_wrist:
+        try:
+            wrist_cam_cfg = CameraCfg(
+                prim_path=DEFAULT_WRIST_CAMERA.prim_path,
+                offset=CameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
+                spawn=None,
+                width=DEFAULT_WRIST_CAMERA.resolution[0],
+                height=DEFAULT_WRIST_CAMERA.resolution[1],
+                update_period=0.0,
+                data_types=["rgb"],
+            )
+            wrist_sensor = Camera(cfg=wrist_cam_cfg)
+            print(f"[eval] wrist sensor attached: {wrist_cam_cfg.width}x{wrist_cam_cfg.height}")
+        except Exception as e:
+            print(f"[eval] ERROR: could not create wrist Camera sensor: {e}; wrist view will be BLACK.")
+            wrist_sensor = None
+
     # Reset sim + robot
     sim.reset()
     if camera_sensor is not None:
         try:
             camera_sensor.reset()
+        except Exception:
+            pass
+    if wrist_sensor is not None:
+        try:
+            wrist_sensor.reset()
         except Exception:
             pass
     root_state = robot.data.default_root_state.clone()
@@ -742,6 +965,14 @@ def main() -> int:
     policy_rate_hz = int(eval_cfg.get("policy_rate_hz", 5))
     if args.policy_rate_hz is not None:
         policy_rate_hz = int(args.policy_rate_hz)
+    # New contract field (2026-07): checkpoints trained after the camera-set
+    # change carry the collection log rate; warn on mismatch (the YAML
+    # train_action_rate_hz rescale below still applies either way).
+    if ckpt_action_rate is not None and int(ckpt_action_rate) != int(policy_rate_hz) and replay_dir is None:
+        print(
+            f"[eval] WARNING: checkpoint action_rate_hz={ckpt_action_rate} != eval policy_rate_hz={policy_rate_hz}; "
+            "set eval.policy_rate_hz to the training sessions' log rate."
+        )
 
     # Actions are EE deltas per 1/log_rate_hz of the *collection* session. If
     # eval runs at a different rate, rescale the deltas so EE speed matches the
@@ -817,6 +1048,49 @@ def main() -> int:
         except Exception:
             pass
         return "open"
+
+    def _grab_rgb_resized(sensor) -> Optional[torch.Tensor]:
+        """Sensor RGB -> (3, S, S) float [0,1] on device; None when unavailable."""
+        if sensor is None:
+            return None
+        try:
+            data = sensor.data
+            rgb = data.output.get("rgb") if data.output is not None else None
+        except Exception:
+            return None
+        if rgb is None:
+            return None
+        t = rgb[0] if rgb.dim() == 4 else rgb
+        t = t.float()
+        if t.max() > 1.5:
+            t = t / 255.0
+        if t.dim() == 3 and t.shape[-1] == 4:
+            t = t[..., :3]
+        if t.dim() == 3 and t.shape[-1] == 3:
+            t = t.permute(2, 0, 1).contiguous()
+        return torch.nn.functional.interpolate(
+            t.unsqueeze(0).to(device), size=(infer_image_size, infer_image_size), mode="bilinear", align_corners=False
+        )[0]
+
+    def _object_pos_b_by_color(color_by_leaf: Dict[str, str]) -> Dict[str, Tuple[float, float, float]]:
+        """Live object positions (PhysX tracker) in the robot base frame, keyed by color."""
+        out: Dict[str, Tuple[float, float, float]] = {}
+        try:
+            root = robot.data.root_pose_w
+            for o in tracker.snapshot():
+                cname = color_by_leaf.get(str(o.id))
+                if cname is None:
+                    continue
+                pw = torch.tensor(
+                    [[float(o.pose.position_m[0]), float(o.pose.position_m[1]), float(o.pose.position_m[2])]],
+                    device=root.device,
+                )
+                qw = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=root.device)
+                pb, _ = subtract_frame_transforms(root[:, 0:3], root[:, 3:7], pw, qw)
+                out[cname] = (float(pb[0, 0]), float(pb[0, 1]), float(pb[0, 2]))
+        except Exception:
+            pass
+        return out
 
     # ------------------------------------------------------------------
     # Replay actions + per-tick debug logging
@@ -923,24 +1197,40 @@ def main() -> int:
                 box_idx=box_idx,
                 rng_seed=int(eval_cfg.get("language_seed", 1337)),
             )
+        # Instruction-ambiguity axis (2026-07 intent uncertainty): with prob. per
+        # `ambig_mode`, replace the instruction with a colorless template. The
+        # human still WANTS the scheduled target — only the instruction
+        # underspecifies it, so resolving it requires the human (query/feedback).
+        instr_ambiguous_flag = False
+        if replay_dir is None and args.language is None and ambig_mode != "none":
+            _arng = random.Random(int(eval_cfg.get("language_seed", 1337)) * 7919 + ep)
+            if ambig_mode == "full" or (_arng.random() < 0.5):
+                instruction = _arng.choice(["Pick up the box.", "Grab a box and lift it.", "Pick it up."])
+                instr_ambiguous_flag = True
+
         if replay_dir is not None:
             instruction = replay_instruction or instruction
-        print(f"[eval][EP {ep}] target={leaf!r}  instruction={instruction!r}")
+        instruction_initial = str(instruction)  # feedback may refine `instruction` mid-episode
+        print(f"[eval][EP {ep}] target={leaf!r}  instruction={instruction!r}"
+              + ("  [AMBIGUOUS]" if instr_ambiguous_flag else ""))
+
+        # Scene candidates by color (used by the allocator's query options, the
+        # intent estimator, and the feedback channel).
+        scene_colors: List[str] = []
+        color_by_leaf: Dict[str, str] = {}
+        for sp in sorted([str(p) for p in spawned_paths]):
+            desc, c, _bidx = _box_desc_from_prim(sp, BOX_COLORS)
+            cname = c or desc
+            scene_colors.append(cname)
+            color_by_leaf[sp.split("/")[-1]] = cname
+        true_color = color_by_leaf.get(leaf, leaf)
 
         # Per-episode allocator state: query options (object descriptions) + the oracle target.
         ep_decisions: List[Tuple[int, Any]] = []
         policy_tick_idx = 0
-        ep_options: List[str] = []
-        ep_oracle: Optional[str] = None
+        ep_options: List[str] = list(scene_colors)
+        ep_oracle: Optional[str] = true_color
         if harness is not None:
-            try:
-                for sp in sorted([str(p) for p in spawned_paths]):
-                    desc, c, _bidx = _box_desc_from_prim(sp, BOX_COLORS)
-                    ep_options.append(c or desc)
-                tgt_desc, tgt_color, _ = _box_desc_from_prim(target_prim, BOX_COLORS)
-                ep_oracle = tgt_color or tgt_desc
-            except Exception:
-                ep_options, ep_oracle = [], None
             harness.set_oracle(ep_oracle)
 
         ids = attn = None
@@ -948,6 +1238,33 @@ def main() -> int:
             ids, attn = tokenizer.encode(instruction)
             ids = ids.to(device)
             attn = attn.to(device)
+
+        def _set_instruction(new_instr: str) -> None:
+            """Apply a mid-episode instruction refinement (re-encodes tokens for tiny)."""
+            nonlocal instruction, ids, attn
+            instruction = str(new_instr)
+            if policy_backend == "tiny" and tokenizer is not None:
+                _i, _a = tokenizer.encode(instruction)
+                ids, attn = _i.to(device), _a.to(device)
+
+        # Per-episode feedback state (reliability persists ACROSS episodes).
+        ep_feedback_events: List[Dict[str, Any]] = []
+        ep_intent_entropies: List[float] = []
+        if feedback_on and fb_channel_kind == "scripted":
+            ep_sim_human = SimulatedHuman(
+                sim_human_cfg,
+                true_target_label=true_color,
+                candidate_labels=scene_colors,
+                episode_idx=ep,
+            )
+            fb_channel = ScriptedFeedbackChannel(ep_sim_human)
+        if live_qi is not None:
+            live_qi.channel = fb_channel
+        paused_ticks_left = 0
+        pending_nudge: Optional[Tuple[Tuple[float, float, float], float]] = None
+        nudge_ticks_left = 0
+        last_intent_est = None
+        last_xview: Optional[float] = None
 
         # Reset the robot to its default state, then settle with the controller
         # actively holding the arm (mirrors vla_v1's settle loop). A bare
@@ -1025,6 +1342,11 @@ def main() -> int:
                     camera_sensor.update(physics_dt)
                 except Exception:
                     pass
+            if wrist_sensor is not None:
+                try:
+                    wrist_sensor.update(physics_dt)
+                except Exception:
+                    pass
         if debug_fp is not None:
             _pos_dbg, _ = _ee_pose_b()
             print(f"[dbg][EP {ep}] settled EE pos_b=({_pos_dbg[0]:.3f}, {_pos_dbg[1]:.3f}, {_pos_dbg[2]:.3f})")
@@ -1095,72 +1417,226 @@ def main() -> int:
                     occ_patch_seed = int(occ_patch_base) + int(ep)
                 rgb_used = apply_occlusion_rgb_chw(
                     rgb_t,
-                    occ_mode,
+                    occ_mode if occ_camera in ("overhead", "both") else "none",
                     fraction=occ_frac,
                     patch_seed=occ_patch_seed,
                 )
 
+                # Wrist view (2026-07): grabbed only when the eval camera set uses it.
+                wrist_used: Optional[torch.Tensor] = None
+                if wrist_sensor is not None:
+                    wrist_t = _grab_rgb_resized(wrist_sensor)
+                    if wrist_t is None:
+                        wrist_t = torch.zeros(3, infer_image_size, infer_image_size, device=device)
+                    wrist_used = apply_occlusion_rgb_chw(
+                        wrist_t,
+                        occ_mode if occ_camera in ("wrist", "both") else "none",
+                        fraction=occ_frac,
+                        patch_seed=occ_patch_seed,
+                    )
+                camera_present_t: Optional[torch.Tensor] = None
+                if policy_backend == "tiny" and len(model_cameras) > 1:
+                    camera_present_t = torch.tensor(
+                        [1.0 if c in eval_cameras else 0.0 for c in model_cameras], device=device
+                    )
+
                 pos_b, quat_b = _ee_pose_b()
                 gx = 1.0 if _gripper_state().startswith("o") else 0.0
+                state_t: Optional[torch.Tensor] = None
+                if policy_backend == "tiny" and tiny_model_cfg_obj is not None:
+                    state_t = torch.tensor(
+                        list(pos_b) + [gx] + [0.0] * max(0, tiny_model_cfg_obj.state_dim - 4),
+                        dtype=torch.float32,
+                        device=device,
+                    )[: tiny_model_cfg_obj.state_dim]
+
+                obj_pos_by_color: Dict[str, Tuple[float, float, float]] = {}
+                if feedback_on or intent_estimator is not None:
+                    obj_pos_by_color = _object_pos_b_by_color(color_by_leaf)
+
+                # Intent/perception decomposition (tiny backend).
+                if (
+                    intent_estimator is not None
+                    and state_t is not None
+                    and policy_tick_idx % max(1, intent_every) == 0
+                ):
+                    last_intent_est = intent_estimator.estimate(
+                        instruction=instruction,
+                        candidate_labels=scene_colors,
+                        image=rgb_used if "overhead" in model_cameras else None,
+                        image_wrist=wrist_used if "wrist" in model_cameras else None,
+                        state=state_t,
+                        camera_present=camera_present_t,
+                        object_pos_b=obj_pos_by_color,
+                        ee_pos_b=pos_b,
+                    )
+                    ep_intent_entropies.append(float(last_intent_est.entropy))
+                    if (
+                        "overhead" in model_cameras
+                        and "wrist" in model_cameras
+                        and wrist_used is not None
+                        and ids is not None
+                    ):
+                        last_xview = cross_view_disagreement(
+                            model,
+                            image=rgb_used,
+                            image_wrist=wrist_used,
+                            state=state_t,
+                            lang_ids=ids,
+                            lang_mask=attn,
+                        )
+
+                # Two-way feedback: deliver interjections, parse, fuse by reliability.
+                if feedback_on and fb_channel is not None:
+                    fb_channel.observe(
+                        tick_idx=policy_tick_idx, ee_pos_b=pos_b, object_pos_b=obj_pos_by_color
+                    )
+                    for inter in fb_channel.poll():
+                        ref = parse_utterance(inter.text, scene_colors)
+                        fd = fuse(
+                            ref,
+                            reliability=reliability.mean,
+                            intent_posterior=(last_intent_est.posterior if last_intent_est else None),
+                            cfg=fusion_cfg,
+                        )
+                        ev: Dict[str, Any] = {
+                            "tick": int(policy_tick_idx),
+                            "text": inter.text,
+                            "kind": ref.kind,
+                            "fusion": fd.action,
+                            "reason": fd.reason,
+                            "intended_correct": inter.intended_correct,
+                            "reliability_before": round(reliability.mean, 4),
+                        }
+                        act_now = fd.action
+                        # Verification: re-ask WHICH target through the same channel
+                        # (counts as a query; covers low-reliability corrections).
+                        if (
+                            act_now == "verify"
+                            and ref.kind in ("target", "avoid")
+                            and getattr(fb_channel, "supports_ask", False)
+                        ):
+                            va = fb_channel.ask(
+                                "I want to double-check — which object should I pick up?", scene_colors
+                            )
+                            ev["verify_answer"] = va.text
+                            ev["verify_latency_s"] = float(va.latency_s)
+                            if str(va.text).lower() == str(ref.target_label or "").lower():
+                                act_now = "apply"
+                            elif str(va.text) in scene_colors:
+                                ref = type(ref)(kind="target", target_label=str(va.text), raw_text=inter.text)
+                                act_now = "apply"
+                            else:
+                                act_now = "ignore"
+                        applied_target: Optional[str] = None
+                        if act_now == "apply":
+                            if ref.kind == "target" and ref.target_label:
+                                _set_instruction(f"Pick up the {ref.target_label} box.")
+                                applied_target = ref.target_label
+                            elif ref.kind == "avoid" and ref.target_label:
+                                if getattr(fb_channel, "supports_ask", False):
+                                    va = fb_channel.ask(
+                                        "Understood, not that one — which object should I pick up?",
+                                        [c for c in scene_colors if c != ref.target_label],
+                                    )
+                                    ev["verify_answer"] = va.text
+                                    if str(va.text) in scene_colors:
+                                        _set_instruction(f"Pick up the {va.text} box.")
+                                        applied_target = str(va.text)
+                                else:
+                                    _set_instruction("Pick up the box.")  # forces intent uncertainty
+                            elif ref.kind == "nudge" and ref.direction is not None:
+                                pending_nudge = (ref.direction, nudge_step_m * float(ref.magnitude) * float(fd.scale))
+                                nudge_ticks_left = nudge_horizon_ticks
+                            elif ref.kind == "stop":
+                                paused_ticks_left = auto_resume_ticks
+                            elif ref.kind == "resume":
+                                paused_ticks_left = 0
+                        ev["applied_target"] = applied_target
+                        # Update reliability AFTER the decision (sim grading; on the
+                        # real robot this update comes from verified outcomes).
+                        if inter.intended_correct is not None:
+                            reliability.update(bool(inter.intended_correct))
+                        ev["reliability_after"] = round(reliability.mean, 4)
+                        ep_feedback_events.append(ev)
+                        print(
+                            f"[eval][EP {ep} t{policy_tick_idx}] feedback {inter.text!r} -> {ref.kind}"
+                            f" ({ev['fusion']}/{act_now}); reliability={reliability.mean:.2f}"
+                        )
 
                 chunk_norm_dbg = None
-                with torch.no_grad():
-                    if harness is not None:
-                        # Act/compute/query controller path (HRI pivot).
-                        if policy_backend == "tiny":
-                            assert tiny_model_cfg_obj is not None
-                            state_t = torch.tensor(
-                                list(pos_b) + [gx] + [0.0] * max(0, tiny_model_cfg_obj.state_dim - 4),
-                                dtype=torch.float32,
-                                device=device,
-                            )[: tiny_model_cfg_obj.state_dim]
-                            obs_h = {"image": rgb_used, "state": state_t, "occlusion_fraction": float(occ_frac)}
+                if paused_ticks_left > 0:
+                    paused_ticks_left -= 1
+                    chunk_phys = torch.zeros(1, 7, device=device)
+                else:
+                    with torch.no_grad():
+                        if harness is not None:
+                            # Act/compute/query controller path (HRI pivot).
+                            if policy_backend == "tiny":
+                                assert state_t is not None
+                                obs_h = {"image": rgb_used, "state": state_t, "occlusion_fraction": float(occ_frac)}
+                            else:
+                                st6 = torch.from_numpy(pack_state_xyz_quat(pos_b, quat_b)).to(device)
+                                obs_h = {"image": rgb_used, "state": st6, "occlusion_fraction": float(occ_frac)}
+                            if wrist_used is not None:
+                                obs_h["image_wrist"] = wrist_used
+                            if camera_present_t is not None:
+                                obs_h["camera_present"] = camera_present_t
+                            if last_intent_est is not None:
+                                obs_h.update(last_intent_est.features())
+                            if last_xview is not None:
+                                obs_h["cross_view_disagreement"] = float(last_xview)
+                            decision = harness.decide(
+                                obs_h, instruction=instruction, options=ep_options or None, oracle_answer=ep_oracle
+                            )
+                            chunk_phys = decision.chunk
+                            ep_decisions.append((policy_tick_idx, decision))
+                        elif policy_backend == "tiny":
+                            assert pipeline is not None and state_t is not None and ids is not None
+                            chunk = pipeline.predict_action_chunk(
+                                rgb_used, state_t, ids, attn,
+                                image_wrist=wrist_used, camera_present=camera_present_t,
+                            )
+                            chunk_norm_dbg = chunk
+                            chunk_phys = chunk
+                            if action_stats is not None:
+                                chunk_phys = action_stats.denormalize(chunk.detach().cpu()).to(device)
                         else:
+                            assert smol_policy is not None
                             st6 = torch.from_numpy(pack_state_xyz_quat(pos_b, quat_b)).to(device)
-                            obs_h = {"image": rgb_used, "state": st6, "occlusion_fraction": float(occ_frac)}
-                        decision = harness.decide(
-                            obs_h, instruction=instruction, options=ep_options or None, oracle_answer=ep_oracle
-                        )
-                        chunk_phys = decision.chunk
-                        ep_decisions.append((policy_tick_idx, decision))
-                    elif policy_backend == "tiny":
-                        assert pipeline is not None and tiny_model_cfg_obj is not None and ids is not None
-                        state_t = torch.tensor(
-                            list(pos_b) + [gx] + [0.0] * max(0, tiny_model_cfg_obj.state_dim - 4),
-                            dtype=torch.float32,
-                            device=device,
-                        )[: tiny_model_cfg_obj.state_dim]
-                        chunk = pipeline.predict_action_chunk(rgb_used, state_t, ids, attn)
-                        chunk_norm_dbg = chunk
-                        chunk_phys = chunk
-                        if action_stats is not None:
-                            chunk_phys = action_stats.denormalize(chunk.detach().cpu()).to(device)
-                    else:
-                        assert smol_policy is not None
-                        st6 = torch.from_numpy(pack_state_xyz_quat(pos_b, quat_b)).to(device)
-                        if use_smol_ttc:
-                            one_call_lat: List[Dict[str, Any]] = []
-                            chunk_phys = smol_policy.predict_chunk_phys_ttc(
-                                rgb_chw_float=rgb_used,
-                                state6=st6,
-                                instruction=instruction,
-                                ttc_cfg_dict=ttc_cfg_dict,
-                                latency_log=one_call_lat,
-                            )
-                            smol_latencies.extend(one_call_lat)
-                        else:
-                            chunk_phys = smol_policy.predict_chunk_phys(
-                                rgb_chw_float=rgb_used,
-                                state6=st6,
-                                instruction=instruction,
-                            )
+                            smol_wrist = wrist_used if "wrist" in eval_cameras else None
+                            if use_smol_ttc:
+                                one_call_lat: List[Dict[str, Any]] = []
+                                chunk_phys = smol_policy.predict_chunk_phys_ttc(
+                                    rgb_chw_float=rgb_used,
+                                    state6=st6,
+                                    instruction=instruction,
+                                    ttc_cfg_dict=ttc_cfg_dict,
+                                    latency_log=one_call_lat,
+                                    wrist_rgb_chw_float=smol_wrist,
+                                )
+                                smol_latencies.extend(one_call_lat)
+                            else:
+                                chunk_phys = smol_policy.predict_chunk_phys(
+                                    rgb_chw_float=rgb_used,
+                                    state6=st6,
+                                    instruction=instruction,
+                                    wrist_rgb_chw_float=smol_wrist,
+                                )
+                    # Directional nudge: reliability-scaled bias on upcoming deltas.
+                    if nudge_ticks_left > 0 and pending_nudge is not None:
+                        vec, gain = pending_nudge
+                        nvec = torch.tensor(vec, device=chunk_phys.device, dtype=chunk_phys.dtype)
+                        chunk_phys = chunk_phys.clone()
+                        chunk_phys[:, :3] = chunk_phys[:, :3] + float(gain) * nvec
+                        nudge_ticks_left -= 1
                 policy.set_chunk(chunk_phys)
                 policy_tick_idx += 1
                 _debug_log_tick(
                     ep=ep,
                     tick=policy_tick_idx - 1,
                     chunk_phys=chunk_phys,
-                    source=policy_backend,
+                    source=policy_backend if paused_ticks_left == 0 else "paused",
                     chunk_norm=chunk_norm_dbg,
                 )
 
@@ -1177,6 +1653,11 @@ def main() -> int:
             if camera_sensor is not None:
                 try:
                     camera_sensor.update(physics_dt)
+                except Exception:
+                    pass
+            if wrist_sensor is not None:
+                try:
+                    wrist_sensor.update(physics_dt)
                 except Exception:
                     pass
 
@@ -1213,7 +1694,25 @@ def main() -> int:
             "policy_latency_p95_ms": float(np.quantile(np.asarray(lat_totals, dtype=np.float64), 0.95))
             if len(lat_totals) > 0
             else None,
+            "instruction_ambiguous": bool(instr_ambiguous_flag),
+            "instruction_initial": instruction_initial,
+            "cameras_eval": list(eval_cameras),
         }
+        if ep_intent_entropies:
+            result["intent"] = {
+                "n_estimates": len(ep_intent_entropies),
+                "mean_entropy": float(statistics.mean(ep_intent_entropies)),
+                "max_entropy": float(max(ep_intent_entropies)),
+            }
+        if feedback_on:
+            result["feedback"] = {
+                "events": ep_feedback_events,
+                "n_interjections": len(ep_feedback_events),
+                "n_applied": sum(1 for e in ep_feedback_events if e.get("applied_target") or e.get("fusion") == "apply"),
+                "n_verified": sum(1 for e in ep_feedback_events if "verify_answer" in e),
+                "n_ignored": sum(1 for e in ep_feedback_events if e.get("fusion") == "ignore"),
+                "reliability_after_episode": float(reliability.mean),
+            }
         if replay_actions is not None:
             result["replay_episode"] = str(replay_dir)
             result["replay_actions_executed"] = int(replay_idx)
@@ -1275,7 +1774,25 @@ def main() -> int:
         "action_clamp_count": int(policy.clamp_count),
         "lerobot_dataset_root": str(lerobot_dataset_root) if lerobot_dataset_root else None,
         "observability_mode": observability_mode,
-        "occlusion": {"mode": occ_mode, "fraction": float(occ_frac)},
+        "occlusion": {"mode": occ_mode, "fraction": float(occ_frac), "camera": occ_camera},
+        "camera_set_model": list(model_cameras),
+        "camera_set_eval": list(eval_cameras),
+        "instruction_ambiguity": ambig_mode,
+        "intent": {
+            "enabled": intent_estimator is not None,
+            "every_n_ticks": int(intent_every),
+        },
+        "feedback": (
+            {
+                "channel": fb_channel_kind,
+                "sim_human": sim_human_cfg.to_dict() if fb_channel_kind == "scripted" else None,
+                "fusion": fusion_cfg.to_dict(),
+                "reliability_final": float(reliability.mean),
+                "n_interjections_total": int(sum(len(r.get("feedback", {}).get("events", [])) for r in ep_results)),
+            }
+            if feedback_on
+            else None
+        ),
         "ttc": ttc_cfg_dict,
         "ttc_aggregate": _aggregate_ttc_latencies(ttc_rows_all),
         "controller": controller_kind if use_controller else None,
