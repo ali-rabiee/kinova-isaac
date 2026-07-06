@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Export Kinova `vla_v1` logs to a LeRobot dataset (see `vla_lab/smoll-vla-setup.md`).
+# Export Kinova vla_v1/vla_v4 logs to a LeRobot dataset (see vla_lab/README.md §5.2;
+# deps: vla_lab/requirements-smolvla.txt).
 #
 # Example:
 #   ./vla_lab/scripts/export_lerobot_dataset.sh \\

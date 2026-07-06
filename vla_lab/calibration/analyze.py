@@ -15,13 +15,11 @@ Produces (under ``--out-dir``):
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 from pathlib import Path
-from typing import List, Sequence
 
 from . import metrics
-from .records import CalibrationRecord, read_jsonl
+from .records import read_many
 
 
 def _bucket_midpoint(label: str) -> float:
@@ -34,14 +32,6 @@ def _bucket_midpoint(label: str) -> float:
         return (lo + hi) / 2.0
     except Exception:
         return 0.0
-
-
-def _load(paths: Sequence[str]) -> List[CalibrationRecord]:
-    recs: List[CalibrationRecord] = []
-    for pat in paths:
-        for p in sorted(glob.glob(pat)) or [pat]:
-            recs.extend(read_jsonl(p))
-    return recs
 
 
 def _plot_reliability(records, scale, n_bins, out_dir: Path, fmt: str) -> None:
@@ -149,7 +139,7 @@ def main() -> int:
     if not args.calib:
         print("[calibration.analyze] no --calib paths given.")
         return 2
-    records = _load(args.calib)
+    records = read_many(args.calib)
     if not records:
         print("[calibration.analyze] no records loaded.")
         return 2

@@ -70,12 +70,32 @@ def _lerobot_version() -> str | None:
         return None
 
 
+def _session_log_rate_hz(episodes: Sequence[EpisodeRecord]) -> int | None:
+    """Unique log_rate_hz across the episodes' session metadata (None if unrecorded)."""
+
+    rates = set()
+    for ep in episodes:
+        try:
+            meta = json.loads((ep.folder / "metadata.json").read_text())
+            r = int(meta.get("config", {}).get("log_rate_hz", 0))
+            if r > 0:
+                rates.add(r)
+        except Exception:
+            continue
+    if len(rates) > 1:
+        raise RuntimeError(
+            f"mixed log_rate_hz across sessions: {sorted(rates)} — never mix action-rate "
+            "contracts in one export (see vla_lab/README.md §7)."
+        )
+    return next(iter(rates)) if rates else None
+
+
 def convert(
     *,
     session_roots: Sequence[Path],
     out_dir: Path,
     repo_id: str,
-    fps: int,
+    fps: int | None = None,
     val_fraction: float,
     split_seed: int,
     train_only: bool,
@@ -96,6 +116,17 @@ def convert(
     episodes = discover_episodes(roots, success_only=success_only)
     if not episodes:
         raise RuntimeError(f"No episodes found under roots: {[str(r) for r in roots]}")
+
+    # fps drives LeRobot timestamps and must equal the collection log rate
+    # (the action-rate contract). Default: read it from session metadata.
+    if fps is None:
+        fps = _session_log_rate_hz(episodes)
+        if fps is None:
+            fps = 15
+            print("[export] WARNING: no log_rate_hz in session metadata; assuming 15 Hz (pass --fps to override).")
+        else:
+            print(f"[export] fps from session metadata: {fps} Hz")
+    fps = int(fps)
 
     train_eps, val_eps = split_episodes(episodes, val_fraction=val_fraction, seed=split_seed)
     to_export = train_eps if train_only else train_eps + val_eps
@@ -204,7 +235,13 @@ def main() -> int:
     )
     p.add_argument("--out-dir", type=str, required=True, help="e.g. vla_lab/datasets/lerobot_kinova_v0")
     p.add_argument("--repo-id", type=str, default="kinova_isaac_vla", help="LeRobot dataset repo_id / name in meta")
-    p.add_argument("--fps", type=int, default=5, help="Policy logging rate (nominal; used for timestamps).")
+    p.add_argument(
+        "--fps",
+        type=int,
+        default=None,
+        help="Policy logging rate for timestamps. Default: read log_rate_hz from session "
+        "metadata (falls back to 15 with a warning). Must match the collection rate.",
+    )
     p.add_argument("--val-fraction", type=float, default=0.1, help="Held-out fraction at episode level (info only)")
     p.add_argument("--split-seed", type=int, default=0)
     p.add_argument(
@@ -231,7 +268,7 @@ def main() -> int:
         session_roots=args.session_roots,
         out_dir=Path(args.out_dir),
         repo_id=str(args.repo_id),
-        fps=int(args.fps),
+        fps=(int(args.fps) if args.fps is not None else None),
         val_fraction=float(args.val_fraction),
         split_seed=int(args.split_seed),
         train_only=bool(args.train_only),

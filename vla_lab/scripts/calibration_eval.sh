@@ -21,15 +21,23 @@ cd "${REPO_ROOT}"
 
 CONFIG="${CONFIG:-vla_lab/configs/eval_isaac.yaml}"
 DEVICE="${DEVICE:-cuda:0}"
-ISAACLAB="${ISAACLAB:-./IsaacLab/isaaclab.sh}"
 OUT_ROOT="${OUT_ROOT:-vla_lab/calibration_runs/$(date +%Y%m%d_%H%M%S)}"
 NUM_EPISODES="${NUM_EPISODES:-50}"
 CONTROLLER="${CONTROLLER:-compute_gated}"   # autonomy|fixed_compute|compute_gated|scale|knowno|insight|allocator
 FIT="${FIT:-}"                              # optional allocator_fit.json (unlocks query/INSIGHT/KnowNo)
 EXTRA_FLAGS=( "$@" )
 
-if [[ ! -x "${ISAACLAB}" ]]; then
-  echo "[calibration_eval] ${ISAACLAB} not found or not executable. Set ISAACLAB= to your isaaclab.sh path." >&2
+if [[ -z "${ISAACLAB:-}" ]]; then
+  for candidate in "./IsaacLab/isaaclab.sh" "${HOME}/IsaacLab/isaaclab.sh"; do
+    if [[ -x "${candidate}" ]]; then
+      ISAACLAB="${candidate}"
+      break
+    fi
+  done
+fi
+
+if [[ -z "${ISAACLAB:-}" || ! -x "${ISAACLAB}" ]]; then
+  echo "[calibration_eval] isaaclab.sh not found. Set ISAACLAB= to your isaaclab.sh path." >&2
   exit 1
 fi
 

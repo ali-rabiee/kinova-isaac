@@ -13,7 +13,7 @@ keeps the allocator core importable without torch.
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import torch
 
@@ -187,14 +187,3 @@ class SmolVLAComputeBranch:
         best, scores = select_from_candidates(cands, self.selection)
         disp = chunk_dispersion(cands)
         return ComputeResult(chunk=best, dispersion=disp, k_used=int(cands.shape[0]), candidates=cands, scores=scores, forward_ms=(time.time() - t0) * 1000.0)
-
-
-def build_compute_branch(policy_backend: str, **kwargs):
-    """Convenience factory used by the Isaac glue."""
-
-    b = str(policy_backend).lower().strip()
-    if b == "tiny":
-        return TTCComputeBranch(**kwargs)
-    if b == "smolvla":
-        return SmolVLAComputeBranch(**kwargs)
-    raise ValueError(f"unknown policy_backend {policy_backend!r}")

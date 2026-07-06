@@ -5,10 +5,11 @@ The base policy expects (see its Hub `config.json`):
   - `observation.images.camera{1,2,3}`: 3×256×256 images (CHW after dataset load)
   - `action`: 6 floats (MEAN_STD)
 
-Our Kinova logs use one RGB camera and 7D `action_from_prev`
-(Δxyz, Δrotvec×3, gripper). For SmolVLA we **duplicate** the same image to
-three views (top-down only setups) and export **6D delta pose** without the
-gripper channel. Gripper is **not** controlled by SmolVLA in this bridge; use
+Our Kinova logs carry 7D `action_from_prev` (Δxyz, Δrotvec×3, gripper) and one
+or two RGB cameras. Slot routing: legacy overhead-only exports duplicate the
+same image to all three views; `--wrist` exports route the wrist view into
+`camera2` (camera1/camera3 stay overhead). Actions export as **6D delta pose**
+without the gripper channel. Gripper is **not** controlled by SmolVLA in this bridge; use
 TinyVLA or extend the action head if you need learned gripper.
 
 State in the export is **absolute** end-effector pose in the robot base frame:

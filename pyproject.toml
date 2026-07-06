@@ -30,6 +30,17 @@ packages = [
   "motion_generation.planners",
   "utilities",
   "copilot_demo",
+  "vla_lab",
+  "vla_lab.allocation",
+  "vla_lab.baselines",
+  "vla_lab.calibration",
+  "vla_lab.feedback",
+  "vla_lab.human_study",
+  "vla_lab.intent",
+  "vla_lab.real_robot",
+  "vla_lab.smolvla_bridge",
+  "vla_lab.tests",
+  "vla_lab.ttc_methods",
 ]
 include-package-data = true
 

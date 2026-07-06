@@ -28,7 +28,6 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 CAMERA_NAMES = ("overhead", "wrist")
@@ -327,6 +326,28 @@ class TinyVLA(nn.Module):
             streams.append(tok)
         return torch.cat(streams, dim=1)
 
+    def _assemble_memory(
+        self,
+        img_tok: torch.Tensor,
+        lang_tok: torch.Tensor,
+        st_tok: torch.Tensor,
+        lang_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Concat the streams into the fused token sequence + its key-padding mask.
+
+        Vision/state tokens are always real; language positions use `lang_mask`
+        (mask True = pad). Returns (normed memory, key_padding_mask).
+        """
+
+        memory = torch.cat([img_tok, lang_tok, st_tok], dim=1)
+        memory = self.token_norm(memory)
+        b, l = lang_mask.shape
+        nv = img_tok.size(1)
+        ns = st_tok.size(1)
+        full_mask = torch.zeros(b, nv + l + ns, dtype=torch.bool, device=memory.device)
+        full_mask[:, nv : nv + l] = lang_mask == 0
+        return memory, full_mask
+
     def forward(
         self,
         image: Optional[torch.Tensor] = None,
@@ -353,25 +374,14 @@ class TinyVLA(nn.Module):
         img_tok = self._camera_streams(image, image_wrist, camera_present)  # (B, n*Nv, D)
         lang_tok = self.language(lang_ids, lang_mask)       # (B, L, D)
         st_tok = self.state_enc(state)                      # (B, 1, D)
-
-        memory = torch.cat([img_tok, lang_tok, st_tok], dim=1)
-        memory = self.token_norm(memory)
+        memory, full_mask = self._assemble_memory(img_tok, lang_tok, st_tok, lang_mask)
 
         # Bottleneck noise injection.
         std = float(noise_std) if noise_std is not None else float(self.cfg.noise_std)
-        if noise is None and self.training and std > 0:
-            noise = torch.randn_like(memory) * std
-        if noise is None and (not self.training) and std > 0:
+        if noise is None and std > 0:
             noise = torch.randn_like(memory) * std
         if noise is not None:
             memory = memory + noise
-
-        # Build memory key-padding mask: vision/state are always real, language uses lang_mask.
-        b, l = lang_mask.shape
-        nv = img_tok.size(1)
-        ns = st_tok.size(1)
-        full_mask = torch.zeros(b, nv + l + ns, dtype=torch.bool, device=memory.device)
-        full_mask[:, nv : nv + l] = lang_mask == 0  # True where language token is pad
 
         actions = self.decoder(memory, memory_key_padding_mask=full_mask)
         # `features` stays the FIRST stream's tokens (B, Nv, D) so the DINOv2
@@ -392,8 +402,12 @@ class TinyVLA(nn.Module):
     ) -> torch.Tensor:
         """Return K candidate action chunks of shape (K, B, T, A).
 
-        The model is run K times with independent Gaussian noise injected
-        at the fused-token bottleneck. K=1 is deterministic (no noise).
+        K=1 is deterministic (no noise). For K>1 the observation is encoded
+        ONCE and the decoder runs a single batched pass over K noisy copies of
+        the fused tokens — the same distribution as K independent forwards
+        (noise only enters at the bottleneck) at a fraction of the compute,
+        since the encoders dominate the FLOPs. Inference-only helper: call
+        under `model.eval()` / `torch.no_grad()`.
         """
 
         if k <= 1:
@@ -402,14 +416,49 @@ class TinyVLA(nn.Module):
                 image_wrist=image_wrist, camera_present=camera_present,
             )
             return out.actions.unsqueeze(0)
-        outs = []
-        for _ in range(int(k)):
-            out = self.forward(
-                image, state, lang_ids, lang_mask, noise_std=noise_std,
-                image_wrist=image_wrist, camera_present=camera_present,
-            )
-            outs.append(out.actions)
-        return torch.stack(outs, dim=0)
+
+        k = int(k)
+        img_tok = self._camera_streams(image, image_wrist, camera_present)
+        lang_tok = self.language(lang_ids, lang_mask)
+        st_tok = self.state_enc(state)
+        memory, full_mask = self._assemble_memory(img_tok, lang_tok, st_tok, lang_mask)
+        b, n_tok, d = memory.shape
+        mem_k = memory.unsqueeze(0).expand(k, b, n_tok, d).reshape(k * b, n_tok, d)
+        mem_k = mem_k + torch.randn_like(mem_k) * float(noise_std)
+        mask_k = full_mask.unsqueeze(0).expand(k, b, full_mask.size(1)).reshape(k * b, -1)
+        actions = self.decoder(mem_k, memory_key_padding_mask=mask_k)  # (K*B, T, A)
+        return actions.view(k, b, actions.size(1), actions.size(2))
+
+    @torch.no_grad()
+    def counterfactual_actions(
+        self,
+        image: Optional[torch.Tensor] = None,
+        state: torch.Tensor = None,
+        lang_ids: torch.Tensor = None,
+        lang_mask: torch.Tensor = None,
+        image_wrist: Optional[torch.Tensor] = None,
+        camera_present: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Deterministic action chunks for K alternative instructions over ONE observation.
+
+        `lang_ids` / `lang_mask` are (K, L); `image` / `image_wrist` / `state` /
+        `camera_present` are single-observation (1, ...) tensors. The camera and
+        state streams are encoded once and broadcast across the K instructions,
+        so the cost is one vision encode + one batched decode instead of K full
+        forwards (this is what makes the intent estimator's per-tick
+        counterfactual sweep cheap). Returns (K, T, A).
+        """
+
+        k = int(lang_ids.size(0))
+        img_tok = self._camera_streams(image, image_wrist, camera_present)  # (1, Nv, D)
+        st_tok = self.state_enc(state)                                      # (1, 1, D)
+        if img_tok.size(0) != 1 or st_tok.size(0) != 1:
+            raise ValueError("counterfactual_actions expects a single observation (batch 1)")
+        lang_tok = self.language(lang_ids, lang_mask)                       # (K, L, D)
+        memory, full_mask = self._assemble_memory(
+            img_tok.expand(k, -1, -1), lang_tok, st_tok.expand(k, -1, -1), lang_mask
+        )
+        return self.decoder(memory, memory_key_padding_mask=full_mask)      # (K, T, A)
 
 
 def build_model(cfg_dict: Dict[str, Any]) -> Tuple[TinyVLA, TinyVLAConfig]:

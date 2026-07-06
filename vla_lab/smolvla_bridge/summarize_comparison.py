@@ -4,26 +4,17 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict
 
-
-def _wilson_ci(successes: int, n: int, z: float = 1.96) -> Tuple[float, float]:
-    if n <= 0:
-        return (float("nan"), float("nan"))
-    p = successes / n
-    denom = 1.0 + z**2 / n
-    centre = (p + z**2 / (2 * n)) / denom
-    margin = (z / denom) * math.sqrt(p * (1 - p) / n + z**2 / (4 * n**2))
-    return (max(0.0, centre - margin), min(1.0, centre + margin))
+from ..stats_utils import wilson_ci
 
 
 def _summarize(path: Path) -> Dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     n = int(data.get("num_episodes", 0))
     s = int(data.get("num_success", 0))
-    lo, hi = _wilson_ci(s, n)
+    lo, hi = wilson_ci(s, n)
     return {
         "path": str(path),
         "policy_backend": data.get("policy_backend"),

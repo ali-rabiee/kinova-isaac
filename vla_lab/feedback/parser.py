@@ -7,7 +7,7 @@ Swap in an LLM parser later behind the same function signature if needed.
 
 from __future__ import annotations
 
-from typing import List, Sequence, Tuple
+from typing import List, Sequence
 
 from .types import DIRECTION_VECTORS, Refinement
 

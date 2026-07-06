@@ -16,6 +16,7 @@ No Isaac dependency; unit-tested offline in vla_lab/tests/test_intent.py.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -99,6 +100,8 @@ class IntentEstimator:
 
     def _encode(self, text: str) -> Tuple[torch.Tensor, torch.Tensor]:
         if text not in self._cf_cache:
+            if len(self._cf_cache) >= 512:  # mid-episode refinements vary the key set
+                self._cf_cache.clear()
             ids, attn = self.tokenizer.encode(text)
             self._cf_cache[text] = (ids.to(self.device), attn.to(self.device))
         return self._cf_cache[text]
@@ -115,6 +118,31 @@ class IntentEstimator:
             camera_present=model_inputs.get("camera_present"),
         )
         return out.actions.squeeze(0)  # (T, A)
+
+    @torch.no_grad()
+    def _counterfactual_chunks(self, model_inputs: Dict[str, Any], texts: Sequence[str]) -> torch.Tensor:
+        """Action chunks for all `texts` over one observation, shape (len(texts), T, A).
+
+        Uses the model's batched `counterfactual_actions` when available (one
+        vision encode + one batched decode for the whole sweep); falls back to
+        sequential per-text forwards for wrapped/mock policies that only
+        expose `forward`.
+        """
+
+        enc = [self._encode(t) for t in texts]
+        fn = getattr(self.model, "counterfactual_actions", None)
+        if callable(fn):
+            ids = torch.stack([e[0] for e in enc])
+            attn = torch.stack([e[1] for e in enc])
+            return fn(
+                image=model_inputs.get("image"),
+                state=model_inputs["state"],
+                lang_ids=ids,
+                lang_mask=attn,
+                image_wrist=model_inputs.get("image_wrist"),
+                camera_present=model_inputs.get("camera_present"),
+            )
+        return torch.stack([self._chunk(model_inputs, ids_t, attn_t) for ids_t, attn_t in enc])
 
     @torch.no_grad()
     def estimate(
@@ -149,26 +177,23 @@ class IntentEstimator:
         lexical = lexical_target_candidates(instruction, labels)
         ambiguous = len(lexical) != 1
 
-        # Behavioral: actual chunk vs counterfactual per-candidate chunks.
-        # Distances are normalized by their mean so the posterior sharpness is
-        # SCALE-FREE: a policy whose counterfactuals barely differ (undertrained,
-        # or a genuinely ambiguous instruction) yields a near-uniform posterior
-        # (high entropy) regardless of the model's raw action magnitudes.
-        ids0, attn0 = self._encode(str(instruction))
-        chunk0 = self._chunk(inputs, ids0, attn0)
-        rms_list: List[float] = []
-        for lbl in labels:
-            ids_c, attn_c = self._encode(self.template.format(label=lbl))
-            chunk_c = self._chunk(inputs, ids_c, attn_c)
-            rms_list.append(float((chunk0 - chunk_c).pow(2).mean().sqrt().item()))
-        rms_t = torch.tensor(rms_list, dtype=torch.float32)
+        # Behavioral: actual chunk vs counterfactual per-candidate chunks — one
+        # batched sweep (see `_counterfactual_chunks`). Distances are normalized
+        # by their mean so the posterior sharpness is SCALE-FREE: a policy whose
+        # counterfactuals barely differ (undertrained, or a genuinely ambiguous
+        # instruction) yields a near-uniform posterior (high entropy) regardless
+        # of the model's raw action magnitudes.
+        texts = [str(instruction)] + [self.template.format(label=lbl) for lbl in labels]
+        chunks = self._counterfactual_chunks(inputs, texts)  # (1+N, T, A)
+        chunk0 = chunks[0]
+        rms_t = (chunks[1:] - chunk0.unsqueeze(0)).pow(2).mean(dim=(1, 2)).sqrt().to("cpu", torch.float32)
         scale = rms_t.mean().clamp_min(1e-9)
         logits = -(rms_t / scale) / max(1e-6, self.temperature)
 
         # Geometric: does the predicted displacement head toward the candidate?
         if object_pos_b and ee_pos_b is not None and self.geometric_weight > 0:
             dp = chunk0[:, :3].sum(dim=0)  # cumulative EE displacement of the chunk
-            dp_n = dp / (dp.norm() + 1e-9)
+            dp_n = (dp / (dp.norm() + 1e-9)).cpu()
             geo: List[float] = []
             for lbl in labels:
                 p = object_pos_b.get(lbl)
@@ -179,7 +204,7 @@ class IntentEstimator:
                     [float(p[k]) - float(ee_pos_b[k]) for k in range(3)], dtype=torch.float32
                 )
                 to_obj = to_obj / (to_obj.norm() + 1e-9)
-                geo.append(float(torch.dot(dp_n.cpu(), to_obj).item()))
+                geo.append(float(torch.dot(dp_n, to_obj).item()))
             logits = logits + self.geometric_weight * torch.tensor(geo) / max(1e-6, self.temperature)
 
         post = torch.softmax(logits, dim=0)
@@ -192,7 +217,7 @@ class IntentEstimator:
 
         p = post.clamp_min(1e-9)
         ent = float(-(p * p.log()).sum().item())
-        ent_norm = ent / max(1e-9, torch.tensor(float(len(labels))).log().item()) if len(labels) > 1 else 0.0
+        ent_norm = ent / math.log(len(labels)) if len(labels) > 1 else 0.0
         order = torch.argsort(post, descending=True)
         top1 = labels[int(order[0])]
         margin = float(post[order[0]] - (post[order[1]] if len(labels) > 1 else 0.0))
@@ -238,11 +263,24 @@ def cross_view_disagreement(
     state = _b(state, 1)
     lang_ids = _b(lang_ids, 1)
     lang_mask = _b(lang_mask, 1)
-    n = len(cams)
-    mask_oh = torch.tensor([[1.0 if c == "overhead" else 0.0 for c in cams]], device=image.device).expand(image.size(0), n)
-    mask_wr = torch.tensor([[1.0 if c == "wrist" else 0.0 for c in cams]], device=image.device).expand(image.size(0), n)
-    a_oh = model.forward(image, state, lang_ids, lang_mask, noise_std=0.0,
-                         image_wrist=image_wrist, camera_present=mask_oh).actions
-    a_wr = model.forward(image, state, lang_ids, lang_mask, noise_std=0.0,
-                         image_wrist=image_wrist, camera_present=mask_wr).actions
-    return float((a_oh - a_wr).pow(2).mean().sqrt().item())
+    if image.size(0) != 1:
+        raise ValueError("cross_view_disagreement expects a single observation (batch 1)")
+    # One batched forward: row 0 sees only the overhead stream, row 1 only the
+    # wrist stream (identical pixels, per-row camera_present masks).
+    masks = torch.tensor(
+        [
+            [1.0 if c == "overhead" else 0.0 for c in cams],
+            [1.0 if c == "wrist" else 0.0 for c in cams],
+        ],
+        device=image.device,
+    )
+    acts = model.forward(
+        image.expand(2, -1, -1, -1),
+        state.expand(2, -1),
+        lang_ids.expand(2, -1),
+        lang_mask.expand(2, -1),
+        noise_std=0.0,
+        image_wrist=image_wrist.expand(2, -1, -1, -1),
+        camera_present=masks,
+    ).actions
+    return float((acts[0] - acts[1]).pow(2).mean().sqrt().item())

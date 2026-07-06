@@ -92,9 +92,6 @@ class SplitConformal:
 
         return bool(float(score) > self.q_hat)
 
-    def is_covered(self, score: float) -> bool:
-        return not self.is_anomalous(score)
-
     def to_dict(self) -> Dict[str, float]:
         return {"alpha": float(self.alpha), "q_hat": float(self.q_hat), "n_calib": int(self.n_calib)}
 

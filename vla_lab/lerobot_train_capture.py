@@ -25,7 +25,6 @@ import re
 import shutil
 import subprocess
 import sys
-from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -206,13 +205,10 @@ def _plot_eval_success(eval_points: List[Tuple[int, float]], fig_dir: Path, fmt:
         return
     steps_s: List[int] = []
     succ: List[float] = []
-    inferred_step = -1
     for st, sc in eval_points:
         if st >= 0:
             steps_s.append(st)
             succ.append(sc)
-        else:
-            inferred_step += 1
     if not steps_s and eval_points:
         # no step parsed — index by order
         steps_s = list(range(len(eval_points)))

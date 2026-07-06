@@ -28,7 +28,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -311,7 +310,7 @@ def verify_session(session_dir: Path, *, min_success_rate: float = 0.7, idle_dp_
     for h in hard_failures:
         print(f"[verify][FAIL] {h}")
     if hard_failures:
-        print(f"\n[verify] RESULT: FAIL — fix the issues above before training on this session.")
+        print("\n[verify] RESULT: FAIL — fix the issues above before training on this session.")
         return 1
     print(f"\n[verify] RESULT: OK{' (with warnings)' if warnings else ''} — session looks usable for training.")
     return 0

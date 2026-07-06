@@ -29,13 +29,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import random
 import statistics
 import subprocess
-import sys
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1361,6 +1358,7 @@ def main() -> int:
 
         steps = 0
         ep_t0 = time.time()
+        ep_clamp_start = int(policy.clamp_count)  # provider total is cumulative across episodes
         smol_latencies: List[Dict[str, Any]] = []
         replay_idx = 0
         replay_errs: List[float] = []
@@ -1383,33 +1381,8 @@ def main() -> int:
                 _debug_log_tick(ep=ep, tick=policy_tick_idx - 1, chunk_phys=chunk_phys, source="replay")
             elif policy.needs_new_chunk():
                 # Build observation tensors.
-                if camera_sensor is not None:
-                    try:
-                        cam_data = camera_sensor.data
-                        rgb = cam_data.output.get("rgb") if cam_data.output is not None else None
-                    except Exception:
-                        rgb = None
-                else:
-                    rgb = None
-                if rgb is not None:
-                    if rgb.dim() == 4:
-                        rgb_t = rgb[0]
-                    else:
-                        rgb_t = rgb
-                    rgb_t = rgb_t.float()
-                    if rgb_t.max() > 1.5:
-                        rgb_t = rgb_t / 255.0
-                    if rgb_t.dim() == 3 and rgb_t.shape[-1] == 4:
-                        rgb_t = rgb_t[..., :3]  # some Isaac versions return RGBA
-                    if rgb_t.shape[-1] == 3 and rgb_t.dim() == 3:
-                        rgb_t = rgb_t.permute(2, 0, 1).contiguous()
-                    rgb_t = torch.nn.functional.interpolate(
-                        rgb_t.unsqueeze(0).to(device),
-                        size=(infer_image_size, infer_image_size),
-                        mode="bilinear",
-                        align_corners=False,
-                    )[0]
-                else:
+                rgb_t = _grab_rgb_resized(camera_sensor)
+                if rgb_t is None:
                     rgb_t = torch.zeros(3, infer_image_size, infer_image_size, device=device)
 
                 occ_patch_seed = None
@@ -1724,9 +1697,10 @@ def main() -> int:
                     f"EE tracking error mean={statistics.mean(replay_errs) * 1000:.1f}mm  "
                     f"max={max(replay_errs) * 1000:.1f}mm"
                 )
-        if policy.clamp_count:
-            result["action_clamp_count"] = int(policy.clamp_count)
-            print(f"[eval][EP {ep}] WARNING: safety clamps triggered {policy.clamp_count}x (see max_action_dpos_m/max_action_drot_rad)")
+        ep_clamps = int(policy.clamp_count) - ep_clamp_start
+        if ep_clamps:
+            result["action_clamp_count"] = ep_clamps
+            print(f"[eval][EP {ep}] WARNING: safety clamps triggered {ep_clamps}x this episode (see max_action_dpos_m/max_action_drot_rad)")
         ep_results.append(result)
         print(
             f"[eval][EP {ep}] success={success}  steps={steps}  z0={z0_target}  z_after={z_after}  elapsed={elapsed:.1f}s"

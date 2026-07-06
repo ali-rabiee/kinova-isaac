@@ -16,7 +16,7 @@ Expected on-disk layout (produced by `vla_v1` profile in planner mode):
 
 The collect_data logger stringifies floats with 4 decimal places via
 `_format_numbers(...)` in `data_collection/core/logger.py`, so this loader
-recursively converts numeric strings back to floats while parsing.
+float()-parses the specific fields it consumes while reading ticks.
 
 Each dataset sample corresponds to one *training-tick* (an observation + the
 chunk of next-T actions to take from it). The action is read from
@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import json
 import math
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -44,29 +43,6 @@ except ImportError as exc:  # pragma: no cover
     raise ImportError(
         "vla_lab.dataset requires Pillow (PIL). Install with `pip install Pillow`."
     ) from exc
-
-
-_NUM_PAT = re.compile(r"^[-+]?\d+(\.\d+)?([eE][-+]?\d+)?$")
-
-
-def _to_float_maybe(value: Any) -> Any:
-    """Recursively convert stringified numbers in a JSON record back to floats.
-
-    The session logger writes floats as fixed-decimal strings (see
-    `_format_numbers` in data_collection/core/logger.py). This helper undoes that
-    so downstream code sees real numbers.
-    """
-
-    if isinstance(value, str) and _NUM_PAT.match(value):
-        try:
-            return float(value)
-        except ValueError:
-            return value
-    if isinstance(value, list):
-        return [_to_float_maybe(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _to_float_maybe(v) for k, v in value.items()}
-    return value
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +133,9 @@ def _parse_instruction(folder: Path) -> Tuple[str, str]:
 
 
 def _parse_ticks(ticks_path: Path) -> List[TickRecord]:
+    # Only the fields used for training are extracted (and float()-parsed from
+    # the logger's fixed-decimal strings) — full-record recursive conversion of
+    # every tick was the slow part of session discovery.
     out: List[TickRecord] = []
     with ticks_path.open("r") as f:
         for line_idx, line in enumerate(f):
@@ -167,37 +146,35 @@ def _parse_ticks(ticks_path: Path) -> List[TickRecord]:
                 raw = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            rec = _to_float_maybe(raw)
 
             try:
-                tick_idx = int(rec.get("tick_idx", line_idx))
+                tick_idx = int(float(raw.get("tick_idx", line_idx)))
             except Exception:
                 tick_idx = line_idx
 
             image_rel = None
             try:
-                image_rel = rec.get("image", {}).get("path")
+                image_rel = raw.get("image", {}).get("path")
             except Exception:
                 image_rel = None
 
             wrist_image_rel = None
             try:
-                wrist_image_rel = rec.get("image_wrist", {}).get("path")
+                wrist_image_rel = raw.get("image_wrist", {}).get("path")
             except Exception:
                 wrist_image_rel = None
 
-            ee_pos = tuple(rec["robot"]["ee_pose_b"]["position_m"])  # type: ignore[index]
-            ee_quat = tuple(rec["robot"]["ee_pose_b"]["orientation_wxyz"])  # type: ignore[index]
-            grip_state = str(rec["robot"]["gripper"]["state"])  # type: ignore[index]
+            pose = raw["robot"]["ee_pose_b"]  # type: ignore[index]
+            ee_pos = tuple(float(v) for v in pose["position_m"])
+            ee_quat = tuple(float(v) for v in pose["orientation_wxyz"])
+            grip_state = str(raw["robot"]["gripper"]["state"])  # type: ignore[index]
 
             action: Optional[Tuple[float, float, float, float, float, float, int]] = None
             try:
-                policy = rec.get("policy", {})
-                afp = policy.get("action_from_prev")
+                afp = raw.get("policy", {}).get("action_from_prev")
                 if isinstance(afp, dict):
-                    dpos = list(afp["ee_delta_pos_b"])
-                    drot = list(afp["ee_delta_rotvec_b"])
-                    g = int(afp.get("gripper_action", 0))
+                    dpos = afp["ee_delta_pos_b"]
+                    drot = afp["ee_delta_rotvec_b"]
                     action = (
                         float(dpos[0]),
                         float(dpos[1]),
@@ -205,7 +182,7 @@ def _parse_ticks(ticks_path: Path) -> List[TickRecord]:
                         float(drot[0]),
                         float(drot[1]),
                         float(drot[2]),
-                        int(g),
+                        int(float(afp.get("gripper_action", 0))),
                     )
             except Exception:
                 action = None
@@ -214,8 +191,8 @@ def _parse_ticks(ticks_path: Path) -> List[TickRecord]:
                 TickRecord(
                     tick_idx=tick_idx,
                     image_rel=image_rel,
-                    ee_pos_b=tuple(float(v) for v in ee_pos),  # type: ignore[arg-type]
-                    ee_quat_b=tuple(float(v) for v in ee_quat),  # type: ignore[arg-type]
+                    ee_pos_b=ee_pos,  # type: ignore[arg-type]
+                    ee_quat_b=ee_quat,  # type: ignore[arg-type]
                     gripper_state=grip_state,
                     action_from_prev=action,
                     wrist_image_rel=wrist_image_rel,
@@ -436,7 +413,7 @@ class ActionStats:
         )
 
     def normalize(self, action_chunk: torch.Tensor) -> torch.Tensor:
-        """Normalize the 6 continuous dims of an (T, 7) action chunk in place."""
+        """Return a copy of a (T, 7) action chunk with the 6 continuous dims normalized."""
         out = action_chunk.clone()
         out[..., :6] = (out[..., :6] - self.mean) / (self.std + 1e-6)
         return out
@@ -531,6 +508,10 @@ class KinovaSessionDataset(Dataset):
                 raise ValueError(f"DatasetConfig.cameras: unknown camera '{c}'")
         self._cameras = cams
 
+        # Tokenized instructions are identical for every frame of an episode;
+        # cache per unique string (each DataLoader worker holds its own copy).
+        self._token_cache: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+
         self._index: List[Tuple[int, int]] = []
         n_missing_wrist = 0
         for ep_idx, ep in enumerate(episodes):
@@ -567,13 +548,20 @@ class KinovaSessionDataset(Dataset):
     def __len__(self) -> int:
         return len(self._index)
 
-    def _load_image(self, ep: EpisodeRecord, rel: Optional[str]) -> torch.Tensor:
+    def _load_image(self, ep: EpisodeRecord, rel: Optional[str]) -> Tuple[torch.Tensor, bool]:
+        """Load one RGB frame as ((3,S,S) float in [0,1], loaded_ok).
+
+        Missing or unreadable frames return (zeros, False) so `camera_present`
+        can mask the stream instead of feeding a silent black view as "real".
+        """
+
         H = W = self.cfg.image_size
+        blank = torch.zeros(3, H, W, dtype=torch.float32)
         if rel is None:
-            return torch.zeros(3, H, W, dtype=torch.float32)
+            return blank, False
         path = ep.folder / rel
         if not path.exists():
-            return torch.zeros(3, H, W, dtype=torch.float32)
+            return blank, False
         if self._fast_io and self._tv_read_image is not None and self._tv_interpolate is not None:
             try:
                 t8 = self._tv_read_image(str(path))  # CHW uint8
@@ -586,16 +574,16 @@ class KinovaSessionDataset(Dataset):
                     t = self._tv_interpolate(
                         t.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False
                     ).squeeze(0)
-                return t.contiguous()
+                return t.contiguous(), True
             except Exception:
                 pass
         try:
             img = Image.open(path).convert("RGB").resize((W, H), Image.BILINEAR)
             arr = np.array(img, dtype=np.uint8, copy=True)
         except Exception:
-            return torch.zeros(3, H, W, dtype=torch.float32)
+            return blank, False
         t = torch.from_numpy(arr).permute(2, 0, 1).contiguous().float() / 255.0
-        return t
+        return t, True
 
     def _state(self, tick: TickRecord) -> torch.Tensor:
         # 4D state: [ee_x, ee_y, ee_z, gripper_open]
@@ -639,7 +627,11 @@ class KinovaSessionDataset(Dataset):
 
         state = self._state(tick)
         actions, mask = self._action_chunk(ep, t)
-        ids, attn = self.tokenizer.encode(ep.instruction)
+        enc = self._token_cache.get(ep.instruction)
+        if enc is None:
+            enc = self.tokenizer.encode(ep.instruction)
+            self._token_cache[ep.instruction] = enc
+        ids, attn = enc
 
         if self.action_stats is not None:
             actions = self.action_stats.normalize(actions)
@@ -655,8 +647,9 @@ class KinovaSessionDataset(Dataset):
         for cam in self._cameras:
             rel = tick.image_rel if cam == "overhead" else tick.wrist_image_rel
             key = "image" if cam == "overhead" else "image_wrist"
-            sample[key] = self._load_image(ep, rel)
-            present.append(1.0 if (rel and (ep.folder / rel).exists()) else 0.0)
+            img, ok = self._load_image(ep, rel)
+            sample[key] = img
+            present.append(1.0 if ok else 0.0)
         sample["camera_present"] = torch.tensor(present, dtype=torch.float32)
         return sample
 

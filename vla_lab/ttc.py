@@ -133,14 +133,11 @@ def _candidate_scores(candidates: torch.Tensor, selection: str) -> torch.Tensor:
     sel = _normalize_selection_label(selection)
     if sel == "first":
         return torch.zeros(candidates.size(0), device=candidates.device, dtype=candidates.dtype)
-    if sel == "naive_consensus":
-        median = candidates.median(dim=0).values
-        diffs = (candidates - median).pow(2).flatten(start_dim=1).mean(dim=-1)
-        return -diffs
     if sel == "mg_select_kl":
         return mg_select.mg_select_kl_scores(candidates)
     if sel == "flow_variance":
         return flow_variance_score(candidates)
+    # naive_consensus: negative L2 distance to the per-timestep median.
     median = candidates.median(dim=0).values
     diffs = (candidates - median).pow(2).flatten(start_dim=1).mean(dim=-1)
     return -diffs
@@ -149,8 +146,9 @@ def _candidate_scores(candidates: torch.Tensor, selection: str) -> torch.Tensor:
 def select_from_candidates(candidates: torch.Tensor, selection: str) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return (best_chunk[T,A], scores[K])."""
 
-    scores = _candidate_scores(candidates, selection)
-    if candidates.size(0) == 1 or _normalize_selection_label(selection) == "first":
+    sel = _normalize_selection_label(selection)
+    scores = _candidate_scores(candidates, sel)
+    if candidates.size(0) == 1 or sel == "first":
         return candidates[0], scores
     best_idx = int(scores.argmax().item())
     return candidates[best_idx], scores
@@ -176,7 +174,7 @@ class TTCPipeline:
             if fp is not None:
                 try:
                     fp.close()
-                finally:
+                except OSError:
                     pass
         self._log_fp = None
         self._lat_fp = None
@@ -216,47 +214,14 @@ class TTCPipeline:
         gate_expanded = False
 
         gmode = _normalize_gating_label(gate_mode)
-        if k_max > 1 and gmode == "twin_uncertainty":
-            t0 = time.time()
-            out0 = self.model.forward(image, state, lang_ids, lang_mask, noise_std=0.0, **cam_kw)
-            out1 = self.model.forward(
-                image, state, lang_ids, lang_mask, noise_std=float(self.cfg.gating_noise_std), **cam_kw
-            )
-            forward_ms += (time.time() - t0) * 1000.0
-            a0 = out0.actions.squeeze(0)
-            a1 = out1.actions.squeeze(0)
-            uncertainty = float(twin_sample_uncertainty(a0, a1).item())
-            k_eff = uncertainty_gate_effective_k(
-                uncertainty,
-                threshold=float(self.cfg.gating_threshold),
-                k_when_uncertain=k_max,
-                k_when_certain=1,
-            )
-            gated = True
-            gate_expanded = k_eff > 1
-            if k_eff == 1:
-                best = a0
-                scores = torch.zeros(1, device=best.device)
-                t1 = time.time()
-                score_ms = (t1 - t_total0) * 1000.0 - forward_ms
-                total_ms = (t1 - t_total0) * 1000.0
-                self._write_logs(
-                    k_eff=k_eff,
-                    k_max=k_max,
-                    scores=scores,
-                    selection=sel,
-                    forward_ms=forward_ms,
-                    score_ms=max(0.0, score_ms),
-                    total_ms=total_ms,
-                    uncertainty=uncertainty,
-                    gated=gated,
-                    gate_expanded=False,
-                )
-                return best
-        elif k_max > 1 and gmode == "noisy_pair":
+        if k_max > 1 and gmode in ("twin_uncertainty", "noisy_pair"):
+            # Two cheap probes decide whether the full K-sample budget is spent.
+            # twin_uncertainty: deterministic ξ=0 + low-noise probe;
+            # noisy_pair: two stochastic probes (no deterministic twin).
             t0 = time.time()
             gn = float(self.cfg.gating_noise_std)
-            out0 = self.model.forward(image, state, lang_ids, lang_mask, noise_std=gn, **cam_kw)
+            std0 = 0.0 if gmode == "twin_uncertainty" else gn
+            out0 = self.model.forward(image, state, lang_ids, lang_mask, noise_std=std0, **cam_kw)
             out1 = self.model.forward(image, state, lang_ids, lang_mask, noise_std=gn, **cam_kw)
             forward_ms += (time.time() - t0) * 1000.0
             a0 = out0.actions.squeeze(0)
@@ -271,6 +236,7 @@ class TTCPipeline:
             gated = True
             gate_expanded = k_eff > 1
             if k_eff == 1:
+                # Cheap path: return the first probe's chunk without sampling.
                 best = a0
                 scores = torch.zeros(1, device=best.device)
                 t1 = time.time()
@@ -289,24 +255,30 @@ class TTCPipeline:
                     gate_expanded=False,
                 )
                 return best
-        else:
-            k_eff = k_max
 
         t0 = time.time()
         if k_eff > 1 and self.cfg.include_deterministic_candidate:
             a_det = self.model.forward(image, state, lang_ids, lang_mask, noise_std=0.0, **cam_kw).actions.squeeze(0)
-            stoch = self.model.sample_actions(
-                image=image,
-                state=state,
-                lang_ids=lang_ids,
-                lang_mask=lang_mask,
-                k=int(k_eff - 1),
-                noise_std=float(self.cfg.noise_std),
-                **cam_kw,
-            )
-            if stoch.size(1) != 1:
-                raise ValueError("TTCPipeline.predict_action_chunk supports B=1 only.")
-            stoch = stoch.squeeze(1)
+            n_stoch = int(k_eff - 1)
+            if n_stoch == 1:
+                # sample_actions(k=1) is deterministic by contract; draw the single
+                # stochastic candidate explicitly so K=2 isn't the ξ=0 chunk twice.
+                stoch = self.model.forward(
+                    image, state, lang_ids, lang_mask, noise_std=float(self.cfg.noise_std), **cam_kw
+                ).actions
+            else:
+                stoch = self.model.sample_actions(
+                    image=image,
+                    state=state,
+                    lang_ids=lang_ids,
+                    lang_mask=lang_mask,
+                    k=n_stoch,
+                    noise_std=float(self.cfg.noise_std),
+                    **cam_kw,
+                )
+                if stoch.size(1) != 1:
+                    raise ValueError("TTCPipeline.predict_action_chunk supports B=1 only.")
+                stoch = stoch.squeeze(1)
             candidates = torch.cat([a_det.unsqueeze(0), stoch], dim=0)
         else:
             candidates = self.model.sample_actions(

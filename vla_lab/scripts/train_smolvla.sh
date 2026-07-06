@@ -18,6 +18,7 @@ STEPS="${STEPS:-9824}"
 # ~4 passes over ~78k-frame export at batch 32; override for other data or full training (e.g. STEPS=20000).
 BATCH_SIZE="${BATCH_SIZE:-32}"
 DEVICE="${DEVICE:-cuda}"
+SEED="${SEED:-1000}"
 
 # Do not mkdir OUT_DIR here: lerobot-train requires --output_dir to be absent when resume=false
 # (it errors if the directory already exists). Stash run metadata beside checkpoints instead.
@@ -72,7 +73,8 @@ if [ "${RESUME:-false}" = "true" ]; then
   RESUME_ARGS=(--resume=true)
 fi
 
-TRAIN_CMD=(python -m vla_lab.lerobot_train_capture --
+# One flag list for both launch paths (capture wrapper vs bare lerobot-train).
+TRAIN_ARGS=(
   --policy.path="${POLICY_PATH}"
   --policy.push_to_hub="${PUSH_TO_HUB}"
   --dataset.repo_id="${DATASET_REPO_ID}"
@@ -80,6 +82,7 @@ TRAIN_CMD=(python -m vla_lab.lerobot_train_capture --
   --policy.device="${DEVICE}"
   --batch_size="${BATCH_SIZE}"
   --steps="${STEPS}"
+  --seed="${SEED}"
   --output_dir="${OUT_DIR}"
   --job_name="${RUN_NAME}"
   --save_checkpoint="${SAVE_CHECKPOINT}"
@@ -91,22 +94,7 @@ TRAIN_CMD=(python -m vla_lab.lerobot_train_capture --
 )
 
 if [ "${VLA_LAB_CAPTURE_RESULTS:-1}" = "0" ]; then
-  exec lerobot-train \
-    --policy.path="${POLICY_PATH}" \
-    --policy.push_to_hub="${PUSH_TO_HUB}" \
-    --dataset.repo_id="${DATASET_REPO_ID}" \
-    --dataset.root="${DATASET_DIR}" \
-    --policy.device="${DEVICE}" \
-    --batch_size="${BATCH_SIZE}" \
-    --steps="${STEPS}" \
-    --output_dir="${OUT_DIR}" \
-    --job_name="${RUN_NAME}" \
-    --save_checkpoint="${SAVE_CHECKPOINT}" \
-    --save_freq="${SAVE_FREQ}" \
-    --log_freq="${LOG_FREQ}" \
-    --eval_freq="${EVAL_FREQ}" \
-    "${RESUME_ARGS[@]}" \
-    "$@"
+  exec lerobot-train "${TRAIN_ARGS[@]}"
 fi
 
-exec "${TRAIN_CMD[@]}"
+exec python -m vla_lab.lerobot_train_capture -- "${TRAIN_ARGS[@]}"

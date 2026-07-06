@@ -1,4 +1,4 @@
-"""Lightweight stats helpers for offline eval aggregation (Wilson intervals live in `plot_metrics.py`)."""
+"""Lightweight stats helpers shared by the offline eval/analysis CLIs."""
 
 from __future__ import annotations
 
@@ -32,3 +32,14 @@ def mcnemar_test(success_a: Iterable[bool], success_b: Iterable[bool]) -> Option
     p = 2.0 * (1.0 - phi)
     p = float(min(1.0, max(0.0, p)))
     return float(stat), p, nd
+
+def wilson_ci(successes: int, n: int, z: float = 1.96) -> Tuple[float, float]:
+    """95% Wilson score interval for a Binomial proportion; (nan, nan) when n <= 0."""
+
+    if n <= 0:
+        return (float("nan"), float("nan"))
+    p = successes / n
+    denom = 1.0 + z**2 / n
+    centre = (p + z**2 / (2 * n)) / denom
+    margin = (z / denom) * math.sqrt(p * (1 - p) / n + z**2 / (4 * n**2))
+    return (max(0.0, centre - margin), min(1.0, centre + margin))

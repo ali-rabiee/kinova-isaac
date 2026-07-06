@@ -12,15 +12,23 @@ cd "${REPO_ROOT}"
 
 CONFIG="${CONFIG:-vla_lab/configs/eval_isaac.yaml}"
 DEVICE="${DEVICE:-cuda:0}"
-ISAACLAB="${ISAACLAB:-./IsaacLab/isaaclab.sh}"
 OUT_ROOT="${OUT_ROOT:-vla_lab/eval_sweeps/tau_sweep}"
 NUM_EPISODES="${NUM_EPISODES:-50}"
 # Space-separated thresholds
 TAU_VALUES="${TAU_VALUES:-0.01 0.015 0.02 0.03 0.05 0.08}"
 EXTRA_FLAGS=( "$@" )
 
-if [[ ! -x "${ISAACLAB}" ]]; then
-  echo "[sweep_tau] ${ISAACLAB} not found or not executable." >&2
+if [[ -z "${ISAACLAB:-}" ]]; then
+  for candidate in "./IsaacLab/isaaclab.sh" "${HOME}/IsaacLab/isaaclab.sh"; do
+    if [[ -x "${candidate}" ]]; then
+      ISAACLAB="${candidate}"
+      break
+    fi
+  done
+fi
+
+if [[ -z "${ISAACLAB:-}" || ! -x "${ISAACLAB}" ]]; then
+  echo "[sweep_tau] isaaclab.sh not found. Set ISAACLAB= to your isaaclab.sh path." >&2
   exit 1
 fi
 

@@ -20,8 +20,7 @@ Everything is seeded and deterministic given (seed, episode).
 from __future__ import annotations
 
 import random
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from ..allocation.query import QueryAnswer
@@ -149,7 +148,8 @@ class SimulatedHuman:
                     break
 
         due = [i for at, i in self._pending if at <= tick_idx]
-        self._pending = [(at, i) for at, i in self._pending if at > tick_idx]
+        if due:
+            self._pending = [(at, i) for at, i in self._pending if at > tick_idx]
         return due
 
     # ------------------------------------------------------------------ query

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 
 from vla_lab.human_study.instruments import (
     NASA_TLX_SUBSCALES,
@@ -20,7 +19,6 @@ from vla_lab.human_study.power import (
 from vla_lab.human_study.protocol import (
     StudyProtocol,
     balanced_latin_square,
-    default_conditions,
     generate_session_plan,
 )
 from vla_lab.human_study.reliance import (

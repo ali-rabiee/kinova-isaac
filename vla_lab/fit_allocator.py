@@ -25,29 +25,20 @@ runs in the Isaac env or any plain Python env.
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
 from .allocation.allocator import AllocatorFit
 from .allocation.conformal import MondrianConformal, SplitConformal, bucketize
-from .allocation.linear_model import LogisticModel, fit_logistic
+from .allocation.linear_model import fit_logistic
 from .allocation.value_of_information import CostModel, ValueParams
 from .calibration.metrics import auroc, coverage_vs_occlusion
-from .calibration.records import CalibrationRecord, read_jsonl
+from .calibration.records import CalibrationRecord, read_many
 
 DEFAULT_FEATURES = ["dispersion", "occlusion_fraction"]
-
-
-def _load(paths: Sequence[str]) -> List[CalibrationRecord]:
-    recs: List[CalibrationRecord] = []
-    for pat in paths:
-        for p in sorted(glob.glob(pat)) or [pat]:
-            recs.extend(read_jsonl(p))
-    return recs
 
 
 def _record_features(r: CalibrationRecord) -> Dict[str, float]:
@@ -193,7 +184,7 @@ def main() -> int:
     if not args.calib:
         print("[fit_allocator] no --calib paths given.")
         return 2
-    records = _load(args.calib)
+    records = read_many(args.calib)
     if not records:
         print("[fit_allocator] no calibration records loaded.")
         return 2

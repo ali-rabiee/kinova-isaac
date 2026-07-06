@@ -61,13 +61,6 @@ def chunk_dispersion(candidates: Any) -> float:
     return float(np.sqrt(max(0.0, var)))
 
 
-def normalized_dispersion(dispersion: float, scale: float) -> float:
-    """Map a raw dispersion onto ``[0, 1)`` via ``1 - exp(-d/scale)`` (scale>0)."""
-
-    s = max(1e-9, float(scale))
-    return float(1.0 - np.exp(-max(0.0, float(dispersion)) / s))
-
-
 @dataclass
 class ProbeResult:
     """Output of the cheap two-forward probe used to decide act vs. {compute, query}.
@@ -103,9 +96,3 @@ class ComputeResult:
     scores: Optional[Any] = None
     forward_ms: float = 0.0
     score_ms: float = 0.0
-
-
-def feature_vector(features: Dict[str, float], keys) -> np.ndarray:
-    """Stable ordered feature vector for a fitted detector (missing keys -> 0.0)."""
-
-    return np.asarray([float(features.get(str(k), 0.0)) for k in keys], dtype=np.float64)

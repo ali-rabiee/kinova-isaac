@@ -14,7 +14,7 @@ References
 
 from __future__ import annotations
 
-from typing import Dict, List, Mapping, Optional, Sequence, Union
+from typing import Dict, Mapping, Sequence, Union
 
 Number = Union[int, float]
 

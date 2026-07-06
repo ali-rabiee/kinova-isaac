@@ -53,7 +53,6 @@ def extract(
     Records without any correctness label are dropped.
     """
 
-    conf: List[float] = []
     corr: List[float] = []
     disp: List[float] = []
     occ: List[float] = []
@@ -237,9 +236,14 @@ def coverage_vs_occlusion(
     labs: List[float] = []
     occ: List[float] = []
     for r in records:
-        s = float(r.nonconformity_score) if (score == "nonconformity" and r.nonconformity_score) else float(r.dispersion)
         if score == "irreducibility":
             s = float(r.irreducible_score)
+        elif score == "nonconformity" and float(r.nonconformity_score) != 0.0:
+            # 0.0 is the dataclass default = "never computed" (controllers without
+            # a conformal stage); fall back to dispersion so mixed logs stay usable.
+            s = float(r.nonconformity_score)
+        else:
+            s = float(r.dispersion)
         y = _label(r)
         vals.append(s)
         labs.append(float("nan") if y is None else float(y))

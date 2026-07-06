@@ -10,7 +10,8 @@ A channel owns BOTH directions of the human link so experiments can vary one
 
 Implementations:
 - :class:`NullFeedbackChannel`    — silence (pure-autonomy runs).
-- :class:`ScriptedFeedbackChannel`— wraps :class:`SimulatedHuman` (sim/evals).
+- :class:`ScriptedFeedbackChannel`— wraps :class:`SimulatedHuman` (sim/evals);
+  the eval loop rebuilds it per episode (the sim human needs the true target).
 - :class:`ConsoleFeedbackChannel` — live keyboard: a daemon thread reads stdin
   lines; typed lines between questions are interjections, lines typed after a
   question are its answer.
@@ -22,7 +23,7 @@ import queue
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, List, Optional, Sequence
 
 from ..allocation.query import QueryAnswer
 from .sim_human import SimulatedHuman
@@ -139,15 +140,3 @@ class ConsoleFeedbackChannel(FeedbackChannel):
     def close(self) -> None:
         self._stop.set()
 
-
-def build_feedback_channel(kind: str, sim_human: Optional[SimulatedHuman] = None) -> FeedbackChannel:
-    k = str(kind).lower().strip()
-    if k in ("none", "", "off"):
-        return NullFeedbackChannel()
-    if k == "scripted":
-        if sim_human is None:
-            raise ValueError("scripted feedback channel needs a SimulatedHuman")
-        return ScriptedFeedbackChannel(sim_human)
-    if k in ("console", "stdin", "keyboard"):
-        return ConsoleFeedbackChannel()
-    raise ValueError(f"unknown feedback channel {kind!r}")

@@ -8,7 +8,7 @@ the partial-observability baseline.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List
 
 
 @dataclass

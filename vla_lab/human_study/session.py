@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import json
 import random
-import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -281,7 +280,7 @@ class SimEpisodeRunner:
                     pr = p.human_catch_unaided
                 intervened = self.rng.random() < pr
 
-        success = robot_correct or (queried and robot_correct) or (intervened and self.rng.random() < p.human_fix_success)
+        success = robot_correct or (intervened and self.rng.random() < p.human_fix_success)
         return EpisodeResult(
             success=bool(success),
             robot_correct=bool(robot_correct),

@@ -15,7 +15,7 @@ top-down RGB image (and, since 2026-07, optionally a calibrated **wrist camera**
 the EE state, and an instruction like *"Pick up the red box."*, and must reach, grasp,
 and lift the right box.
 
-> **2026-07 reframing** (see `/fable_report.md` at the repo root): uncertainty is now
+> **2026-07 reframing** (see [`fable_report.md`](./fable_report.md)): uncertainty is now
 > decomposed by **source** — *perception* (occlusion, missing view) vs *human intent*
 > (which object is meant) — and each source routes to a different remedy (compute, the
 > other view, or a clarifying query). A two-way feedback channel lets the human interject
@@ -109,7 +109,7 @@ vla_lab/
 │
 ├── checkpoints/ datasets/       <- training outputs / LeRobot exports   (artifacts, gitignored)
 ├── eval_results/ results/       <- eval + experiment outputs            (artifacts)
-└── paper/                       <- CoRL LaTeX sources
+└── paper/                       <- HRI-2027 LaTeX sources (+ talk deck in presentation/)
 ```
 
 ★ = the four commands you will actually use day-to-day.
@@ -396,8 +396,9 @@ variable of the study. Per-episode feedback/intent traces land in `results_*.jso
 
 | Document | Content |
 | --- | --- |
+| [`RECOMMENDATIONS.md`](./RECOMMENDATIONS.md) | 2026-07-05 project assessment: HRI-2027 fit/verdict, 13-week critical path, go/no-go gate, prioritized implementation list |
 | [`data_collection_guide.md`](./data_collection_guide.md) | Pipeline anatomy, data/action contract, 2026-06-11 bug fixes, final-dataset procedure, troubleshooting |
-| [`/fable_report.md`](../fable_report.md) | 2026-07 reframing report: wrist camera, intent/perception decomposition, feedback fusion — what was built, why, and the July-2026 literature map |
+| [`fable_report.md`](./fable_report.md) | 2026-07 reframing report: wrist camera, intent/perception decomposition, feedback fusion — what was built, why, and the July-2026 literature map |
 | [`docs/EVAL_DEBUG_REPORT.md`](./docs/EVAL_DEBUG_REPORT.md) | Postmortem: why eval flailed and how every root cause was fixed |
 | [`docs/new_changes.md`](./docs/new_changes.md) | Eval protocol design notes (Wilson CIs, occlusion axes, SmolVLA comparison) — pre-wrist framing |
 | [`docs/FABLE_INSTRUCTIONS.md`](./docs/FABLE_INSTRUCTIONS.md) | Historical task brief for the eval debug (context for the report) |

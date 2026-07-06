@@ -15,20 +15,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-
-def _wilson_ci(successes: int, n: int, z: float = 1.96) -> Tuple[float, float]:
-    """95% Wilson score interval for Binomial proportion."""
-    if n <= 0:
-        return (float("nan"), float("nan"))
-    p = successes / n
-    denom = 1.0 + z**2 / n
-    centre = (p + z**2 / (2 * n)) / denom
-    margin = (z / denom) * math.sqrt(p * (1 - p) / n + z**2 / (4 * n**2))
-    return (max(0.0, centre - margin), min(1.0, centre + margin))
+from .stats_utils import wilson_ci
 
 
 def _load_metrics_jsonl(path: Path) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -128,7 +118,7 @@ def _plot_eval_comparison(summaries: List[Tuple[str, Dict[str, Any]]], out_dir: 
         n_ep = int(s.get("num_episodes", 0))
         ns = int(s.get("num_success", 0))
         rate = float(s.get("success_rate", ns / max(1, n_ep)))
-        lo, hi = _wilson_ci(ns, n_ep)
+        lo, hi = wilson_ci(ns, n_ep)
         labels.append(label)
         rates.append(rate)
         lows.append(lo)
@@ -185,7 +175,7 @@ def _plot_eval_comparison(summaries: List[Tuple[str, Dict[str, Any]]], out_dir: 
                 succ = sum(1 for v in by_t[k] if v)
                 n = len(by_t[k])
                 p = succ / max(1, n)
-                lo, hi = _wilson_ci(succ, n)
+                lo, hi = wilson_ci(succ, n)
                 tr.append(p)
                 err_lo.append(p - lo)
                 err_hi.append(hi - p)
@@ -217,7 +207,7 @@ def _plot_success_vs_k_mean_frontier(summaries: List[Tuple[str, Dict[str, Any]]]
         n_ep = int(s.get("num_episodes", 0))
         ns = int(s.get("num_success", 0))
         rate = float(s.get("success_rate", ns / max(1, n_ep)))
-        lo, hi = _wilson_ci(ns, n_ep)
+        lo, hi = wilson_ci(ns, n_ep)
         pts.append((float(k_bar), rate, lo, hi, label))
     if len(pts) < 2:
         return

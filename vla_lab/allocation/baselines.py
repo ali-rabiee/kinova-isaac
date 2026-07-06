@@ -22,7 +22,7 @@ import time
 from typing import Any, Optional, Sequence
 
 from .allocator import ActComputeQueryAllocator, AllocatorFit, Controller, Decision, formulate_question
-from .conformal import SplitConformal, bucketize
+from .conformal import SplitConformal
 from .linear_model import LogisticModel
 from .query import QueryAnswer, QueryInterface, refine_instruction
 from .transparency import TransparencyConfig, render_message, uncertainty_type_for

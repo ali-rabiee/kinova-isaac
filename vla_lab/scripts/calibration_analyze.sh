@@ -5,7 +5,7 @@
 # (the decoupling/inversion finding), and coverage_vs_occlusion (conformal under shift), plus
 # calibration_summary.json. Pure NumPy + matplotlib; no Isaac needed.
 #
-#   CALIB='vla_lab/calibration_runs/*/records.jsonl' ./vla_lab/scripts/calibration_analyze.sh
+#   CALIB='vla_lab/calibration_runs/*/*/records.jsonl' ./vla_lab/scripts/calibration_analyze.sh
 #   FORMAT=png ./vla_lab/scripts/calibration_analyze.sh
 
 set -euo pipefail

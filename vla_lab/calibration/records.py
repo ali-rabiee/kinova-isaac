@@ -132,8 +132,13 @@ def read_jsonl(path: Union[str, Path]) -> List[CalibrationRecord]:
     return out
 
 
-def read_many(paths: Iterable[Union[str, Path]]) -> List[CalibrationRecord]:
+def read_many(patterns: Iterable[Union[str, Path]]) -> List[CalibrationRecord]:
+    """Load records from paths and/or glob patterns (the CLIs' --records inputs)."""
+
+    import glob
+
     out: List[CalibrationRecord] = []
-    for p in paths:
-        out.extend(read_jsonl(p))
+    for pat in patterns:
+        for p in sorted(glob.glob(str(pat))) or [str(pat)]:
+            out.extend(read_jsonl(p))
     return out

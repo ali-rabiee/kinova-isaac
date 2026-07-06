@@ -16,23 +16,12 @@ from __future__ import annotations
 import argparse
 import glob
 import json
-import math
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..stats_utils import mcnemar_test
+from ..stats_utils import mcnemar_test, wilson_ci
 from .reliance import RelianceTrial, reliance_summary, trust_calibration
-
-
-def _wilson_ci(successes: int, n: int, z: float = 1.96) -> Tuple[float, float]:
-    if n <= 0:
-        return (float("nan"), float("nan"))
-    p = successes / n
-    denom = 1.0 + z**2 / n
-    centre = (p + z**2 / (2 * n)) / denom
-    margin = (z / denom) * math.sqrt(p * (1 - p) / n + z**2 / (4 * n**2))
-    return (max(0.0, centre - margin), min(1.0, centre + margin))
 
 
 def _load(paths: List[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -110,7 +99,7 @@ def analyze(trials: List[Dict[str, Any]], quest: List[Dict[str, Any]], *, refere
         cal = trust_calibration(rts)
         n = summ.get("n", 0)
         ns = int(round(summ.get("success_rate", 0.0) * n))
-        lo, hi = _wilson_ci(ns, n)
+        lo, hi = wilson_ci(ns, n)
         per_condition[cond] = {
             "reliance": summ,
             "trust_calibration": cal,

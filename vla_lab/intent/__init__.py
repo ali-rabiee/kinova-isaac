@@ -1,6 +1,6 @@
 """Intent-uncertainty estimation: WHICH goal does the human mean?
 
-2026-07 reframing (see fable_report.md at the repo root): with the wrist camera
+2026-07 reframing (see vla_lab/fable_report.md): with the wrist camera
 removing the single-view deficiency, uncertainty is decomposed by SOURCE —
 
 - perception uncertainty: the policy cannot see well enough to execute

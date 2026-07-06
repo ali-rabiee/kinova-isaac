@@ -68,7 +68,6 @@ ttc:
   k_action_samples: 1
   noise_std: 0.1
   selection: naive_consensus
-  scoring: naive_consensus    # legacy alias for `selection`
   gating: none                # none | twin_uncertainty | noisy_pair
   gating_noise_std: 0.05
   gating_threshold: 0.02

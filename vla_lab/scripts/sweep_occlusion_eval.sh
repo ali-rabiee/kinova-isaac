@@ -12,13 +12,21 @@ cd "${REPO_ROOT}"
 
 CONFIG="${CONFIG:-vla_lab/configs/eval_isaac.yaml}"
 DEVICE="${DEVICE:-cuda:0}"
-ISAACLAB="${ISAACLAB:-./IsaacLab/isaaclab.sh}"
 OUT_ROOT="${OUT_ROOT:-vla_lab/eval_sweeps/occlusion_sweep}"
 NUM_EPISODES="${NUM_EPISODES:-50}"
 EXTRA_FLAGS=( "$@" )
 
-if [[ ! -x "${ISAACLAB}" ]]; then
-  echo "[sweep_occlusion] ${ISAACLAB} not found or not executable." >&2
+if [[ -z "${ISAACLAB:-}" ]]; then
+  for candidate in "./IsaacLab/isaaclab.sh" "${HOME}/IsaacLab/isaaclab.sh"; do
+    if [[ -x "${candidate}" ]]; then
+      ISAACLAB="${candidate}"
+      break
+    fi
+  done
+fi
+
+if [[ -z "${ISAACLAB:-}" || ! -x "${ISAACLAB}" ]]; then
+  echo "[sweep_occlusion] isaaclab.sh not found. Set ISAACLAB= to your isaaclab.sh path." >&2
   exit 1
 fi
 
