@@ -54,8 +54,12 @@ class CartesianVelocityJogController(ArmController):
 
     Input provider should return up to 7D per step: [dx, dy, dz, rx, ry, rz, g]
     - Translation mode: uses [dx, dy, dz], holds orientation.
-    - Rotation mode: uses [rx, ry, rz] (rotation vector), holds position.
+    - Rotation mode: uses [rx, ry, rz] (rotation vector, EE frame), holds position.
     - Gripper mode: uses [g] if present (g>0 open, g<0 close) and holds pose.
+    - Twist mode: uses all of [dx, dy, dz, rx, ry, rz, g] simultaneously
+      (policy rollout). Unlike rotation mode, [rx, ry, rz] is interpreted in
+      the BASE frame (matching the logged `ee_delta_rotvec_b` action
+      convention); g > 0.5 opens, g < -0.5 closes, otherwise the gripper holds.
     """
 
     def __init__(self, config: CartesianVelocityJogConfig, num_envs: int = 1, device: Optional[str] = None) -> None:
@@ -69,7 +73,7 @@ class CartesianVelocityJogController(ArmController):
         self._ee_quat_hold_b: Optional[torch.Tensor] = None
         self._ee_quat_last_safe_b: Optional[torch.Tensor] = None
         self._step_count = 0
-        self._mode: Literal["translate", "rotate", "gripper"] = "translate"
+        self._mode: Literal["translate", "rotate", "gripper", "twist"] = "translate"
         self._refresh_hold_ori_on_translate: bool = False
         # High-level helpers
         _gc = self.config.gripper_cfg or GripperConfig(
@@ -81,7 +85,7 @@ class CartesianVelocityJogController(ArmController):
         self._cmd_builder = MotionCommandBuilder(device=str(self.device))
         self.motion = MotionPrimitives(self._cmd_builder, self)
 
-    def set_mode(self, mode: Literal["translate", "rotate", "gripper"]) -> None:
+    def set_mode(self, mode: Literal["translate", "rotate", "gripper", "twist"]) -> None:
         if self._mode != mode:
             self._mode = mode
             print(f"[CTRL] Mode set to: {self._mode}")
@@ -190,6 +194,18 @@ class CartesianVelocityJogController(ArmController):
             quat_des = quat_box_plus(ee_quat_b, drot_safe)
             # update last safe orientation for potential external consumers
             self._ee_quat_last_safe_b = quat_des.clone()
+        elif self._mode == "twist":
+            # Simultaneous translation + rotation: compose the translate and
+            # rotate branches, inheriting the same safety machinery.
+            if self.config.safety_cfg.min_sigma_thresh is not None:
+                sigma_min = self.safety.smallest_singular_value(jac)
+                block_sigma = sigma_min < self.config.safety_cfg.min_sigma_thresh
+                target_quat = self._ee_quat_last_safe_b if self._ee_quat_last_safe_b is not None else ee_quat_b
+                projected_drot = self.safety.project_rotation_toward_quat(ee_quat_b, target_quat, drot_safe)
+                drot_safe = torch.where(block_sigma.unsqueeze(-1), projected_drot, drot_safe)
+            pos_des = self.safety.clamp_position(ee_pos_b + dpos_safe)
+            quat_des = quat_box_plus(ee_quat_b, drot_safe)
+            self._ee_quat_last_safe_b = quat_des.clone()
         elif self._mode == "translate":
             pos_des = self.safety.clamp_position(ee_pos_b + dpos_safe)
             quat_des = self.safety.hold_orientation(ee_quat_b, self._ee_quat_hold_b, self.config.hold_orientation)
@@ -218,6 +234,13 @@ class CartesianVelocityJogController(ArmController):
             if g_val.mean().item() > 0.0:
                 self.gripper.command_open(robot)
             else:
+                self.gripper.command_close(robot)
+        elif self._mode == "twist" and g_val is not None:
+            # deadband so g = 0 means "hold current gripper state"
+            g_mean = g_val.mean().item()
+            if g_mean > 0.5:
+                self.gripper.command_open(robot)
+            elif g_mean < -0.5:
                 self.gripper.command_close(robot)
 
         # Gravity compensation
