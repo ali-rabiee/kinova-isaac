@@ -12,14 +12,9 @@ own Franka wrist-camera reference config,
 and ``Camera.__init__``, which spawns the prim eagerly when ``spawn`` is not
 ``None``).
 
-Placeholder geometry only: ``offset_pos``/``offset_rot_wxyz`` have NOT been
-visually verified, and ``parent_body_name`` has only been confirmed as a
-PhysX *articulation body* name (via ``robot.find_bodies``) -- not necessarily
-the identical USD prim-tree name. ``find_prim_path_by_name`` below resolves
-(and, if it can't, reports) the actual prim path live rather than assuming a
-fixed relative path. Run ``scripts/debug_cameras.py --cameras wrist`` and
-inspect the saved frames (and the printed descendant list if attachment
-fails) before trusting these defaults for real data collection.
+The defaults below are visually confirmed (fingertips at the bottom corners,
+clear centre, verified rigid across arm poses). Re-check with
+``scripts/debug_cameras.py --cameras wrist`` after any change.
 """
 
 from __future__ import annotations
@@ -34,16 +29,54 @@ if TYPE_CHECKING:
 
 @dataclass
 class WristCameraConfig:
-    """Eye-in-hand camera, spawned as a rigid child of the EE link."""
+    """Eye-in-hand camera, held rigid to the EE link by sync_wrist_camera_to_ee.
+
+    Geometry tuned visually via ``scripts/debug_cameras.py``. Straight view --
+    identity rotation, looking down the approach axis -- with one fingertip
+    entering each bottom corner and the centre left clear for the object.
+
+    Reading the offset (all in the END-EFFECTOR frame):
+
+    - ``+Z is the approach direction``, NOT height. z = -0.12 sits the camera
+      12 cm back along the grasp axis, behind the fingertips (which are at
+      z = -0.019). More negative pushes it backwards into the wrist body,
+      where the frame goes black.
+    - ``y = -0.09`` is the lateral lift clear of the hand housing. Y is the
+      right axis for it: the one-vs-two finger split runs along X
+      (finger_1 at x=+0.067, the pair at x=-0.062), so offsetting along Y is
+      perpendicular to that split and keeps one finger on each side of the
+      frame. Offsetting along X instead slides one group into the centre.
+    - The sign matters: with convention="ros" (+Y is down in image space) a
+      camera at -Y projects the fingers downward, putting them at the BOTTOM
+      corners. +Y puts them at the top, which reads upside down.
+    - ``offset_rot_wxyz`` is a +12 deg ROLL about the camera's own optical
+      axis, which levels the two visible fingertips. It is needed because the
+      gripper is mirror-symmetric about the XZ plane (finger_1 at y~0, the
+      pair at y=+-0.029), so a camera lifted along Y sits OUT of that symmetry
+      plane and sees the two fingers at different heights -- finger_1 projects
+      to image y=+0.089 against finger_3's +0.061, a ~12 deg tilt. Rolling by
+      that angle cancels it without moving the camera or changing the framing.
+    - ``focal_length_mm=10`` against the 20.955 mm aperture is ~93 deg -- wide,
+      as eye-in-hand cameras normally are, since the fingers sit centimetres
+      away.
+
+    To re-tune: a fingertip at lateral radius r and depth d lands at
+    ``r / (d * tan(FOV/2))`` of the half-frame; ~0.85 puts it at the edge.
+    """
 
     parent_body_name: str = "j2n6s300_end_effector"
     prim_leaf: str = "wrist_cam"
-    offset_pos: Tuple[float, float, float] = (0.0, 0.0, 0.05)
-    offset_rot_wxyz: Tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+    # x=+0.02 centres the gripper horizontally. Only TWO fingertips are ever in
+    # frame (the lone one plus one of the pair), and their midpoint -- not the
+    # three-finger centroid -- is what reads as the gripper's centre; measured
+    # off the render, it sat ~7% right of frame centre at x=0.
+    offset_pos: Tuple[float, float, float] = (0.02, -0.09, -0.12)
+    # +12 deg roll about the optical axis -- levels the two visible fingertips
+    offset_rot_wxyz: Tuple[float, float, float, float] = (0.99452, 0.0, 0.0, 0.10453)
     offset_convention: str = "ros"
     resolution: Tuple[int, int] = (320, 320)
     horizontal_aperture_mm: float = 20.955
-    focal_length_mm: float = 18.0
+    focal_length_mm: float = 9.0
     clipping_range: Tuple[float, float] = (0.01, 2.0)
 
 
@@ -110,14 +143,20 @@ def build_wrist_camera_cfg(robot: "Articulation", camera_cfg: "WristCameraConfig
     import isaaclab.sim as sim_utils
     from isaaclab.sensors import CameraCfg
 
-    parent_path = find_prim_path_by_name(robot, camera_cfg.parent_body_name)
-    if parent_path is None:
-        raise RuntimeError(
-            f"could not find a prim named {camera_cfg.parent_body_name!r} under the robot's "
-            "USD tree; run scripts/debug_cameras.py to print the full descendant list and "
-            "update WristCameraConfig.parent_body_name accordingly"
-        )
-    prim_path = f"{parent_path}/{camera_cfg.prim_leaf}"
+    # Deliberately a STANDALONE prim, not a child of the end-effector prim.
+    #
+    # Parenting it under the EE prim looks right and even spawns in the right
+    # place, but it does not track the arm: PhysX keeps link transforms in its
+    # own buffers and never writes them back down the USD hierarchy, so the
+    # camera's world transform is recomputed forever as (frozen parent x local)
+    # -- it sits motionless while the arm moves, and any world pose written to
+    # it is immediately overwritten by that recomputation.
+    #
+    # Unparented, its world pose is ours to set, which sync_wrist_camera_to_ee
+    # does every step from the link's live physics pose. offset_pos/offset_rot
+    # are applied there instead of here, so they keep their meaning: a rigid
+    # mount expressed in the end-effector frame.
+    prim_path = f"/World/Origin1/{camera_cfg.prim_leaf}"
 
     return CameraCfg(
         prim_path=prim_path,
@@ -127,14 +166,50 @@ def build_wrist_camera_cfg(robot: "Articulation", camera_cfg: "WristCameraConfig
             clipping_range=camera_cfg.clipping_range,
         ),
         offset=CameraCfg.OffsetCfg(
-            pos=camera_cfg.offset_pos,
-            rot=camera_cfg.offset_rot_wxyz,
+            pos=(0.0, 0.0, 0.0),
+            rot=(1.0, 0.0, 0.0, 0.0),
             convention=camera_cfg.offset_convention,
         ),
         data_types=["rgb"],
         width=camera_cfg.resolution[0],
         height=camera_cfg.resolution[1],
     )
+
+
+def sync_wrist_camera_to_ee(
+    robot: "Articulation", camera: "Camera", camera_cfg: "WristCameraConfig"
+) -> None:
+    """Write the camera's world pose from the parent link's CURRENT physics pose.
+
+    MUST be called every step, before the render that produces the frame.
+    Skipping it does not error -- it silently yields a camera sitting still in
+    space while the arm moves, producing plausible-looking but wrong frames.
+
+    The camera prim is intentionally NOT parented to the robot (see
+    ``build_wrist_camera_cfg``), because a child prim's world transform is
+    recomputed from its parent every step and articulation motion never
+    reaches the USD hierarchy -- so a parented camera stays frozen and
+    ignores any pose written to it. Unparented, this function is what makes
+    the mount rigid: it composes the configured EE-frame offset onto the
+    link's live physics pose and writes the result.
+    """
+    import torch
+    from isaaclab.utils.math import combine_frame_transforms
+
+    ids, _ = robot.find_bodies([camera_cfg.parent_body_name])
+    ee_id = int(ids[0])
+    ee_pos = robot.data.body_pose_w[:, ee_id, 0:3]
+    ee_quat = robot.data.body_pose_w[:, ee_id, 3:7]
+
+    device = ee_pos.device
+    n = ee_pos.shape[0]
+    off_pos = torch.tensor(camera_cfg.offset_pos, dtype=ee_pos.dtype, device=device).repeat(n, 1)
+    off_quat = torch.tensor(
+        camera_cfg.offset_rot_wxyz, dtype=ee_quat.dtype, device=device
+    ).repeat(n, 1)
+
+    pos_w, quat_w = combine_frame_transforms(ee_pos, ee_quat, off_pos, off_quat)
+    camera.set_world_poses(pos_w, quat_w, convention=camera_cfg.offset_convention)
 
 
 def build_wrist_camera_sensor(robot: "Articulation", camera_cfg: "WristCameraConfig | None" = None) -> "Camera":

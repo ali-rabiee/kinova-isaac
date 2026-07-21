@@ -28,6 +28,7 @@ from .wrist import (
     build_wrist_camera_sensor,
     find_prim_path_by_name,
     list_all_descendant_prim_names,
+    sync_wrist_camera_to_ee,
 )
 
 __all__ = [
@@ -48,4 +49,5 @@ __all__ = [
     "build_wrist_camera_sensor",
     "find_prim_path_by_name",
     "list_all_descendant_prim_names",
+    "sync_wrist_camera_to_ee",
 ]
