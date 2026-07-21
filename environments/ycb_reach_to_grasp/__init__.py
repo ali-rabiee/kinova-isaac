@@ -13,11 +13,15 @@ from environments.base import (
     define_origins,
     design_scene,
 )
+from environments.utils.camera.front import FrontCameraConfig
+from environments.utils.camera.wrist import WristCameraConfig
 
 from .config import (
     DEFAULT_CAMERA,
+    DEFAULT_FRONT_CAMERA,
     DEFAULT_SCENE,
     DEFAULT_TOP_DOWN_CAMERA,
+    DEFAULT_WRIST_CAMERA,
     default_ycb_dir,
 )
 from .env import YCBReachToGraspEnv
@@ -26,9 +30,13 @@ __all__ = [
     "CameraConfig",
     "SceneConfig",
     "TopDownCameraConfig",
+    "FrontCameraConfig",
+    "WristCameraConfig",
     "DEFAULT_CAMERA",
     "DEFAULT_SCENE",
     "DEFAULT_TOP_DOWN_CAMERA",
+    "DEFAULT_FRONT_CAMERA",
+    "DEFAULT_WRIST_CAMERA",
     "YCBReachToGraspEnv",
     "default_ycb_dir",
     "define_origins",

@@ -20,9 +20,14 @@ from typing import TYPE_CHECKING, Tuple
 
 import numpy as np
 
+from environments.utils.camera.front import DEFAULT_FRONT_CAMERA, FrontCameraConfig
+from environments.utils.camera.topdown import DEFAULT_TOP_DOWN_CAMERA, TopDownCameraConfig
+from environments.utils.camera.wrist import DEFAULT_WRIST_CAMERA, WristCameraConfig
+
 if TYPE_CHECKING:  # only for typing -- importing these at module import time
     # would pull in heavy Omni/USD modules before AppLauncher has run.
     from isaaclab.assets import Articulation
+    from isaaclab.sensors import Camera
     from isaaclab.sim import SimulationContext
 
     from environments.utils.object_loader import ObjectLoader, ObjectLoaderConfig
@@ -95,22 +100,16 @@ class CameraConfig:
     target: Tuple[float, float, float] = (0.0, 0.0, 0.5)
 
 
-@dataclass
-class TopDownCameraConfig:
-    """Optional overhead camera prim, used by VLA / data-collection profiles."""
-
-    prim_path: str = "/World/Origin1/TopDownCamera"
-    position: Tuple[float, float, float] = (0.4, 0.0, 4.0)
-    target: Tuple[float, float, float] = (0.4, 0.0, 0.8)
-    resolution: Tuple[int, int] = (640, 640)
-    fov: float = 65.0
-
+# TopDownCameraConfig/FrontCameraConfig/WristCameraConfig now live in
+# environments.utils.camera.{topdown,front,wrist} (one config per camera,
+# fully self-contained); imported above and re-exported here so existing
+# ``from environments.base import TopDownCameraConfig`` call sites keep
+# working unchanged.
 
 # Default singletons. Concrete env packages re-export these as module-level
 # constants for convenience (``environments.ycb_reach_to_grasp.DEFAULT_SCENE``).
 DEFAULT_SCENE = SceneConfig()
 DEFAULT_CAMERA = CameraConfig()
-DEFAULT_TOP_DOWN_CAMERA = TopDownCameraConfig()
 
 
 def define_origins(num_origins: int, spacing: float) -> list[list[float]]:
@@ -204,6 +203,8 @@ class BaseSceneEnv:
         scene_cfg: SceneConfig | None = None,
         camera_cfg: CameraConfig | None = None,
         top_down_camera_cfg: TopDownCameraConfig | None = None,
+        front_camera_cfg: FrontCameraConfig | None = None,
+        wrist_camera_cfg: WristCameraConfig | None = None,
         physics_cfg: "PhysicsConfig | None" = None,
         device: str | None = None,
     ) -> None:
@@ -214,6 +215,8 @@ class BaseSceneEnv:
         self.top_down_camera_cfg: TopDownCameraConfig = (
             top_down_camera_cfg or TopDownCameraConfig()
         )
+        self.front_camera_cfg: FrontCameraConfig = front_camera_cfg or FrontCameraConfig()
+        self.wrist_camera_cfg: WristCameraConfig = wrist_camera_cfg or WristCameraConfig()
         self.physics_cfg: PhysicsConfig = (
             physics_cfg if physics_cfg is not None else PhysicsConfig()
         )
@@ -224,6 +227,11 @@ class BaseSceneEnv:
         self.sim: "SimulationContext | None" = None
         self.scene_entities: dict | None = None
         self.scene_origins: list[list[float]] | None = None
+
+        # Populated on demand by build_*_camera_sensor(); None until called.
+        self.top_down_camera_sensor: "Camera | None" = None
+        self.front_camera_sensor: "Camera | None" = None
+        self.wrist_camera_sensor: "Camera | None" = None
 
     # ------------------------------------------------------------------
     # Scene + simulation construction
@@ -255,6 +263,40 @@ class BaseSceneEnv:
         from environments.utils.camera import create_topdown_camera
 
         create_topdown_camera(self.top_down_camera_cfg)
+
+    def attach_front_camera(self) -> None:
+        """Spawn the front-angled camera prim defined by ``front_camera_cfg``
+        (mirrors ``attach_top_down_camera``)."""
+        from environments.utils.camera import create_front_camera
+
+        create_front_camera(self.front_camera_cfg)
+
+    def build_top_down_camera_sensor(self) -> "Camera":
+        """Build (and cache) a ready-to-capture IsaacLab ``Camera`` sensor for
+        the top-down view. Safe to call even if ``attach_top_down_camera()``
+        hasn't run yet -- it creates the raw prim on demand."""
+        from environments.utils.camera import build_topdown_camera_sensor
+
+        self.top_down_camera_sensor = build_topdown_camera_sensor(self.top_down_camera_cfg)
+        return self.top_down_camera_sensor
+
+    def build_front_camera_sensor(self) -> "Camera":
+        """Build (and cache) a ready-to-capture IsaacLab ``Camera`` sensor for
+        the front view. Safe to call even if ``attach_front_camera()`` hasn't
+        run yet -- it creates the raw prim on demand."""
+        from environments.utils.camera import build_front_camera_sensor
+
+        self.front_camera_sensor = build_front_camera_sensor(self.front_camera_cfg)
+        return self.front_camera_sensor
+
+    def build_wrist_camera_sensor(self) -> "Camera":
+        """Build (and cache) a ready-to-capture IsaacLab ``Camera`` sensor for
+        the wrist/eye-in-hand view. Requires ``design_scene()`` to have run
+        already (needs ``self.robot``)."""
+        from environments.utils.camera import build_wrist_camera_sensor
+
+        self.wrist_camera_sensor = build_wrist_camera_sensor(self.robot, self.wrist_camera_cfg)
+        return self.wrist_camera_sensor
 
     @property
     def robot(self) -> "Articulation":

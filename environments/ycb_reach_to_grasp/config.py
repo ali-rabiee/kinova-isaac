@@ -10,6 +10,8 @@ from environments.base import (
     TopDownCameraConfig,
     default_jaco2_home_pose,
 )
+from environments.utils.camera.front import FrontCameraConfig
+from environments.utils.camera.wrist import WristCameraConfig
 
 
 DEFAULT_SCENE: SceneConfig = SceneConfig(
@@ -17,6 +19,9 @@ DEFAULT_SCENE: SceneConfig = SceneConfig(
 )
 DEFAULT_CAMERA: CameraConfig = CameraConfig()
 DEFAULT_TOP_DOWN_CAMERA: TopDownCameraConfig = TopDownCameraConfig()
+# Placeholder geometry -- not yet visually confirmed, see scripts/debug_cameras.py.
+DEFAULT_FRONT_CAMERA: FrontCameraConfig = FrontCameraConfig()
+DEFAULT_WRIST_CAMERA: WristCameraConfig = WristCameraConfig()
 
 
 def default_ycb_dir() -> str:
@@ -36,5 +41,7 @@ __all__ = [
     "DEFAULT_SCENE",
     "DEFAULT_CAMERA",
     "DEFAULT_TOP_DOWN_CAMERA",
+    "DEFAULT_FRONT_CAMERA",
+    "DEFAULT_WRIST_CAMERA",
     "default_ycb_dir",
 ]
