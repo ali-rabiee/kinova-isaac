@@ -381,6 +381,12 @@ def run(args: argparse.Namespace) -> int:
     from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
     from controllers import CartesianVelocityJogConfig, CartesianVelocityJogController
+    from environments.utils.camera import (
+        DEFAULT_FRONT_CAMERA,
+        DEFAULT_WRIST_CAMERA,
+        build_camera,
+        sync_wrist_camera_to_ee,
+    )
     from environments.utils.object_loader import ObjectLoader, ObjectLoaderConfig, SpawnBounds
     from environments.utils.physix import object_loader_kwargs_from_physix
     from environments.ycb_reach_to_grasp import (
@@ -1168,6 +1174,91 @@ def run(args: argparse.Namespace) -> int:
             print(f"[VLA_V1] ERROR: Failed to create Camera object: {create_err}")
             camera_sensor = None
 
+    # ---- VLA observation cameras -------------------------------------------
+    # front (fixed third-person) + wrist (eye-in-hand). Built here, alongside
+    # the top-down camera, because every camera must exist before sim.reset().
+    vla_cameras: dict = {}
+    if camera_sensor is not None:
+        vla_cameras["top_down"] = camera_sensor
+    if enable_cameras:
+        for _cam_name, _cam_cfg in (("front", DEFAULT_FRONT_CAMERA), ("wrist", DEFAULT_WRIST_CAMERA)):
+            try:
+                vla_cameras[_cam_name] = build_camera(_cam_name, robot=robot, cfg=_cam_cfg)
+                print(f"[VLA_V1] {_cam_name} camera created")
+            except Exception as _cam_err:
+                print(f"[VLA_V1] ERROR: {_cam_name} camera creation failed: {_cam_err}")
+
+    _wrist_sync_failed = {"warned": False}
+
+    def _sync_wrist_camera() -> None:
+        """Pin the wrist camera to the EE link. MUST run before each render:
+        the camera prim is unparented (Isaac does not propagate articulation
+        motion down the USD hierarchy), so without this it silently stays
+        frozen in world space and every wrist frame is wrong."""
+        w = vla_cameras.get("wrist")
+        if w is None:
+            return
+        try:
+            sync_wrist_camera_to_ee(robot, w, DEFAULT_WRIST_CAMERA)
+        except Exception as _e:
+            if not _wrist_sync_failed["warned"]:
+                print(f"[VLA_V1] ERROR: wrist camera sync failed ({_e}); wrist frames will be STATIC")
+                _wrist_sync_failed["warned"] = True
+
+    def _update_vla_cameras(dt_: float) -> None:
+        for _s in vla_cameras.values():
+            if _s is None:
+                continue
+            try:
+                if hasattr(_s, "update"):
+                    _s.update(dt_)
+            except Exception:
+                pass
+
+    def _capture_all_cameras(images_root, tick_idx: int) -> dict:
+        """Save one PNG per active camera under images_root/<cam>/ and return
+        {camera name: path relative to the episode root} for the tick log."""
+        fmt = str(getattr(args, "image_format", "png"))
+        out: dict = {}
+        for cam_name, sensor in vla_cameras.items():
+            if sensor is None:
+                continue
+            try:
+                cam_data = sensor.data
+                rgb_data = cam_data.output.get("rgb") if cam_data.output is not None else None
+                if rgb_data is None:
+                    continue
+                if len(rgb_data.shape) == 4:
+                    rgb_np = rgb_data[0].cpu().numpy()
+                elif len(rgb_data.shape) == 3:
+                    rgb_np = rgb_data.cpu().numpy()
+                else:
+                    continue
+                rgb_np = rgb_np[..., :3]
+                rgb_np = (rgb_np * 255).astype(np.uint8) if rgb_np.max() <= 1.0 else rgb_np.astype(np.uint8)
+
+                cam_dir = images_root / cam_name
+                cam_dir.mkdir(parents=True, exist_ok=True)
+                fname = f"image_{tick_idx:06d}.{fmt}"
+                out_path = cam_dir / fname
+                try:
+                    from PIL import Image
+
+                    Image.fromarray(rgb_np).save(str(out_path))
+                except Exception:
+                    try:
+                        import cv2
+
+                        cv2.imwrite(str(out_path), rgb_np[..., ::-1])
+                    except Exception:
+                        out_path = out_path.with_suffix(".npy")
+                        np.save(str(out_path), rgb_np)
+                        fname = out_path.name
+                out[cam_name] = f"images/{cam_name}/{fname}"
+            except Exception:
+                continue
+        return out
+
     # Reset sim and robot
     def _reset_sim_and_robot() -> None:
         sim.reset()
@@ -1188,6 +1279,21 @@ def run(args: argparse.Namespace) -> int:
         except Exception as e:
             print(f"[VLA_V1] ERROR: Camera sensor reset failed post sim.reset: {e}")
             camera_sensor = None
+            vla_cameras.pop("top_down", None)
+
+    # Reset the front/wrist sensors too, and pin the wrist camera once so its
+    # very first frame is already in the right place.
+    for _cam_name in ("front", "wrist"):
+        _s = vla_cameras.get(_cam_name)
+        if _s is None:
+            continue
+        try:
+            _s.reset()
+            print(f"[VLA_V1] {_cam_name} camera reset OK (post sim.reset)")
+        except Exception as e:
+            print(f"[VLA_V1] ERROR: {_cam_name} camera reset failed: {e}")
+            vla_cameras.pop(_cam_name, None)
+    _sync_wrist_camera()
 
     # Apply domain randomization once for non-episode runs (keyboard/idle). Planner mode applies per episode.
     # This is done after sim.reset so camera/light prims exist and are stable.
@@ -1428,17 +1534,15 @@ def run(args: argparse.Namespace) -> int:
             # - Always render on tick boundaries (camera/logging), otherwise render at render_rate_hz.
             do_tick = (accum + dt + 1e-9) >= period
             do_render = bool(do_tick) or (steps % render_stride == 0)
+            if do_render:
+                _sync_wrist_camera()  # before the render, or the frame is stale
             sim.step(render=bool(do_render))
             robot.update(dt)
 
-            if camera_sensor is not None:
-                try:
-                    if hasattr(camera_sensor, "update"):
-                        # Only update camera when we render (otherwise the render product may not advance).
-                        if bool(do_render):
-                            camera_sensor.update(dt)
-                except Exception:
-                    pass
+            # Only update cameras when we render (otherwise the render product
+            # may not have advanced).
+            if bool(do_render):
+                _update_vla_cameras(dt)
 
             accum += dt
             if accum + 1e-9 >= period:
@@ -1462,49 +1566,9 @@ def run(args: argparse.Namespace) -> int:
                 except Exception:
                     pass
 
-                image_path = None
-                if camera_sensor is not None:
-                    try:
-                        cam_data = camera_sensor.data
-                        rgb_data = None
-                        if cam_data.output is not None:
-                            rgb_data = cam_data.output.get("rgb")
-                        if rgb_data is not None:
-                            if len(rgb_data.shape) == 4:
-                                rgb_np = rgb_data[0].cpu().numpy()
-                            elif len(rgb_data.shape) == 3:
-                                rgb_np = rgb_data.cpu().numpy()
-                            else:
-                                raise ValueError(f"Unexpected RGB data shape: {rgb_data.shape}")
-
-                            if rgb_np.max() <= 1.0:
-                                rgb_np = (rgb_np * 255).astype(np.uint8)
-                            else:
-                                rgb_np = rgb_np.astype(np.uint8)
-
-                            image_filename = f"image_{session_logger.tick_idx:06d}.{image_format}"
-                            out_path = images_dir / image_filename
-                            try:
-                                from PIL import Image
-
-                                Image.fromarray(rgb_np).save(str(out_path))
-                            except Exception:
-                                try:
-                                    import cv2
-
-                                    if len(rgb_np.shape) == 3 and rgb_np.shape[2] == 3:
-                                        rgb_np_bgr = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR)
-                                        cv2.imwrite(str(out_path), rgb_np_bgr)
-                                    else:
-                                        cv2.imwrite(str(out_path), rgb_np)
-                                except Exception:
-                                    np.save(str(out_path).replace(f".{image_format}", ".npy"), rgb_np)
-                                    out_path = out_path.with_suffix(".npy")
-
-                            image_path = f"images/{image_filename}"
-                            images_captured += 1
-                    except Exception:
-                        image_path = None
+                image_paths = _capture_all_cameras(images_dir, session_logger.tick_idx)
+                if image_paths:
+                    images_captured += 1
 
                 session_logger.write_tick(
                     robot=robot,
@@ -1512,7 +1576,7 @@ def run(args: argparse.Namespace) -> int:
                     objects=objs_raw,
                     last_user_cmd=mux_input.last_cmd,
                     cfg=tick_cfg,
-                    image_path=image_path,
+                    image_paths=image_paths,
                 )
     else:
         # Planner mode runs episode loops (reset + respawn) and ends each episode after lift.
@@ -2490,16 +2554,13 @@ def run(args: argparse.Namespace) -> int:
 
                     do_tick = (accum + dt + 1e-9) >= period
                     do_render = bool(do_tick) or (steps % render_stride == 0)
+                    if do_render:
+                        _sync_wrist_camera()  # before the render, or the frame is stale
                     sim.step(render=bool(do_render))
                     robot.update(dt)
 
-                    if camera_sensor is not None:
-                        try:
-                            if hasattr(camera_sensor, "update"):
-                                if bool(do_render):
-                                    camera_sensor.update(dt)
-                        except Exception:
-                            pass
+                    if bool(do_render):
+                        _update_vla_cameras(dt)
 
                     accum += dt
                     if accum + 1e-9 >= period:
@@ -2524,49 +2585,9 @@ def run(args: argparse.Namespace) -> int:
                         except Exception:
                             pass
 
-                        image_path = None
-                        if camera_sensor is not None:
-                            try:
-                                cam_data = camera_sensor.data
-                                rgb_data = None
-                                if cam_data.output is not None:
-                                    rgb_data = cam_data.output.get("rgb")
-                                if rgb_data is not None:
-                                    if len(rgb_data.shape) == 4:
-                                        rgb_np = rgb_data[0].cpu().numpy()
-                                    elif len(rgb_data.shape) == 3:
-                                        rgb_np = rgb_data.cpu().numpy()
-                                    else:
-                                        raise ValueError(f"Unexpected RGB data shape: {rgb_data.shape}")
-
-                                    if rgb_np.max() <= 1.0:
-                                        rgb_np = (rgb_np * 255).astype(np.uint8)
-                                    else:
-                                        rgb_np = rgb_np.astype(np.uint8)
-
-                                    image_filename = f"image_{session_logger.tick_idx:06d}.{image_format}"
-                                    out_path = images_dir / image_filename
-                                    try:
-                                        from PIL import Image
-
-                                        Image.fromarray(rgb_np).save(str(out_path))
-                                    except Exception:
-                                        try:
-                                            import cv2
-
-                                            if len(rgb_np.shape) == 3 and rgb_np.shape[2] == 3:
-                                                rgb_np_bgr = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR)
-                                                cv2.imwrite(str(out_path), rgb_np_bgr)
-                                            else:
-                                                cv2.imwrite(str(out_path), rgb_np)
-                                        except Exception:
-                                            np.save(str(out_path).replace(f".{image_format}", ".npy"), rgb_np)
-                                            out_path = out_path.with_suffix(".npy")
-
-                                    image_path = f"images/{image_filename}"
-                                    images_captured_episode += 1
-                            except Exception:
-                                image_path = None
+                        image_paths = _capture_all_cameras(images_dir, session_logger.tick_idx)
+                        if image_paths:
+                            images_captured_episode += 1
 
                         session_logger.write_tick(
                             robot=robot,
@@ -2574,7 +2595,7 @@ def run(args: argparse.Namespace) -> int:
                             objects=objs_raw,
                             last_user_cmd=mux_input.last_cmd,
                             cfg=tick_cfg,
-                            image_path=image_path,
+                            image_paths=image_paths,
                         )
                 # If we hit the max steps, still end the episode cleanly.
                 if str(vla_planner_state.get("stage", "")) != "done":

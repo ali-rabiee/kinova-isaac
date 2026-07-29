@@ -142,7 +142,7 @@ class SessionLogWriter:
         objects: List[Dict[str, Any]],
         last_user_cmd: Optional[torch.Tensor],
         cfg: TickLoggingConfig,
-        image_path: Optional[str] = None,
+        image_paths: Optional[Dict[str, str]] = None,
     ) -> None:
         now_ms = int(time.time() * 1000)
         self._resolve_robot_indices(robot, cfg.ee_link_name, cfg.arm_joint_regex)
@@ -415,9 +415,13 @@ class SessionLogWriter:
             "recency": rec,
         }
         
-        # Add image path if provided
-        if image_path is not None:
-            record["image"] = {"path": image_path}
+        # Add image paths if provided, keyed by camera name, e.g.
+        #   {"front": {"path": "images/front/image_000123.png"},
+        #    "wrist": {"path": "images/wrist/image_000123.png"}}
+        # (replaces the old single-camera record["image"]; nothing read that
+        # field -- the zarr converter globs the images/ tree off disk.)
+        if image_paths:
+            record["images"] = {k: {"path": v} for k, v in image_paths.items()}
 
         self.ticks_f.write(json.dumps(_format_numbers(record, ndigits=4)) + "\n")
         self.tick_idx += 1

@@ -567,7 +567,8 @@ def run(args: argparse.Namespace) -> int:
                 objects=objs_raw,
                 last_user_cmd=mux_input.last_cmd,
                 cfg=tick_cfg,
-                image_path=image_path,  # Pass image path to logger
+                # v0 is single-camera; the logger now takes a {camera: path} map
+                image_paths=({"top_down": image_path} if image_path else None),
             )
             
             # Print progress every 5 seconds
