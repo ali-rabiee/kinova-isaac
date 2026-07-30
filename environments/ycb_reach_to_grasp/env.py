@@ -10,6 +10,8 @@ from environments.base import (
     SceneConfig,
     TopDownCameraConfig,
 )
+from environments.utils.camera.front import FrontCameraConfig
+from environments.utils.camera.wrist import WristCameraConfig
 from environments.utils.object_loader import (
     ObjectLoaderConfig,
     SpawnBounds,
@@ -21,8 +23,10 @@ from environments.utils.physix import (
 
 from .config import (
     DEFAULT_CAMERA,
+    DEFAULT_FRONT_CAMERA,
     DEFAULT_SCENE,
     DEFAULT_TOP_DOWN_CAMERA,
+    DEFAULT_WRIST_CAMERA,
     default_ycb_dir,
 )
 
@@ -50,6 +54,8 @@ class YCBReachToGraspEnv(BaseSceneEnv):
         scene_cfg: SceneConfig | None = None,
         camera_cfg: CameraConfig | None = None,
         top_down_camera_cfg: TopDownCameraConfig | None = None,
+        front_camera_cfg: FrontCameraConfig | None = None,
+        wrist_camera_cfg: WristCameraConfig | None = None,
         physics_cfg: PhysicsConfig | None = None,
         device: str | None = None,
         ycb_dir: str | None = None,
@@ -60,6 +66,8 @@ class YCBReachToGraspEnv(BaseSceneEnv):
             scene_cfg=scene_cfg or DEFAULT_SCENE,
             camera_cfg=camera_cfg or DEFAULT_CAMERA,
             top_down_camera_cfg=top_down_camera_cfg or DEFAULT_TOP_DOWN_CAMERA,
+            front_camera_cfg=front_camera_cfg or DEFAULT_FRONT_CAMERA,
+            wrist_camera_cfg=wrist_camera_cfg or DEFAULT_WRIST_CAMERA,
             physics_cfg=physics_cfg,
             device=device,
         )
