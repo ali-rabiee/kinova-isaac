@@ -1,0 +1,130 @@
+# Phase 0 (HRI 2027) — the contract and protocol for the REAL study.
+#
+#   Reference: vla_lab/rehab.md  (§9 the contract, §7 the protocol, §12 open decisions)
+#   Entry point: ./vla_lab/scripts/rehab_session.sh
+#
+# Anything under `contract:` is HASHED. Two participants whose contract hashes differ are NOT
+# poolable, and vla_lab/rehab/verify_session.py enforces that. Change these values between
+# participants only if you intend to start a new pool.
+#
+# CLAIM BOUNDARY (rehab.md §1.6, and it belongs in the paper verbatim): Phase 0 is a
+# healthy-adult physical-HRI measurement and scheduling result. It is NOT evidence of stroke
+# nonuse, rehabilitation efficacy, clinical construct validity, or recovery. "Nonpreferred arm"
+# is a handedness-defined label, not a paretic limb.
+
+contract:
+  robot: kinova_gen2_j2n6s300
+  online_observer: vision        # "keyed" is the pre-registered fallback if the pilot misses kappa >= 0.9 (W8)
+  camera_set: [front, wrist]
+
+  # --- target geometry (W1) ------------------------------------------------
+  # The estimand's information lives in the crossover band near the midline, so the grid is
+  # densified there. Every target must be reachable by BOTH arms without trunk displacement
+  # (trunk compensation shifts the effective midline and would confound arm choice).
+  workspace:
+    lateral_extent_m: 0.34
+    n_lateral: 9
+    crossover_center_m: 0.0
+    crossover_halfwidth_m: 0.12
+    densification: 1.8          # >1 concentrates targets in the crossover band
+    min_spacing_m: 0.05         # below a puck's width two targets are one target
+    depths_m: [0.28, 0.38]
+    shoulder_halfwidth_m: 0.19  # half biacromial width; re-measure per participant if it differs
+    shoulder_forward_m: 0.0
+    human_max_reach_m: 0.65
+    human_min_reach_m: 0.18
+    table_height_m: 0.75
+    robot_reach_min_m: 0.20
+    robot_reach_max_m: 0.70
+
+  # Robot base pose in the participant frame: across the table, facing the participant.
+  robot_base_in_participant:
+    tx: 0.75
+    ty: 0.0
+    tz: 0.0
+    yaw_rad: 3.141592653589793
+
+  # --- trial timing (W2, §9) -----------------------------------------------
+  # The carryover model is a function of ELAPSED TIME, so these are contractual, not cosmetic.
+  timing:
+    present_timeout_ms: 8000
+    settle_dwell_ms: 700        # the arm must hold tolerance this long before GO is issued
+    go_window_ms: 4000
+    reach_timeout_ms: 5000
+    return_ms: 1200
+    inter_trial_ms: 1500
+    wait_dwell_ms: 6000         # one WAIT slot: the cost of waiting, in wall-clock
+    settle_tolerance_m: 0.01
+
+  # --- the matched interaction budget (§1.3) -------------------------------
+  # T and C are IDENTICAL across every compared condition, by construction: the protocol fixes
+  # the slot layout and the scheduler only chooses ASSESS vs WAIT on the non-COACH slots.
+  # Re-derive these from the power memo (W16) before the first non-pilot participant.
+  budget:
+    trials_per_block: 40        # T
+    coach_per_block: 8          # C
+    reference_trials: 30        # the no-prompt reference block (defines tilde-pi*)
+    retest_trials: 30           # the terminal no-prompt retest block
+    inter_block_washout_ms: 120000
+
+  # --- COACH content (W9) ---------------------------------------------------
+  # Content-hashed. Changing any wording, asset, or effort level changes the hash and un-pools
+  # the session from everything recorded before it.
+  prompts:
+    coach_effort_level: moderate    # §12.7: a bare verbal cue may be too weak in healthy adults
+    effort_delta_logit_source: prior  # set to "pilot:<session>" once M4 measures it
+    coach:
+      prompt_id: coach_v1
+      kind: coach
+      text: "Please use your {nonpreferred_arm_word} hand for this one."
+      audio_asset: "tts:piper/en_US-lessac-medium@1.2.0"
+    neutral:
+      prompt_id: neutral_v1
+      kind: neutral
+      text: "Take a moment. The next target is coming up."
+      audio_asset: "tts:piper/en_US-lessac-medium@1.2.0"
+    go:
+      prompt_id: go_v1
+      kind: go
+      text: "Go."
+      audio_asset: "tone:1000hz_120ms"
+
+protocol:
+  # §12.6 hybrid: run the reference block, the proposed policy, and the STRONGEST baseline
+  # prospectively; evaluate the rest off-policy as a clearly-labelled secondary analysis.
+  # "Strongest" must be chosen from the synthetic study (W6) and fixed in the preregistration —
+  # fixed_washout is the placeholder until then.
+  prospective_conditions: [carryover_aware, fixed_washout]
+  n_participants: 24            # replace with the power memo's N (W16)
+  seed: 20260816
+  # Population carryover parameters. PRIORS until the M4 pilot measures them; they set B2's
+  # washout constant, so the pilot must update them and population_source must say so.
+  population_lambda: 0.72
+  population_beta: 1.0
+  population_g: 0.8
+  population_source: prior
+  instruments: [edinburgh_handedness, nasa_tlx, session_burden]
+  notes: "Phase 0 confirmatory protocol. Preregister before the first non-pilot participant."
+
+# Carryover model (§12.3). Fit BOTH parameterizations on the pilot and preregister whichever
+# the pilot supports; report the comparison as a secondary result.
+carryover:
+  decay_mode: time              # time | trials
+  time_unit_s: 10.0
+  n_lambda: 12
+  n_beta: 11
+  n_g: 9
+
+safety:
+  # Well below the JACO 2 defaults: a human's hands are inside the workspace (W12).
+  max_cartesian_speed_ms: 0.12
+  max_cartesian_accel_ms2: 0.25
+  max_joint_current_a: 2.5
+  max_motion_ms: 9000
+  body_clearance_m: 0.30
+
+session:
+  log_root: logs/rehab
+  observer: both                # vision + keyed; keyed is ALWAYS running (W8)
+  apparatus: real               # null | twin | real
+  gen2_socket: /tmp/kinova_gen2_bridge.sock

@@ -15,6 +15,7 @@ from typing import List
 from vla_lab.tests import run_namespace
 
 MODULES: List[str] = [
+    # --- VLA / act-compute-query track ---------------------------------------
     "test_allocation",
     "test_calibration",
     "test_human_study",
@@ -25,6 +26,22 @@ MODULES: List[str] = [
     "test_feedback",
     "test_intent",
     "test_multicam",
+    # --- rehab Phase 0 track (2026-08 pivot; see vla_lab/rehab.md §3, §6) -----
+    # One test gate covers the whole repository, so ./vla_lab/scripts/run_tests.sh
+    # still answers "is anything broken?" for both tracks at once.
+    "test_rehab_workspace",
+    "test_rehab_carryover",
+    "test_rehab_estimand",
+    "test_rehab_scheduler",
+    "test_rehab_sim_participant",
+    "test_rehab_protocol",
+    "test_rehab_safety",
+    "test_rehab_logging",
+    # rehab.md §4 lists the eight modules above; these two cover W8's offline
+    # "done when" (agreement machinery on fixtures) and W15's ("each failure
+    # mode has a fixture that triggers it, and a passing session that does not").
+    "test_rehab_observation",
+    "test_rehab_session",
 ]
 
 

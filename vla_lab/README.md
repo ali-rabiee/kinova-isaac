@@ -1,5 +1,28 @@
 # `vla_lab/` — VLA training & evaluation for the Kinova Jaco in Isaac Sim
 
+## Two tracks
+
+Since the **2026-08 rehabilitation pivot**, this package holds two parallel research tracks.
+They share utilities and one test gate, and are otherwise independent:
+
+| | **VLA / act–compute–query** (this README) | **rehab Phase 0** ([`rehab.md`](./rehab.md)) |
+| --- | --- | --- |
+| Question | When a stochastic VLA is uncertain, should it compute more or ask a human? | Can a carryover-aware COACH/WAIT/ASSESS policy estimate a person's unprompted arm-choice map better than naive assessment schedules? |
+| Who acts | The **robot** (reach → grasp → lift) | The **human** (reaches to a presented target with one arm) |
+| Robot's job | Execute a policy | **Present** targets, **prompt**, **observe**, **schedule** |
+| Platform | Isaac Sim (real robot = stubs) | **Real Kinova Gen2**, Isaac retained as a digital twin |
+| Code | everything below | `vla_lab/rehab/`, `environments/bilateral_choice/` |
+| Entry point | `collect_v4.sh` → `train.sh` → `eval.sh` | `rehab_pilot.sh` → `rehab_session.sh` → `rehab_verify.sh` → `rehab_analyze.sh` |
+| Status | **kept and maintained**; not deleted or rewritten by the pivot | carries the HRI 2027 submission |
+
+**Phase 0 is where the paper is.** If that is what you are here for, read
+[`rehab.md`](./rehab.md) and [`rehab/README.md`](./rehab/README.md) instead of this file, and
+start with `./vla_lab/scripts/rehab_pilot.sh` — a full synthetic study, no robot, seconds.
+Nothing in the VLA track imports from `vla_lab/rehab/`, and the pivot changed no VLA
+behaviour: the coexistence rules are in [`rehab.md`](./rehab.md) §3.
+
+---
+
 This package contains everything needed to go from **scripted demonstrations** in Isaac Sim
 to a **language-conditioned visuomotor policy** (VLA) and back into the simulator for
 closed-loop evaluation — plus the HRI-2027 *act / compute / query* allocation experiments
@@ -63,10 +86,28 @@ Only collection and eval start the simulator.
 ```
 vla_lab/
 ├── README.md                    <- you are here
+├── rehab.md                     <- THE rehab Phase 0 specification (the other track)  ★
 ├── data_collection_guide.md     <- THE data-collection reference (pipeline, contract, fixes)
 ├── docs/                        <- historical reports (eval-flailing postmortem, design notes)
 │
+├── rehab/                       <- ★ rehab Phase 0: everything for the arm-choice study
+│   ├── README.md                <-   quick start (run order, one screen)
+│   ├── workspace.py contract.py <-   bilateral target geometry; the hashed Phase 0 contract
+│   ├── carryover.py estimand.py <-   the latent carryover model; pi*(l) estimators + metrics
+│   ├── scheduler/               <-   B0-B4 + B4's two ablations (COACH / WAIT / ASSESS)
+│   ├── apparatus/               <-   null / Isaac twin / real Kinova Gen2 backends
+│   ├── observation/             <-   arm-choice observers, agreement, physical calibration
+│   ├── protocol.py session.py   <-   blocks + counterbalancing; the one session runner
+│   ├── safety.py                <-   human-proximate interlocks (motion/reach exclusion)
+│   ├── verify_session.py        <-   the Phase 0 session gate  ★ run after every session
+│   ├── sim_participant.py       <-   generative participant (makes it all testable offline)
+│   └── power.py analyze.py      <-   Monte-Carlo power memo; outcomes + every paper figure
+│
 ├── scripts/                     <- entrypoints (each wraps one command; env-var overridable)
+│   ├── rehab_pilot.sh           <- ★ synthetic Phase 0 study, no robot, seconds
+│   ├── rehab_session.sh         <- ★ one real participant session
+│   ├── rehab_verify.sh          <- ★ the Phase 0 session gate
+│   ├── rehab_analyze.sh / rehab_power.sh / rehab_twin_dryrun.sh / rehab_calibrate.sh
 │   ├── collect_v3.sh            <- data collection: reach/grasp/lift, 15 Hz, DR  ★
 │   ├── collect_v4.sh            <- collect_v3 + calibrated WRIST camera          ★ (new data)
 │   ├── train.sh                 <- TinyVLA training                              ★
@@ -105,7 +146,8 @@ vla_lab/
 ├── real_robot/                  <- Kinova bridge + safety envelope stubs for sim→real
 ├── tests/                       <- offline test suite (run_tests.sh)
 ├── configs/                     <- train_tiny.yaml, train_multicam.yaml (wrist+overhead),
-│                                   eval_isaac.yaml, train_smolvla.example.yaml, eval_real.yaml
+│                                   eval_isaac.yaml, train_smolvla.example.yaml, eval_real.yaml,
+│                                   rehab_phase0.yaml / rehab_sim_pilot.yaml / rehab_twin.yaml
 │
 ├── checkpoints/ datasets/       <- training outputs / LeRobot exports   (artifacts, gitignored)
 ├── eval_results/ results/       <- eval + experiment outputs            (artifacts)
@@ -396,7 +438,9 @@ variable of the study. Per-episode feedback/intent traces land in `results_*.jso
 
 | Document | Content |
 | --- | --- |
-| [`RECOMMENDATIONS.md`](./RECOMMENDATIONS.md) | 2026-07-05 project assessment: HRI-2027 fit/verdict, 13-week critical path, go/no-go gate, prioritized implementation list |
+| [`rehab.md`](./rehab.md) | **2026-08 pivot: the Phase 0 specification.** The estimand, the carryover mechanism, the COACH/WAIT/ASSESS conditions, work items W1–W18, the Phase 0 contract, the data model, safety/IRB, and the open design decisions. The entry point for the other track |
+| [`rehab/README.md`](./rehab/README.md) | Phase 0 quick start: run order, the five day-to-day commands, and what to read first |
+| [`RECOMMENDATIONS.md`](./RECOMMENDATIONS.md) | 2026-07-05 project assessment: HRI-2027 fit/verdict, 13-week critical path, go/no-go gate, prioritized implementation list. **Superseded as the roadmap by `rehab.md`; kept as the VLA-track record** |
 | [`data_collection_guide.md`](./data_collection_guide.md) | Pipeline anatomy, data/action contract, 2026-06-11 bug fixes, final-dataset procedure, troubleshooting |
 | [`fable_report.md`](./fable_report.md) | 2026-07 reframing report: wrist camera, intent/perception decomposition, feedback fusion — what was built, why, and the July-2026 literature map |
 | [`docs/EVAL_DEBUG_REPORT.md`](./docs/EVAL_DEBUG_REPORT.md) | Postmortem: why eval flailed and how every root cause was fixed |

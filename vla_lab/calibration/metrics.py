@@ -280,6 +280,63 @@ def coverage_vs_occlusion(
     }
 
 
+def coverage_vs_bucket(
+    scores: Sequence[float],
+    labels: Sequence[float],
+    bucket_values: Sequence[float],
+    *,
+    alpha: float = 0.1,
+    edges: Optional[Sequence[float]] = None,
+) -> Dict[str, object]:
+    """:func:`coverage_vs_occlusion` with the bucketing axis generalized to plain arrays.
+
+    Same split-conformal construction — calibrate an "act when confident" threshold on the
+    cleanest bucket, then report acceptance rate and selective accuracy as the covariate
+    shifts — but taking ``(scores, labels, bucket_values)`` directly instead of reading
+    occlusion off a :class:`CalibrationRecord`.
+
+    Added for the rehab Phase 0 track (``rehab.md`` §7), which buckets by **carryover level**
+    rather than occlusion: the question there is whether a confidence threshold calibrated on
+    clean (uncontaminated) trials still holds once a prompt's residue is present. Additive —
+    :func:`coverage_vs_occlusion` is unchanged and still what the VLA analysis calls.
+
+    ``labels`` may contain NaN for unlabeled rows; those rows still count toward the
+    acceptance rate and are skipped in the selective accuracy.
+    """
+
+    edges = list(edges) if edges is not None else [0.1, 0.2, 0.3, 0.4, 0.5]
+    sv = np.asarray(scores, dtype=np.float64)
+    ly = np.asarray(labels, dtype=np.float64)
+    bv = np.asarray(bucket_values, dtype=np.float64)
+    buckets = np.asarray([bucketize(float(b), edges) for b in bv], dtype=object)
+
+    uniq = sorted(set(buckets.tolist()))
+    target = 1.0 - float(alpha)
+    if not uniq:
+        return {"q_hat": float("inf"), "calib_bucket": None, "target": target,
+                "acceptance_rate": {}, "selective_accuracy": {}, "coverage": {}}
+    calib_bucket = uniq[0]
+    q_hat = conformal_quantile(sv[buckets == calib_bucket].tolist(), alpha)
+
+    selective_accuracy: Dict[str, float] = {}
+    acceptance_rate: Dict[str, float] = {}
+    for bucket in uniq:
+        m = buckets == bucket
+        accepted = m & (sv <= q_hat)
+        acceptance_rate[str(bucket)] = float(np.mean(sv[m] <= q_hat)) if m.sum() else float("nan")
+        lab = ly[accepted]
+        lab = lab[~np.isnan(lab)]
+        selective_accuracy[str(bucket)] = float(lab.mean()) if lab.size else float("nan")
+    return {
+        "q_hat": float(q_hat),
+        "calib_bucket": str(calib_bucket),
+        "target": target,
+        "acceptance_rate": acceptance_rate,
+        "selective_accuracy": selective_accuracy,
+        "coverage": selective_accuracy,
+    }
+
+
 def summary(
     records: Sequence[CalibrationRecord], *, scale: float = 0.1, alpha: float = 0.1, edges: Optional[Sequence[float]] = None, n_bins: int = 10
 ) -> Dict[str, object]:

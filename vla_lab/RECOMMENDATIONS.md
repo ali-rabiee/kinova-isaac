@@ -1,7 +1,22 @@
 # vla_lab — Project Recommendations & HRI 2027 Assessment
 
+> **2026-08-16 — superseded as the roadmap by the rehabilitation pivot.**
+> The HRI 2027 submission is now **Phase 0** of the post-stroke adaptive-robotics program:
+> healthy adults, a Kinova Gen2 as *apparatus and coach*, and a personalized carryover-aware
+> **COACH / WAIT / ASSESS** policy estimating each person's unprompted arm-choice map. See
+> **[`rehab.md`](./rehab.md)** for the specification and `vla_lab/rehab/` for the code.
+>
+> This document stays as the **VLA-track record**: its July assessment of the act/compute/query
+> work, its critical path, and its go/no-go analysis are still accurate *about that track*,
+> which remains in the repository and maintained. What changed is which track carries the
+> paper. Two things below are now historical rather than operative:
+> the 13-week critical path in §7 and the 2026-07-31 go/no-go in §1 — the Phase 0 milestones
+> in [`rehab.md`](./rehab.md) §13 replace them. The verdict that *"HRI full papers live or die
+> on the human study"* is exactly why the pivot happened, and it still holds.
+
 *Written 2026-07-05, after a full code review + cleanup pass of `vla_lab/` (see §8).
-Companion docs: [`fable_report.md`](./fable_report.md) (2026-07-04 reframing),
+Companion docs: [`rehab.md`](./rehab.md) (2026-08 pivot, Phase 0 spec),
+[`fable_report.md`](./fable_report.md) (2026-07-04 reframing),
 [`README.md`](./README.md), [`data_collection_guide.md`](./data_collection_guide.md).*
 
 ---

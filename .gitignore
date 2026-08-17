@@ -209,6 +209,15 @@ __marimo__/
 # Project logs
 /logs/
 
+# rehab Phase 0 — participant VIDEO is identifiable data (rehab.md §11).
+# `/logs/` above already covers everything under logs/, but these are listed explicitly so the
+# rule survives anyone loosening that line: media/ must NEVER be committed, while
+# trials.jsonl / events.jsonl / observers.jsonl (the coded labels, not the video) are the
+# shareable analysis artifacts. Video lives under the IRB-approved data-management plan.
+logs/rehab/**/media/
+logs/rehab_sim/**/media/
+**/session_*/media/
+
 # vla_lab — checkpoints, exported datasets, eval JSON (large / regenerable)
 vla_lab/checkpoints/
 vla_lab/datasets/

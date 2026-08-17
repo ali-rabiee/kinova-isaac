@@ -1,0 +1,89 @@
+# Synthetic Phase 0 pilot — no robot, no participants, seconds per study.
+#
+#   ./vla_lab/scripts/rehab_pilot.sh
+#
+# Runs the REAL session code path (protocol, schedulers, observers, safety envelope, phase
+# machine, event-locked logging) with a generative participant behind the observer seam and the
+# null apparatus behind the apparatus seam. This is a rehearsal of the pipeline, not evidence
+# about people: every number it produces follows from the population prior below, which the M4
+# lab pilot is supposed to replace.
+#
+# Differences from rehab_phase0.yaml, all deliberate:
+#   - every compared condition runs prospectively (a real session cannot afford this; §12.6)
+#   - a shorter budget, so a sweep finishes fast
+#   - the population prior is explicit and editable, because it is the thing being assumed
+
+contract:
+  robot: kinova_gen2_j2n6s300
+  online_observer: vision
+  camera_set: [front, wrist]
+
+  workspace:
+    lateral_extent_m: 0.34
+    n_lateral: 9
+    crossover_center_m: 0.0
+    crossover_halfwidth_m: 0.12
+    densification: 1.8
+    min_spacing_m: 0.05
+    depths_m: [0.28, 0.38]
+    human_max_reach_m: 0.65
+
+  timing:
+    settle_dwell_ms: 700
+    go_window_ms: 4000
+    reach_timeout_ms: 5000
+    return_ms: 1200
+    inter_trial_ms: 1500
+    wait_dwell_ms: 6000
+
+  budget:
+    trials_per_block: 40
+    coach_per_block: 8
+    reference_trials: 30
+    retest_trials: 30
+    inter_block_washout_ms: 120000
+
+  prompts:
+    coach_effort_level: moderate
+    effort_delta_logit_source: prior
+
+protocol:
+  prospective_conditions: [carryover_aware, fixed_washout]
+  n_participants: 12
+  seed: 20260816
+  population_lambda: 0.72
+  population_beta: 1.0
+  population_g: 0.8
+  population_source: prior
+  instruments: [edinburgh_handedness, nasa_tlx, session_burden]
+
+carryover:
+  decay_mode: time
+  time_unit_s: 10.0
+
+# The generative participant (W6). EVERY number here is an assumption to be replaced by the
+# M4 pilot's measurements before the power memo means anything.
+population_prior:
+  # the estimand
+  crossover_mean_m: 0.02        # crossover offset from the midline, toward the nonpreferred side
+  crossover_sd_m: 0.06          # between-person spread — the headline heterogeneity
+  steepness_mean: 12.0          # d logit(pi*) / d s, per metre
+  steepness_sd_log: 0.35
+  depth_coef_sd: 1.5
+  # carryover
+  lambda_a: 6.0                 # Beta(a, b) on the per-person decay
+  lambda_b: 2.5
+  beta_mean: 1.0
+  beta_sd: 0.3
+  g_mean: 0.8
+  g_sd: 0.25
+  # confounds the pipeline must survive
+  fatigue_mean: -0.4            # logit drift over a session (negative = back to the preferred arm)
+  fatigue_sd: 0.3
+  lapse_rate: 0.02
+  misdetect_rate: 0.03          # observer error — raise this to stress-test the scheduler (W8)
+
+session:
+  log_root: logs/rehab_sim
+  observer: simulated
+  apparatus: null
