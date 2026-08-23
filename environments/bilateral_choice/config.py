@@ -2,7 +2,7 @@
 
 Deliberately **Isaac-free at import time** (unlike
 ``environments/reach_to_grasp_VLA/config.py``, which imports ``isaaclab`` at module level):
-:mod:`vla_lab.rehab.apparatus.isaac_apparatus` names this package in a lazy import, and the
+:mod:`vla_lab.old_direction.rehab.apparatus.isaac_apparatus` names this package in a lazy import, and the
 Phase 0 test suite must stay runnable on a machine with no simulator. The USD asset paths are
 resolved in :mod:`environments.bilateral_choice.twin`, inside the functions that need them.
 

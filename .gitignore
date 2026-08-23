@@ -223,8 +223,14 @@ vla_lab/checkpoints/
 vla_lab/datasets/
 vla_lab/results/
 vla_lab/eval_results/
+vla_lab/old_demos/checkpoints/
+vla_lab/old_demos/datasets/
+vla_lab/old_demos/results/
+vla_lab/old_demos/eval_results/
+vla_lab/old_direction/results/
 # Draft paper (local; do not publish to GitHub)
 vla_lab/paper/
+vla_lab/old_direction/paper/
 
 # Claude local workspace (do not publish to GitHub)
 /claude/

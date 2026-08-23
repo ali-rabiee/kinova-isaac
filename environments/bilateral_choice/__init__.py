@@ -1,3 +1,9 @@
+"""Digital twin for the ARCHIVED arm-choice study (see vla_lab/old_direction/).
+
+Kept runnable, not maintained: the live direction uses
+``environments/supervisory_fetch/`` instead.
+"""
+
 """W10 — the Isaac Lab scene for the Phase 0 bilateral-choice apparatus (``rehab.md`` §8).
 
 Mirrors the structure of ``environments/reach_to_grasp_VLA/`` (config + scene + demo) but is

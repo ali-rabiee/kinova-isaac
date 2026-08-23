@@ -1,0 +1,84 @@
+# Isaac digital-twin dry-run for the Phase 0 apparatus (W10, milestone M2).
+#
+#   ./vla_lab/scripts/rehab_twin_dryrun.sh
+#
+# The twin's job is to fail early, before a person is near the arm: validate geometry,
+# reachability, presentation trajectories, settle behaviour, and the safety envelope
+# (rehab.md §6/W10). It uses the SAME contract, the SAME target IDs, and the SAME Apparatus
+# protocol as the real backend, so a dry-run exercises the session code path rather than a
+# parallel one.
+#
+# M2 passes when: 100% of contract targets reachable, zero trajectory intersections with the
+# participant proxy, and one wrist-camera render per target.
+#
+# The contract block MUST match rehab_phase0.yaml — a twin validated against different geometry
+# has validated nothing. Keep them in sync, or point both at the same file.
+
+contract:
+  robot: kinova_gen2_j2n6s300
+  online_observer: vision
+  camera_set: [front, wrist]
+
+  workspace:
+    lateral_extent_m: 0.34
+    n_lateral: 9
+    crossover_center_m: 0.0
+    crossover_halfwidth_m: 0.12
+    densification: 1.8
+    min_spacing_m: 0.05
+    depths_m: [0.28, 0.38]
+    shoulder_halfwidth_m: 0.19
+    human_max_reach_m: 0.65
+    human_min_reach_m: 0.18
+    table_height_m: 0.75
+    robot_reach_min_m: 0.20
+    robot_reach_max_m: 0.70
+
+  robot_base_in_participant:
+    tx: 0.75
+    ty: 0.0
+    tz: 0.0
+    yaw_rad: 3.141592653589793
+
+  timing:
+    present_timeout_ms: 8000
+    settle_dwell_ms: 700
+    settle_tolerance_m: 0.01
+
+  budget:
+    trials_per_block: 40
+    coach_per_block: 8
+    reference_trials: 30
+    retest_trials: 30
+
+# Seated-participant keep-out volume. Deliberately generous — the twin should reject a layout
+# that is merely *probably* fine.
+participant_proxy:
+  torso_radius_m: 0.22
+  torso_height_m: 0.75
+  # The participant-frame origin is the sternum PROJECTION (the front of the chest), so the
+  # torso cylinder is centred behind it by roughly its half-depth. Centring it on the origin
+  # would model the torso as bulging forward and would reject the near target row outright.
+  torso_center_offset_m: -0.13
+  reach_box_forward_m: 0.55
+  reach_box_halfwidth_m: 0.55
+  reach_box_height_m: 0.35
+  clearance_m: 0.10
+
+twin:
+  headless: true
+  render_wrist_views: true
+  out_dir: vla_lab/old_direction/results/rehab_phase0/twin
+  # The Phase 0 wrist mount is RE-AIMED relative to the VLA data-collection mount, which points
+  # along the grasp-approach axis. Whether this framing actually catches a participant's hand
+  # arriving is exactly what the per-target renders are for (W11, §14 risk row).
+  wrist_camera:
+    offset_pos: [0.0, -0.04, -0.06]
+    offset_rpy_deg: [145.0, 0.0, 0.0]
+    fov: 87.0
+    resolution: [640, 480]
+  front_camera:
+    position: [1.05, 0.0, 1.55]
+    target: [0.30, 0.0, 0.80]
+    fov: 78.0
+    resolution: [960, 540]

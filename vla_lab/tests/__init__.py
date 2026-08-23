@@ -17,6 +17,22 @@ import traceback
 from typing import Dict
 
 
+def approx(a: float, b: float, *, tol: float = 1e-6) -> bool:
+    """Scalar closeness, for assertions that read as prose."""
+    return abs(float(a) - float(b)) <= float(tol)
+
+
+def assert_raises(exc_type, fn) -> None:
+    """Assert that ``fn()`` raises ``exc_type``. Kept here so tests need no pytest."""
+    try:
+        fn()
+    except exc_type:
+        return
+    except Exception as exc:  # noqa: BLE001
+        raise AssertionError(f"expected {exc_type.__name__}, got {type(exc).__name__}: {exc}") from exc
+    raise AssertionError(f"expected {exc_type.__name__}, nothing was raised")
+
+
 def run_namespace(ns: Dict[str, object], *, label: str = "") -> int:
     """Run every ``test_*`` callable in ``ns``; return the number that failed."""
 

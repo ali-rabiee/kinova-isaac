@@ -1,34 +1,51 @@
-"""No-pytest test runner for the HRI-pivot suite.
+"""No-pytest test runner for the carryover-aware supervisory-control suite.
 
 Runs every ``test_*`` function across the test modules and reports a summary. Exits non-zero
 if any test fails, so it works as a CI gate without pytest::
 
-    python -m vla_lab.tests.run_tests
+    python -m vla_lab.tests.run_tests                 # the live suite
+    python -m vla_lab.tests.run_tests --archived      # + the archived rehab Phase 0 suite
+    python -m vla_lab.tests.run_tests --only test_supervisory_carryover
+
+The archived modules live in ``vla_lab/old_direction/tests/`` and cover the pre-pivot
+arm-choice track. They are kept runnable (nothing was deleted) but are off the default gate
+because the live direction no longer depends on them.
 """
 
 from __future__ import annotations
 
+import argparse
 import importlib
 import sys
-from typing import List
+from typing import List, Tuple
 
 from vla_lab.tests import run_namespace
 
+#: (import path, module name) for the live direction.
 MODULES: List[str] = [
-    # --- VLA / act-compute-query track ---------------------------------------
+    # --- shared inference / interaction utilities carried through the pivot ---
     "test_allocation",
     "test_calibration",
     "test_human_study",
     "test_fit_allocator",
-    # 2026-07 intent/feedback/wrist additions. test_feedback is torch-free;
-    # test_intent/test_multicam skip their torch-dependent cases when torch
-    # is unavailable (the suite stays runnable anywhere).
     "test_feedback",
     "test_intent",
     "test_multicam",
-    # --- rehab Phase 0 track (2026-08 pivot; see vla_lab/rehab.md §3, §6) -----
-    # One test gate covers the whole repository, so ./vla_lab/scripts/run_tests.sh
-    # still answers "is anything broken?" for both tracks at once.
+    # --- carryover-aware supervisory control (the live direction) -------------
+    "test_supervisory_scenes",
+    "test_supervisory_carryover",
+    "test_supervisory_estimand",
+    "test_supervisory_scheduler",
+    "test_supervisory_supervisor",
+    "test_supervisory_protocol",
+    "test_supervisory_session",
+    "test_supervisory_logging",
+    "test_supervisory_models",
+    "test_policy_grounder",
+    "test_supervisory_audit",
+]
+
+ARCHIVED_MODULES: List[str] = [
     "test_rehab_workspace",
     "test_rehab_carryover",
     "test_rehab_estimand",
@@ -37,27 +54,55 @@ MODULES: List[str] = [
     "test_rehab_protocol",
     "test_rehab_safety",
     "test_rehab_logging",
-    # rehab.md §4 lists the eight modules above; these two cover W8's offline
-    # "done when" (agreement machinery on fixtures) and W15's ("each failure
-    # mode has a fixture that triggers it, and a passing session that does not").
     "test_rehab_observation",
     "test_rehab_session",
 ]
 
 
-def main() -> int:
+def _collect(args: argparse.Namespace) -> List[Tuple[str, str]]:
+    """-> [(package, module)] to run, in order."""
+    picks: List[Tuple[str, str]] = [("vla_lab.tests", m) for m in MODULES]
+    if args.archived or args.archived_only:
+        arch = [("vla_lab.old_direction.tests", m) for m in ARCHIVED_MODULES]
+        picks = arch if args.archived_only else picks + arch
+    if args.only:
+        wanted = set(args.only)
+        picks = [p for p in picks if p[1] in wanted]
+    return picks
+
+
+def main(argv: List[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--archived", action="store_true", help="also run the archived rehab Phase 0 suite")
+    ap.add_argument("--archived-only", action="store_true", help="run ONLY the archived suite")
+    ap.add_argument("--only", nargs="+", metavar="MODULE", help="run only these test modules")
+    args = ap.parse_args(argv)
+
+    picks = _collect(args)
     total_failed = 0
     total_run = 0
-    for mod_name in MODULES:
-        mod = importlib.import_module(f"vla_lab.tests.{mod_name}")
+    missing: List[str] = []
+    for pkg, mod_name in picks:
+        try:
+            mod = importlib.import_module(f"{pkg}.{mod_name}")
+        except ModuleNotFoundError as exc:
+            # A module listed but not yet written is a build-order fact, not a test failure;
+            # surface it loudly at the end rather than aborting the whole gate.
+            if mod_name in str(exc):
+                missing.append(f"{pkg}.{mod_name}")
+                continue
+            raise
         ns = {k: getattr(mod, k) for k in dir(mod)}
         n_tests = sum(1 for k in ns if k.startswith("test_") and callable(ns[k]))
         total_run += n_tests
         total_failed += run_namespace(ns, label=mod_name)
 
     print("\n" + "=" * 60)
+    if missing:
+        print(f"[SKIP] {len(missing)} listed module(s) not present: {', '.join(missing)}")
     status = "OK" if total_failed == 0 else "FAILED"
-    print(f"[{status}] {total_run - total_failed}/{total_run} tests passed across {len(MODULES)} modules")
+    n_mod = len(picks) - len(missing)
+    print(f"[{status}] {total_run - total_failed}/{total_run} tests passed across {n_mod} modules")
     return 1 if total_failed else 0
 
 

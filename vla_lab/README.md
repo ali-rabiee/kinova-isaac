@@ -1,448 +1,351 @@
-# `vla_lab/` — VLA training & evaluation for the Kinova Jaco in Isaac Sim
+# `vla_lab/` — Carryover-Aware Supervisory Control
 
-## Two tracks
+**A robot that demonstrates a strategy teaches the person watching it what to say.** When it
+then asks *"how should I approach this one?"* on a genuinely ambiguous scene, the answer it
+gets is a mixture of what that person actually prefers and what the robot just spent three
+episodes showing them. This package treats that mixture as the object of study: it estimates
+the supervisor's **unprompted strategy-preference map**, models the residue of the robot's own
+coaching as a latent decaying state, and lets the robot decide when — and whether — to re-open
+the option its own coaching closed.
 
-Since the **2026-08 rehabilitation pivot**, this package holds two parallel research tracks.
-They share utilities and one test gate, and are otherwise independent:
-
-| | **VLA / act–compute–query** (this README) | **rehab Phase 0** ([`rehab.md`](./rehab.md)) |
-| --- | --- | --- |
-| Question | When a stochastic VLA is uncertain, should it compute more or ask a human? | Can a carryover-aware COACH/WAIT/ASSESS policy estimate a person's unprompted arm-choice map better than naive assessment schedules? |
-| Who acts | The **robot** (reach → grasp → lift) | The **human** (reaches to a presented target with one arm) |
-| Robot's job | Execute a policy | **Present** targets, **prompt**, **observe**, **schedule** |
-| Platform | Isaac Sim (real robot = stubs) | **Real Kinova Gen2**, Isaac retained as a digital twin |
-| Code | everything below | `vla_lab/rehab/`, `environments/bilateral_choice/` |
-| Entry point | `collect_v4.sh` → `train.sh` → `eval.sh` | `rehab_pilot.sh` → `rehab_session.sh` → `rehab_verify.sh` → `rehab_analyze.sh` |
-| Status | **kept and maintained**; not deleted or rewritten by the pivot | carries the HRI 2027 submission |
-
-**Phase 0 is where the paper is.** If that is what you are here for, read
-[`rehab.md`](./rehab.md) and [`rehab/README.md`](./rehab/README.md) instead of this file, and
-start with `./vla_lab/scripts/rehab_pilot.sh` — a full synthetic study, no robot, seconds.
-Nothing in the VLA track imports from `vla_lab/rehab/`, and the pivot changed no VLA
-behaviour: the coexistence rules are in [`rehab.md`](./rehab.md) §3.
-
----
-
-This package contains everything needed to go from **scripted demonstrations** in Isaac Sim
-to a **language-conditioned visuomotor policy** (VLA) and back into the simulator for
-closed-loop evaluation — plus the HRI-2027 *act / compute / query* allocation experiments
-built on top of it.
-
-```
-collect (Isaac, scripted expert)  →  verify  →  train (TinyVLA or SmolVLA)  →  eval (Isaac, closed loop)
-   collect_v3.sh / collect_v4.sh  verify_session     train.sh / train_smolvla.sh     eval.sh
-```
-
-Task: a Kinova Jaco `j2n6s300` on a table with 6 colored boxes; the policy receives a
-top-down RGB image (and, since 2026-07, optionally a calibrated **wrist camera** view),
-the EE state, and an instruction like *"Pick up the red box."*, and must reach, grasp,
-and lift the right box.
-
-> **2026-07 reframing** (see [`fable_report.md`](./fable_report.md)): uncertainty is now
-> decomposed by **source** — *perception* (occlusion, missing view) vs *human intent*
-> (which object is meant) — and each source routes to a different remedy (compute, the
-> other view, or a clarifying query). A two-way feedback channel lets the human interject
-> corrections mid-episode, fused by an online reliability estimate. See §9–§10.
-
-> **New here?** Read this file top-to-bottom, then
-> [`data_collection_guide.md`](./data_collection_guide.md) before collecting any data.
+Target venue: **HRI 2027**. Paper source: [`paper/`](./paper/).
 
 ---
 
 ## Quick start
 
 ```bash
-conda activate riften                       # NOT isaac_env; needs numpy<2
-cd ~/Desktop/Depo/Code/CORL/kinova-isaac
+conda activate riften                     # Isaac Sim 5.x + Isaac Lab + torch; numpy<2
 
-# 1. Collect demonstrations (repeat for more chunks; ~2 min/episode headless)
-NUM_EPISODES=40 ./vla_lab/scripts/collect_v3.sh --headless
+# 1. The whole study, synthetic, no robot. Seconds to a few minutes.
+./vla_lab/scripts/sup_study.sh            # -> vla_lab/results/tier1/{table.txt,fig_*.pdf}
 
-# 2. Verify the session (MANDATORY — exit 1 means do not train on it)
-python -m vla_lab.verify_session logs/data_collection/session_<TS>
+# 2. Train one Carryover-Aware VLA cell.
+./vla_lab/scripts/sup_train.sh            # tiny / token, ~2 min on a laptop 4090
 
-# 3. Train TinyVLA (edit data.data_roots in vla_lab/configs/train_tiny.yaml first)
-./vla_lab/scripts/train.sh
+# 3. The architecture comparison table.
+./vla_lab/scripts/sup_models.sh           # -> vla_lab/results/models_isaac/table.txt
 
-# 4. Evaluate in Isaac Lab (closed loop, same scene/camera as collection)
-./vla_lab/scripts/eval.sh --num-episodes 10 --headless
+# 4. Put a trained checkpoint in the loop as the robot's ear.
+./vla_lab/scripts/sup_deployed.sh         # -> vla_lab/results/deployed/table.txt
+
+# 5. Audit what a run actually produced — provenance flags, curves, no re-running.
+./vla_lab/scripts/sup_audit.sh vla_lab/results/models_isaac --figures
+
+# 6. The offline gate (238 tests, no Isaac, no torch needed for most).
+./vla_lab/scripts/run_tests.sh
 ```
 
-## 1. Environment
+Everything above runs with **no simulator**. The Isaac steps are separate, and the **order
+matters** — each one invalidates what the next depends on:
 
-| Requirement | Why |
+```bash
+./vla_lab/scripts/sup_reach.sh --headless          # 1. where the arm can actually reach
+./vla_lab/scripts/sup_sweep.sh --headless --fit    # 2. measure the scene physics (~30 min)
+./vla_lab/scripts/sup_frames.sh --headless         # 3. re-render the atlas on the new physics
+#    ... then retrain (3 above), because the scene ids now map to different clearance gaps.
+```
+
+`build_scene_grid()` picks the fitted physics up from `vla_lab/results/physics/physics.json`
+automatically, so a measurement propagates to the study, the atlas, the training data and the
+closed-loop evaluation at once.
+
+**Building the paper:**
+
+```bash
+./vla_lab/scripts/build_paper.sh          # syncs every figure and table, then builds
+```
+
+Never build it another way. The script regenerates the manuscript's figures and its *measured*
+tables from the result files, lints the source for the two failure modes that compile cleanly and
+read wrong, and refuses to finish with a dangling reference.
+
+---
+
+## The idea in one page
+
+**The estimand.** For supervisor *p*, `π*_p(c) = Pr[p instructs the cautious strategy | scene at
+c, no recent coaching]`. The coordinate `c` is **not** a raw distance: it is the signed
+task-value margin between the two strategies, in units of the transition width, so `c > 0` means
+the cautious strategy is objectively better here, `c < 0` means the efficient one is, and `c = 0`
+is the crossover where the two are worth the same and the supervisor's answer is genuinely a
+preference rather than a correct answer. Defining it that way buys three things: a map that is
+monotone and saturating (so the information concentrates in a band), a coordinate that means the
+same thing across strategy axes, and an **objective regret** — executing the wrong strategy costs
+real task value, so compliance bias is a performance loss and not only a measurement artifact.
+
+**The contamination.**
+
+```
+Pr[y_t = A | c_t, κ_t] = σ( logit π*_p(c_t) + ρ_t · β_p · κ_t )
+κ_{t+1}                = λ_p^Δt · ( κ_t + g_p · s_t · d_t · 1[a_t = COACH] )
+```
+
+`κ` is **signed** (`d_t = ±1`: the robot can coach either strategy), `β_p` is the person's
+compliance sensitivity, `λ_p` their decay rate, and `ρ_t ∈ [0,1]` the **counter-proposal
+attenuation** — how much of the residue's grip a re-opened option removes.
+
+**Four actions**, one per interaction slot:
+
+| | what the robot does |
 | --- | --- |
-| conda env **`riften`** | Isaac Sim 5.x + Isaac Lab + torch are set up there (`isaac_env` is stale). |
-| **NumPy < 2** | NumPy 2.x freezes/crashes Isaac data collection. `python -c "import numpy; print(numpy.__version__)"` |
-| Isaac Lab checkout | `eval.sh` looks for `./IsaacLab/isaaclab.sh` or `~/IsaacLab/isaaclab.sh` (override with `ISAACLAB=`). |
-| `pip install matplotlib` | optional, for training plots (`plot_metrics`). |
-| `pip install -r vla_lab/requirements-smolvla.txt` | only for the SmolVLA path (LeRobot). |
+| `COACH` | executes a strategy on an *unambiguous* scene and narrates it. The manipulation; protocol-fixed. |
+| `PROBE` | presents an ambiguous scene, asks the neutral query, executes what it is told. |
+| `WAIT` | a strategy-neutral filler. Costs budget and wall-clock; decays the residue. |
+| `COUNTER` | a probe **plus** naming the option the robot did *not* just demonstrate. The active de-biasing action. |
 
-Training (`vla_lab.train`) and all offline tools run with plain `python` — no Isaac needed.
-Only collection and eval start the simulator.
+**Six conditions and three ablations** (`supervisory/scheduler/`): B0 no-coach reference,
+B1 **Memoryless VLA**, B2 fixed washout, B3 random/static, B4 always-counter, B5 **carryover-aware**,
+plus B5 with each of its three switches off.
 
-## 2. Folder map
+---
+
+## What the Tier-1 study says
+
+`vla_lab/results/tier1/table.txt`, N = 80 synthetic supervisors, paired, all conditions on an
+identical budget, under the **measured** scene physics. Read the test–retest floor (crossover
+MAE **0.1016**) first: it bounds everything below it, and the study audit prints that reminder
+itself.
+
+- **Ignoring your own coaching is expensive, and it is the only thing that clears the floor.**
+  B1 Memoryless is +0.0573 crossover-MAE [+0.0461, +0.0686] worse than the fixed washout and
+  +0.0616 [+0.0535, +0.0698] worse than always asking, with +0.0043 [+0.0029, +0.0058] more
+  decision regret. It wins **16 %** of paired comparisons. That gap is about four times the
+  entire spread among the other seven conditions.
+- **The penalty scales with the person.** Stratified by true compliance strength `βg`, B1's
+  excess error over the washout grows **+0.044 → +0.046 → +0.082** across terciles. Nothing in
+  any condition observes `βg`, so that dose–response runs through the contamination term.
+- **Among the remedies, nothing separates.** Their whole spread is 0.0155 against a floor of
+  0.1016; every paired interval against the washout contains zero. We report the ordering and
+  decline to interpret it.
+- **λ is poorly identified from one session**: identified in **44 %** of supervisors against
+  **86 %** for compliance strength. Schedule personalisation therefore runs largely on its prior
+  — and the schedule-only ablation is worst in the high-compliance tercile, where it would
+  matter most.
+- **A finding that did not survive re-measuring the physics.** Under the *prior* value model,
+  always-counter beat the washout by −0.0148 [−0.0248, −0.0046] and "asking beats waiting" was a
+  headline. Under the measured model, same policies and seeds, it is −0.0043 [−0.0171, +0.0089].
+  Nothing about the methods changed; the difficulty curve they are scored against did.
+- The study audit raises exactly two flags on this run: the λ identifiability, and that the
+  non-memoryless spread is inside the floor.
+
+### The closed-loop evaluation
+
+`vla_lab/results/deployed{,_smolvla}/table.txt`. Dropping a trained checkpoint into the session as
+the grounding channel, on both backbones with a full set of injection modes.
+
+- **Reading the utterance (`said`) is free accuracy.** Every checkpoint matches its lexical
+  reference to within 0.003 and resolves nearly all the hedged answers the keyword grounder
+  refuses (1.1–1.4 → 0.0–0.6 ungrounded per block). This replicates on both backbones.
+- **Letting the model answer (`unprompted`) helps on the pretrained backbone.** `token` and `film`
+  reach 0.1042 / 0.1038 against the reference's 0.1105, alignment 0.900 → 0.939 / 0.953, and
+  deployment regret cut four-fold (0.0027 → 0.0009 / 0.0006).
+- **And breaks one cell on the from-scratch one.** `film` — best in its row on *both* offline
+  metrics — is the worst channel anywhere: 0.1500 against a 0.1187 reference.
+- **Offline metrics do not determine deployment.** Across the seven `unprompted` cells, offline
+  gain orders deployed error only weakly (Spearman ρ = −0.46, n = 7) and in-band abstention barely
+  at all (ρ = −0.14). Moderate abstention (≤5% in band) is fine and sometimes better; the one cell
+  above 11% is the one that fails. Watch it as a threshold, not as a ranking.
+
+### The architecture comparison
+
+`vla_lab/results/models_isaac{,_smolvla,_qwen}/table.txt`. All cells train on **rendered Isaac
+frames** from the study's own scene, so the comparison is between architectures under matched
+perception.
+
+- **The from-scratch backbone's context-blind cell lands on zero** (gap∼κ = **−0.006**), which is
+  what it must do — its encoder cannot see κ — and is the cleanest confirmation that the metric
+  measures what it claims to. Token injection takes it to +0.052, FiLM to +0.108.
+- **Scale changes what "context-blind" means.** SmolVLA with no context injection still reaches
+  +0.151, presumably from image and wording correlates of the residue. On a large backbone,
+  injection roughly *doubles* an ability the model already has in part — a weaker claim than the
+  from-scratch numbers alone would support, and we report it.
+- **`film` gives the best gain on both backbones** (+0.135, +0.137), and the ordering
+  none < token < film replicates.
+- **On SmolVLA, `text` achieves the highest residue-tracking of any cell (+0.273) and the lowest
+  gain (+0.082)** — tracking the residue and using it well are different abilities, and this is
+  where they come apart. Verbalising costs prompt: 43 context tokens against ~7 for the
+  instruction.
+
+### The objective ablations
+
+`vla_lab/results/ablations/table.txt`, on the best from-scratch cell. **Removing the reference
+supervision collapses the gain to +0.003 while sending gap∼κ to +0.353 — the highest anywhere in
+this project.** The model learns to move its belief *in step with* the residue and nothing about
+*where to move it*. That is a direct warning about the headline metric: a high gap∼κ is necessary
+and manifestly not sufficient, which is why both columns are always reported. Removing forward
+consistency *improves* the gain (+0.031) while reducing residue tracking — the self-supervised
+term costs a little fit to buy mechanism, and we say so rather than implying every term earns its
+place.
+
+Regenerate: `./vla_lab/scripts/sup_study.sh`. Figures land next to each result and reach the
+manuscript through `./vla_lab/scripts/build_paper.sh`.
+
+---
+
+## Two tiers, and why
+
+A scheduling study needs thousands of sessions; a closed-loop Isaac episode costs a minute.
+Running the whole grid in the simulator is not a patience problem, it is a design mistake — it
+re-measures the same execution outcomes over and over.
+
+- **Tier 1** (`supervisory/apparatus/surrogate.py`) samples execution outcomes from success and
+  duration curves **measured once** from an Isaac sweep. The scheduling, belief, and estimation
+  code paths are the real ones.
+- **Tier 2** (`supervisory/apparatus/isaac.py`) runs complete sessions end-to-end in Isaac with
+  the policy in the loop.
+- The **fidelity check** (`fidelity_report`) compares them and is reported *before* any Tier-1
+  result. Tier 1 is a variance-reduction device whose validity rests entirely on that check.
+
+> **Status of the scene driver (2026-08-23): working.** The margin sweep runs end to end and the
+> scene physics is **measured** — 216 rollouts, crossover 8.5 cm, transition width 3.12 cm,
+> `ScenePhysics.source == "measured"`. Getting there took ten distinct defects, seven of which
+> presented with the identical symptom (*"every rollout times out on an early waypoint"*). They
+> are recorded in the paper (§ *Making the instrument work*) and at the line of code that fixes
+> each one. The four worth knowing before touching this scene:
+>
+> 1. **The controller's rotate mode is TOOL-frame.** `drot = quat_apply(ee_quat_b, drot)`, so a
+>    base-frame axis is applied twice. The wrist alignment burned 768 steps and left downwardness
+>    at −0.997 (worse than it started). Converting to the tool frame gives **+0.874** in one pass.
+> 2. **`hold_after_orient` must be `True`** — and the measurement that said otherwise was taken
+>    while (1) was active, i.e. it was holding an *inverted* wrist. Without the hold, the tool
+>    drifts back to +0.17 downwardness during the first translate.
+> 3. **A waypoint that only changes the gripper is done when the gripper moves.** Requiring
+>    position convergence made the follower jog a *loaded* gripper for 16 000 steps and log a
+>    timeout on a grasp that had succeeded.
+> 4. **The start pose was silently favouring one strategy.** `start_ee_pos_b` was configured and
+>    never applied, so every rollout began folded against the base; clear-first's opening move
+>    took 409 steps and direct's diverged and timed out — making the direct strategy fail at
+>    *every* gap. Pre-rolling to the collection contract's pose: **73 steps**.
+>
+> Geometry is now checked against a **measured** reachable envelope by a unit test
+> (`sup_reach.sh` produces the map: `x` in [0.22, 0.66] m, 55/60 poses reached at grasp height).
+>
+> **One correction worth keeping.** The probe's first version jogged back to the home pose
+> between points instead of resetting the episode, and that drifts — residual home error grew
+> 1.8 cm → 6.5 cm → 14–18 cm. The artefact was *structured*: the row along `y = 0` came back
+> marginal along its whole length while the rows either side looked clean, which had a ready
+> mechanical story. We believed it and moved the scene corridor to `y = -0.10`. With a hard reset
+> per point that row is fully reachable. The corridor stays where it is because the measured
+> physics was fitted there, not because `y = 0` is a problem.
+
+---
+
+## The model roster
+
+`vla_lab/policy/` wraps **any** VLA backbone with the same three additions, so the paper's table
+compares *architectural features* and not four unrelated codebases:
+
+| model | pretrain | language model | action head | context modes |
+| --- | --- | --- | --- | --- |
+| TinyVLA-2M (from scratch) | none | no | regression | none, token, film |
+| SmolVLA-450M | robot (VLA) | yes | flow matching | none, text, token, film |
+| Qwen2-VL-2B + head | web (VLM) | yes | regression | none, text, token, film |
+| Qwen2.5-VL-3B + head | web (VLM) | yes | regression | none, text, token, film |
+
+The independent variable is **where the carryover context enters**:
+
+- `none` — dropped. This *is* the Memoryless VLA.
+- `text` — verbalised into the prompt (*"in the last 3 episodes I demonstrated CLEAR_FIRST…"*).
+  Requires a real language model, which is what makes it a probe of the architecture.
+- `token` — a learned embedding prepended to the token sequence.
+- `film` — feature-wise modulation of the heads. Available even to a backbone with no token interface.
+
+The wrapper adds an **intent head** (two logits: what they *said*, and what they would have said
+*unprompted* — initialised so an untrained model is exactly the Memoryless baseline), an **ask
+gate**, and a **forward contamination model** that pushes the de-biased belief back through the
+residue and requires it to reproduce the observed utterance. That last term is self-supervised,
+so it needs no reference block and survives deployment.
+
+LoRA is used for the Qwen cells and **degrades loudly**: without `peft` the backbone is frozen
+instead and the manifest says so, because "LoRA" and "frozen backbone" are different experiments.
+
+Four integration facts worth knowing before you touch `policy/backbones/smolvla.py`, each of
+which cost a debugging cycle because it fails *quietly*:
+
+- The instruction must reach the policy as `task`/`prompt`. A batch without it trains on empty
+  strings and presents as slow learning, not as an error. The adapter now raises instead.
+- Features must come from `VLAFlowMatching.embed_prefix`, **not** from a hook on
+  `select_action` — that method is `@torch.no_grad()`, so the captured activation is detached
+  and training completes having learned nothing.
+- Pool the **instruction segment**, not the whole prefix. With three camera slots the image
+  tokens outnumber the 48 language tokens by an order of magnitude, and a full-sequence mean
+  leaves the intent head at chance. With tail pooling it reaches `acc_said = 1.00`.
+- **Respect the instruction budget.** SmolVLA accepts 48 tokens and its tokenizer truncates from
+  the **left**, so a 77-token verbalised context deletes exactly the informative half and keeps
+  the instruction. That produced a run in which `text` injection scored *worst* of four modes
+  (gap∼κ = −0.02) and looked like a clean falsification of the paper's central hypothesis. With
+  the compact verbalisation inside budget the same cell reaches **+0.22**. The trainer now runs
+  a prompt-budget audit before the first step and refuses to leave it unreported.
+
+---
+
+## Folder map
 
 ```
 vla_lab/
-├── README.md                    <- you are here
-├── rehab.md                     <- THE rehab Phase 0 specification (the other track)  ★
-├── data_collection_guide.md     <- THE data-collection reference (pipeline, contract, fixes)
-├── docs/                        <- historical reports (eval-flailing postmortem, design notes)
-│
-├── rehab/                       <- ★ rehab Phase 0: everything for the arm-choice study
-│   ├── README.md                <-   quick start (run order, one screen)
-│   ├── workspace.py contract.py <-   bilateral target geometry; the hashed Phase 0 contract
-│   ├── carryover.py estimand.py <-   the latent carryover model; pi*(l) estimators + metrics
-│   ├── scheduler/               <-   B0-B4 + B4's two ablations (COACH / WAIT / ASSESS)
-│   ├── apparatus/               <-   null / Isaac twin / real Kinova Gen2 backends
-│   ├── observation/             <-   arm-choice observers, agreement, physical calibration
-│   ├── protocol.py session.py   <-   blocks + counterbalancing; the one session runner
-│   ├── safety.py                <-   human-proximate interlocks (motion/reach exclusion)
-│   ├── verify_session.py        <-   the Phase 0 session gate  ★ run after every session
-│   ├── sim_participant.py       <-   generative participant (makes it all testable offline)
-│   └── power.py analyze.py      <-   Monte-Carlo power memo; outcomes + every paper figure
-│
-├── scripts/                     <- entrypoints (each wraps one command; env-var overridable)
-│   ├── rehab_pilot.sh           <- ★ synthetic Phase 0 study, no robot, seconds
-│   ├── rehab_session.sh         <- ★ one real participant session
-│   ├── rehab_verify.sh          <- ★ the Phase 0 session gate
-│   ├── rehab_analyze.sh / rehab_power.sh / rehab_twin_dryrun.sh / rehab_calibrate.sh
-│   ├── collect_v3.sh            <- data collection: reach/grasp/lift, 15 Hz, DR  ★
-│   ├── collect_v4.sh            <- collect_v3 + calibrated WRIST camera          ★ (new data)
-│   ├── train.sh                 <- TinyVLA training                              ★
-│   ├── eval.sh                  <- closed-loop Isaac Lab evaluation              ★
-│   ├── dryrun.sh                <- VRAM/latency sanity for a checkpoint (no Isaac)
-│   ├── export_lerobot_dataset.sh / train_smolvla.sh / after_smolvla_train.sh
-│   ├── run_tests.sh             <- 83 offline tests (allocator/calibration/human study/intent/feedback/multicam)
-│   ├── sweep_occlusion_eval.sh / fit_allocator.sh / calibration_*.sh
-│   ├── sweep_camera_sets.sh     <- overhead/wrist/both ablation (+1-cam+TTC legs)
-│   ├── sweep_feedback_quality.sh<- human input quality grid (accuracy×specificity, fusion vs trust-all)
-│   ├── human_study_pilot.sh / human_study_analyze.sh / power_analysis.sh
-│   └── legacy/                  <- superseded collectors (collect.sh 5 Hz, collect_v2 pick-place,
-│                                   collect_temp) — do NOT use without porting the respawn fix
-│
-├── dataset.py                   <- ticks.jsonl → torch Dataset (success-only filter, action chunks,
-│                                   camera sets: overhead / wrist / both)
-├── models.py / losses.py        <- TinyVLA (1.9 M params, shared-encoder multi-camera + camera
-│                                   dropout) + optional DINOv2 alignment
-├── train.py                     <- trainer (AMP, resume, metrics.jsonl; records camera_set +
-│                                   action_rate_hz contract into checkpoints)
-├── eval_isaaclab.py             <- eval loop: policy/replay backends, pre-roll, safety clamps, TTC,
-│                                   camera-set ablations, intent estimator, feedback channel
-├── ttc.py / partial_obs.py      <- K-sample inference + occlusion axes (per-view since 2026-07)
-├── intent/                      <- intent-uncertainty estimator (counterfactual sweep) +
-│                                   cross-view disagreement (vla_lab.intent)
-├── feedback/                    <- two-way human channel: parser, simulated human (quality knobs),
-│                                   console channel, reliability-gated fusion (vla_lab.feedback)
-├── verify_session.py            <- post-collection session validator  ★ run after every collection
-├── inspect_data.py              <- quick textual dump of a session
-├── repair_gripper_labels.py     <- backfills gripper labels in pre-2026-06 sessions
-├── dryrun.py / plot_metrics.py / stats_utils.py / checkpoint_utils.py
-│
-├── smolvla_bridge/              <- ticks.jsonl ↔ LeRobot dataset + SmolVLA policy wrapper
-├── allocation/ calibration/     <- HRI-2027 act/compute/query allocator + Result-2 calibration
-├── human_study/ baselines/ ttc_methods/  <- study runner, comparison policies
-├── real_robot/                  <- Kinova bridge + safety envelope stubs for sim→real
-├── tests/                       <- offline test suite (run_tests.sh)
-├── configs/                     <- train_tiny.yaml, train_multicam.yaml (wrist+overhead),
-│                                   eval_isaac.yaml, train_smolvla.example.yaml, eval_real.yaml,
-│                                   rehab_phase0.yaml / rehab_sim_pilot.yaml / rehab_twin.yaml
-│
-├── checkpoints/ datasets/       <- training outputs / LeRobot exports   (artifacts, gitignored)
-├── eval_results/ results/       <- eval + experiment outputs            (artifacts)
-└── paper/                       <- HRI-2027 LaTeX sources (+ talk deck in presentation/)
+├── supervisory/          ★ the study: estimand, carryover model, schedulers, session, gate, analysis
+│   ├── scenes.py           SceneSpec/SceneGrid, the ambiguity coordinate c, the task-value model
+│   ├── carryover.py        signed κ, the grid posterior over (λ, β, g), the population prior
+│   ├── estimand.py         π*(c), three estimators, error/calibration/regret metrics
+│   ├── supervisor.py       the generative supervisor  ← read its docstring before citing any number
+│   ├── narration.py        what the robot says, and the conservative grounder
+│   ├── scheduler/          B0–B5 + B5's three ablations
+│   ├── apparatus/          surrogate | Isaac | the fidelity check | the physics sweep
+│   ├── protocol.py         blocks, counterbalancing, the matched budget
+│   ├── session.py          the one session runner   verify_session.py  the gate
+│   ├── run_study.py        ★ Tier-1 study     run_sweep.py  ★ the Isaac margin sweep
+│   └── analyze.py          every figure in the paper
+├── policy/               ★ the Carryover-Aware VLA: context modes, heads, backbone registry
+├── training/             ★ losses, dialogue data, trainer, the architecture sweep
+├── paper/                ★ the HRI 2027 manuscript
+├── results/                tier1/ · models/ · physics/
+├── old_direction/          the previous (arm-choice rehabilitation) submission + its code, intact
+├── old_demos/              superseded checkpoints, results, docs, legacy scripts
+└── …                       dataset.py, models.py, eval_isaaclab.py, allocation/, feedback/,
+                            intent/, calibration/, human_study/, smolvla_bridge/  (carried through)
 ```
 
-★ = the four commands you will actually use day-to-day.
+`environments/supervisory_fetch/` holds the Isaac scene, the two scripted experts, and the
+geometry that realises a given clearance gap.
 
-## 3. Data collection
+---
 
-Full reference: **[`data_collection_guide.md`](./data_collection_guide.md)** — read it before
-collecting the final dataset. Short version:
+## Reading the numbers honestly
+
+Four boundaries are enforced in code and repeated in the paper:
+
+1. **The simulated supervisor is not evidence about people.** A de-biasing method evaluated
+   against a simulator whose bias we injected is being tested for whether it can invert a
+   process we wrote down. That is how any estimator is validated, and a method that cannot
+   recover a known ground truth will not recover an unknown one — but it is not evidence that
+   human supervisors exhibit compliance carryover. Only participants can supply that.
+2. **Prior versus measured.** `ScenePhysics.source` says which, and the analysis prints it next
+   to any figure that depends on it. It currently reads `measured` — and that mattered: the
+   headline "asking beats waiting" was significant under the prior and is not under the
+   measurement. A simulated study's task-difficulty curve is a modelling choice that can decide
+   a significance test, so measure it and plot it (`fig_physics.pdf`).
+3. **Schematic versus rendered.** With no Isaac frames the trainer draws schematic scenes and
+   prints a warning; those runs validate the pipeline and never enter the headline table. Every
+   reported cell trains on rendered frames, and the audit refuses to be quiet about a run that
+   does not.
+4. **Offline versus deployed.** A learned intent head's held-out accuracy does not determine what
+   it does in the loop (Spearman ρ = −0.46 over seven cells) — see `sup_deployed.sh`. Nothing here
+   reports one as evidence for the other, and the in-band abstention column is a red flag rather
+   than a ranking: ≤5% is fine, the one cell above 11% is the one that fails.
+
+---
+
+## The previous direction
+
+The arm-choice rehabilitation submission (*"When Is the Robot's Next Measurement Trustworthy?"*)
+and its complete `rehab/` implementation are intact in [`old_direction/`](./old_direction/),
+including its own 162-test suite:
 
 ```bash
-# Default: 6 unique-color boxes, cycling targets, domain randomization, 15 Hz ticks
-NUM_EPISODES=40 ./vla_lab/scripts/collect_v3.sh --headless
-
-# WITH the wrist camera (recommended for all new data; same contract + wrist stream):
-NUM_EPISODES=40 ./vla_lab/scripts/collect_v4.sh --headless
-
-# Useful overrides (env vars, both scripts):
-NUM_EPISODES=120 NUM_OBJECTS=6 ./vla_lab/scripts/collect_v4.sh --headless
-TARGET_SELECTION=random ./vla_lab/scripts/collect_v4.sh      # instead of cycle
-DR_SEED=7 ./vla_lab/scripts/collect_v4.sh                    # reproducible randomization
-USE_YCB=1 ./vla_lab/scripts/collect_v4.sh                    # YCB meshes (separate dataset!)
-PLANNER=curobo_v2 ./vla_lab/scripts/collect_v4.sh            # MotionGen instead of scripted
-
-# Watch the first run: respawn readback must CHANGE between episodes, targets must cycle.
+python -m vla_lab.tests.run_tests --archived-only     # 162/162
+./vla_lab/old_direction/scripts/rehab_pilot.sh        # still runs
 ```
 
-Outputs land in `logs/data_collection/session_<TS>/episode_NNNN/` with `ticks.jsonl`
-(15 Hz states + actions), `images/` (640×640 top-down PNGs), `instruction.json`,
-`episode_summary.json` (success verdict), and `events.jsonl` (full audit trail).
-`collect_v4` sessions additionally contain `images/wrist_XXXXXX.png` (one per tick), an
-`image_wrist` key per tick, and per-episode **`cameras.json`** — pinhole intrinsics for
-both cameras, the post-DR overhead pose, and the wrist hand-eye mount extrinsics
-(`DEFAULT_WRIST_CAMERA` in `environments/reach_to_grasp_VLA/config.py`; on the real robot
-replace its offsets with your measured hand-eye calibration). The wrist mount/FOV is part
-of the trained model's contract exactly like the top-down camera. `verify_session` checks
-the wrist stream (every episode has it, files exist, cameras.json present).
-
-**Rules that keep the data usable** (details + rationale in the guide):
-
-1. **Verify every session** before training: `python -m vla_lab.verify_session <session_dir>`.
-   It catches the historical failure modes (frozen object layout, degenerate targets, missing
-   gripper labels, missing images) and refuses with exit 1.
-2. **Collect in chunks** (30–60 episodes per run, headless) — long runs have been OOM-killed
-   (exit 137). Each chunk is a separate session; list them all under `data.data_roots`.
-3. **Never mix contracts**: sessions in one training run must share the same `--log-rate-hz`
-   (15), camera config, and start pose. Sessions collected **before 2026-06-11 are not
-   compatible** (camera moved, frozen-layout bug) — retire them.
-4. ~120 episodes (= 20 demos per color) is a sensible floor for the 6-color task.
-
-## 4. Inspect what was collected
-
-```bash
-# Hard pass/fail + statistics (use this one):
-python -m vla_lab.verify_session logs/data_collection/session_<TS>
-
-# Casual look at episodes/ticks/instructions:
-python -m vla_lab.inspect_data --data-roots logs/data_collection/session_<TS> --print-instructions
-
-# Old sessions (pre-2026-06) only: backfill gripper open/close labels in-place:
-python -m vla_lab.repair_gripper_labels --session logs/data_collection/session_<TS> [--dry-run]
-```
-
-## 5. Training
-
-### 5.1 TinyVLA (default, no Isaac required)
-
-```bash
-# 1. Point the config at your verified session(s):
-#    vla_lab/configs/train_tiny.yaml  ->  data.data_roots: [logs/data_collection/session_<TS>, ...]
-# 2. Train (checkpoints + metrics.jsonl + plots in vla_lab/checkpoints/tiny_v0/):
-./vla_lab/scripts/train.sh
-
-# Variants:
-./vla_lab/scripts/train.sh --auto-resume                 # continue from last.pt
-./vla_lab/scripts/train.sh --epochs 50 --batch-size 256  # quick overrides
-python -m vla_lab.train --config vla_lab/configs/train_tiny.yaml --data-roots \
-    logs/data_collection/session_A logs/data_collection/session_B   # multi-session
-
-# Sanity-check a checkpoint's latency/VRAM and action magnitudes (no Isaac):
-./vla_lab/scripts/dryrun.sh --ckpt vla_lab/checkpoints/tiny_v0/last.pt --iters 50 --k 1
-
-# Two-camera training (collect_v4 sessions; wrist+overhead, camera dropout 0.25):
-#   edit data.data_roots in vla_lab/configs/train_multicam.yaml first
-CONFIG=vla_lab/configs/train_multicam.yaml ./vla_lab/scripts/train.sh
-
-# Camera-set ablations = the same config with data.cameras edited to
-#   [overhead] | [wrist] | [overhead, wrist]     (one run per set), or via a copy:
-python -m vla_lab.train --config vla_lab/configs/train_multicam.yaml \
-    --out-dir vla_lab/checkpoints/wrist_only_v0    # after setting cameras: [wrist]
-```
-
-The camera set and the sessions' `log_rate_hz` are recorded in each checkpoint
-(`camera_set`, `action_rate_hz`); eval reads them to build the right sensors and to
-check the rate contract. Old single-camera checkpoints keep loading unchanged.
-
-Notes:
-
-- `data.success_only: true` (default) trains on successful demonstrations only, using
-  `episode_summary.json` / `events.jsonl`.
-- Action normalization stats are stored in the checkpoint; eval denormalizes automatically.
-- The tokenizer is built from the sessions' instructions — if a color never appears as a
-  target in your data, the model cannot understand it at eval (one more reason for
-  `TARGET_SELECTION=cycle` + verify_session's distribution check).
-
-### 5.2 SmolVLA (LeRobot fine-tune)
-
-```bash
-pip install -r vla_lab/requirements-smolvla.txt   # ideally a separate env; see docs/new_changes.md
-
-# 1. Export ticks → LeRobot dataset (successful episodes only by default):
-./vla_lab/scripts/export_lerobot_dataset.sh \
-    --session-roots logs/data_collection/session_<TS> \
-    --out-dir vla_lab/datasets/lerobot_kinova_v0 --fps 15 --overwrite
-
-# 2. Fine-tune lerobot/smolvla_base on it:
-DATASET_DIR=vla_lab/datasets/lerobot_kinova_v0 STEPS=20000 ./vla_lab/scripts/train_smolvla.sh
-
-# 3. Evaluate with the same Isaac loop (backend switch in the YAML or CLI):
-./vla_lab/scripts/eval.sh --policy-backend smolvla --ckpt vla_lab/checkpoints/smolvla_ft_<TS> \
-    --lerobot-dataset-root vla_lab/datasets/lerobot_kinova_v0
-```
-
-## 6. Evaluation (Isaac Lab)
-
-```bash
-# Default config (vla_lab/configs/eval_isaac.yaml): 10 episodes, scene mirrors collect_v3
-./vla_lab/scripts/eval.sh --num-episodes 10 --headless --ckpt vla_lab/checkpoints/tiny_v0/last.pt
-
-# With the GUI (watch the behavior):
-./vla_lab/scripts/eval.sh --num-episodes 5 --ckpt vla_lab/checkpoints/tiny_v0/last.pt
-
-# Per-tick action diagnostics (JSONL + console magnitudes, clamp counts):
-./vla_lab/scripts/eval.sh --num-episodes 3 --headless --debug-actions
-
-# Execution-path regression test WITHOUT a policy: open-loop replay of a recorded episode.
-# Expect smooth motion and ~mm-level EE tracking error vs the demo.
-./vla_lab/scripts/eval.sh --replay-episode logs/data_collection/session_<TS>/episode_0000 --headless
-
-# K-sample TTC / act-compute-query controllers: see §8.
-
-# Camera-set ablation flags (two-camera checkpoints; see §9):
-./vla_lab/scripts/eval.sh --ckpt vla_lab/checkpoints/multicam_v0/last.pt \
-    --cameras overhead --headless          # wrist masked (missing-view ablation)
-./vla_lab/scripts/eval.sh --cameras both --occlusion-mode bottom_strip \
-    --occlusion-camera wrist --headless    # occlude ONE view (cross-view conflict)
-```
-
-Results: `vla_lab/eval_results/<run>/results.json` (per-episode success, lift heights,
-latency stats).
-
-### If eval motion ever looks erratic again
-
-`docs/EVAL_DEBUG_REPORT.md` is the postmortem of the 2026-06 "flailing" bug. Checklist:
-
-1. `eval.policy_rate_hz` **must equal** the collection `--log-rate-hz` (15). A mismatch
-   stretches/compresses every action in time (`train_action_rate_hz` rescales + warns).
-2. The eval pre-roll target `eval.start_ee_pos_b` must equal collection's
-   `--start-ee-pos-b` (0.454 0.093 0.210).
-3. Run the `--replay-episode` test above: if replay is smooth, the model is the problem;
-   if not, the execution path is.
-4. `--debug-actions` should show |Δp| ≲ 35 mm per tick and zero safety clamps.
-
-## 7. The model contract (do not change one side only)
-
-| Item | Value | Defined in |
-| --- | --- | --- |
-| Observation | 224×224 RGB per camera (resized from 640×640) + EE pos + gripper flag | `dataset.py`, cameras in `environments/reach_to_grasp_VLA/config.py` |
-| Camera set | `[overhead]` (legacy) or `[overhead, wrist]` / `[wrist]` (collect_v4 data); recorded as `camera_set` in the checkpoint | `train_*.yaml data.cameras` ≡ eval `--cameras` |
-| Wrist mount | offset `(0, −0.055, −0.11)` m, rpy `(180°, 0, 0)` in the EE-link frame, FOV 87° | `WristCameraConfig`; dumped per episode in `cameras.json` |
-| Action | `(8, 7)` chunk of per-tick deltas `[dx,dy,dz,drx,dry,drz,g]`, base frame, `g∈{-1,0,+1}` | `data_collection/core/logger.py` (`action_from_prev`) |
-| Tick rate | **15 Hz** sim time (also stored as `action_rate_hz` in new checkpoints) | `collect_v3/v4.sh` ≡ `eval_isaac.yaml policy_rate_hz` |
-| Start pose | EE `(0.454, 0.093, 0.210)` base frame | `--start-ee-pos-b` ≡ `eval.start_ee_pos_b` |
-| Scene | 6×8 cm unique-color boxes, spawn AABB (0.26,−0.34)–(0.52,0.36), ≥0.16 m apart | `collect_v3/v4.sh` ≡ `eval_isaac.yaml` |
-
-## 8. HRI-2027 act / compute / query experiments
-
-Built on top of the eval loop: at each policy tick a controller decides to **act** (1 forward
-pass), **compute** (K samples + consensus), or **query** the human. See `allocation/`,
-`calibration/`, `human_study/`.
-
-```bash
-# Offline first — no Isaac, no robot, ~seconds:
-./vla_lab/scripts/run_tests.sh                       # 83 tests must pass
-./vla_lab/scripts/human_study_pilot.sh               # synthetic end-to-end study + figures
-./vla_lab/scripts/power_analysis.sh                  # sample-size memo
-
-# Robot-only calibration sweep ("Result 2", needs Isaac):
-OUT_ROOT=vla_lab/results/calibration_records ./vla_lab/scripts/sweep_occlusion_eval.sh
-./vla_lab/scripts/fit_allocator.sh                   # -> allocator_fit.json
-./vla_lab/scripts/calibration_analyze.sh             # -> reliability/ECE/coverage figures
-
-# Controllers inside eval (same scenes/seeds for comparisons):
-./vla_lab/scripts/eval.sh --controller allocator --allocator-fit vla_lab/results/allocator_fit.json
-./vla_lab/scripts/eval.sh --controller compute_gated   # or: autonomy | fixed_compute | scale | knowno | insight
-./vla_lab/scripts/eval.sh --controller intent_allocator  # routes by uncertainty SOURCE (see §10)
-```
-
-## 9. Wrist camera & camera-set ablations (2026-07)
-
-The premise: with two calibrated views, "is one camera + our method as good as two?"
-becomes a measurable claim. Pipeline:
-
-```bash
-# 1. Collect two-camera data and verify it:
-NUM_EPISODES=120 ./vla_lab/scripts/collect_v4.sh --headless
-python -m vla_lab.verify_session logs/data_collection/session_<TS>
-
-# 2. Train the two-camera policy (camera dropout teaches single-view robustness):
-CONFIG=vla_lab/configs/train_multicam.yaml ./vla_lab/scripts/train.sh
-
-# 3. Run the full ablation matrix on identical scenes/seeds:
-#    both / overhead-only / wrist-only / one-camera+gated-TTC / per-view occlusion
-CKPT=vla_lab/checkpoints/multicam_v0/last.pt NUM_EPISODES=50 \
-    ./vla_lab/scripts/sweep_camera_sets.sh --headless
-```
-
-Mechanics: one shared vision encoder runs per view + a learned camera-ID embedding;
-`model.camera_dropout: 0.25` zeroes random streams during training; at eval,
-`--cameras overhead|wrist|both` masks the missing stream (`camera_present`), and
-`--occlusion-camera` picks which view the occlusion mask hits. A **cross-view
-disagreement** probe (overhead-only vs wrist-only predictions of the same model) joins
-the allocator's feature set as a perception-uncertainty signal.
-SmolVLA path: export with `--wrist` (`export_lerobot_dataset.sh` flag routes the wrist
-view into `camera2`) and set `smolvla_cameras: both` in the eval YAML.
-
-## 10. Human-intent uncertainty & real-time feedback (2026-07)
-
-Uncertainty is decomposed by **source** and routed to the matching remedy:
-
-- **Perception** (can't see): K-sample dispersion, occlusion, cross-view disagreement
-  → more compute (best-of-K) or the other view.
-- **Intent** (don't know WHICH object you mean): `vla_lab/intent` runs a counterfactual
-  instruction sweep per tick (one cheap forward per candidate color) → a posterior over
-  targets; its normalized entropy is the intent-uncertainty scalar → clarifying query
-  (compute cannot resolve intent).
-
-```bash
-# Intent-routed controller + deliberately ambiguous instructions:
-./vla_lab/scripts/eval.sh --controller intent_allocator --instruction-ambiguity half --headless
-
-# Two-way feedback with a SIMULATED human (quality knobs: accuracy/latency/specificity/noise):
-./vla_lab/scripts/eval.sh --controller intent_allocator --instruction-ambiguity half \
-    --feedback-channel scripted --feedback-accuracy 0.6 --feedback-specificity color --headless
-
-# LIVE keyboard channel (type "no, the red one", "a bit left", "stop" during rollout):
-./vla_lab/scripts/eval.sh --feedback-channel console
-
-# The input-quality study grid (accuracy × specificity, fusion vs trust-all ablation):
-CKPT=vla_lab/checkpoints/multicam_v0/last.pt NUM_EPISODES=30 \
-    ./vla_lab/scripts/sweep_feedback_quality.sh --headless
-```
-
-How feedback is handled (`vla_lab/feedback`): utterances are parsed into typed
-refinements (target override / avoid / directional nudge / stop / resume), then **fused
-by an online reliability estimate** (Beta posterior over "this human is right"):
-apply, verify (a confirmation query through the same channel), or ignore.
-`--no-fusion-verify` is the trust-all ablation. Robot-initiated queries and unsolicited
-corrections share one human model, so `--feedback-accuracy` is the single quality
-variable of the study. Per-episode feedback/intent traces land in `results_*.json`
-(`feedback.events`, `intent.mean_entropy`, controller `uncertainty_type` counts).
-
-## 11. Known gotchas
-
-- **NumPy 2.x freezes Isaac collection** — keep `numpy<2` in `riften`.
-- **`--enable_cameras` is required at collection AND eval** (the wrappers pass it). Without
-  it there are no images and the dataset refuses to build.
-- **Exit 137 during collection** = OOM kill → headless + smaller chunks.
-- **Exit 3 during collection** = the respawn watchdog aborted the run (frozen layout
-  protection). Do not bypass; see guide §5.1.
-- `eval_isaaclab.py` must run under the **IsaacLab launcher** (`eval.sh` handles this);
-  plain `python` can't import `isaaclab.app`.
-- Floats in `ticks.jsonl` are **4-decimal strings**; parse with `vla_lab.dataset`.
-- First tick of each episode has `action_from_prev = null` (no previous tick) — handled by
-  the dataset.
-- Sessions collected **before 2026-06-11** have the old camera framing and the frozen-layout
-  bug → don't mix with new data; `tiny_v0` checkpoints predate the fixes entirely.
-- **Wrist-consuming models need collect_v4 sessions** — the dataset refuses (with a clear
-  error) when `cameras` includes `wrist` but ticks have no `image_wrist`. Never mix
-  collect_v3 and collect_v4 sessions in one wrist-consuming training run.
-- The eval `--cameras` set must be a **subset of the checkpoint's `camera_set`** — a
-  single-camera checkpoint cannot consume the other view.
-
-## 12. Document index
-
-| Document | Content |
-| --- | --- |
-| [`rehab.md`](./rehab.md) | **2026-08 pivot: the Phase 0 specification.** The estimand, the carryover mechanism, the COACH/WAIT/ASSESS conditions, work items W1–W18, the Phase 0 contract, the data model, safety/IRB, and the open design decisions. The entry point for the other track |
-| [`rehab/README.md`](./rehab/README.md) | Phase 0 quick start: run order, the five day-to-day commands, and what to read first |
-| [`RECOMMENDATIONS.md`](./RECOMMENDATIONS.md) | 2026-07-05 project assessment: HRI-2027 fit/verdict, 13-week critical path, go/no-go gate, prioritized implementation list. **Superseded as the roadmap by `rehab.md`; kept as the VLA-track record** |
-| [`data_collection_guide.md`](./data_collection_guide.md) | Pipeline anatomy, data/action contract, 2026-06-11 bug fixes, final-dataset procedure, troubleshooting |
-| [`fable_report.md`](./fable_report.md) | 2026-07 reframing report: wrist camera, intent/perception decomposition, feedback fusion — what was built, why, and the July-2026 literature map |
-| [`docs/EVAL_DEBUG_REPORT.md`](./docs/EVAL_DEBUG_REPORT.md) | Postmortem: why eval flailed and how every root cause was fixed |
-| [`docs/new_changes.md`](./docs/new_changes.md) | Eval protocol design notes (Wilson CIs, occlusion axes, SmolVLA comparison) — pre-wrist framing |
-| [`docs/FABLE_INSTRUCTIONS.md`](./docs/FABLE_INSTRUCTIONS.md) | Historical task brief for the eval debug (context for the report) |
+Nothing was deleted. The carryover mathematics here is a descendant of that work — signed κ, a
+counter-proposal attenuation, and a value-defined coordinate are the three things that changed.

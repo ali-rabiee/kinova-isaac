@@ -41,8 +41,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="run only the Isaac-free clearance check (no simulator needed)")
     args = ap.parse_args(argv)
 
-    from vla_lab.rehab.apparatus.isaac_apparatus import ParticipantProxy, TwinReport, check_trajectories
-    from vla_lab.rehab.contract import Phase0Contract
+    from vla_lab.old_direction.rehab.apparatus.isaac_apparatus import ParticipantProxy, TwinReport, check_trajectories
+    from vla_lab.old_direction.rehab.contract import Phase0Contract
 
     cfg_path = Path(args.config)
     contract = Phase0Contract.from_yaml(cfg_path) if cfg_path.exists() else Phase0Contract()
@@ -65,7 +65,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         _emit(report, out_dir)
         return 0 if not collisions else 1
 
-    from vla_lab.rehab.apparatus.isaac_apparatus import IsaacApparatus
+    from vla_lab.old_direction.rehab.apparatus.isaac_apparatus import IsaacApparatus
 
     app = IsaacApparatus(contract, proxy=proxy, headless=not args.gui)
     try:

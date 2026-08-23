@@ -1,7 +1,7 @@
 """W10 — the Isaac Lab scene and control loop for the Phase 0 apparatus twin.
 
 Every Isaac/Omniverse symbol is imported **inside** a method. Importing this module must stay
-free so ``vla_lab.rehab``'s test suite, the synthetic pilot, and the analysis keep running on
+free so ``vla_lab.old_direction.rehab``'s test suite, the synthetic pilot, and the analysis keep running on
 a machine with no simulator; a missing simulator then fails at :meth:`BilateralChoiceTwin.setup`
 with an instruction rather than at import with a traceback.
 
@@ -12,7 +12,7 @@ What the twin is for (``rehab.md`` §6/W10) — validating, before a person is n
 3. the re-aimed wrist camera actually frames where a hand will arrive, and
 4. the safety envelope's speed and workspace limits are survivable in practice.
 
-The twin uses the **same** :class:`~vla_lab.rehab.apparatus.base.Apparatus` protocol, the same
+The twin uses the **same** :class:`~vla_lab.old_direction.rehab.apparatus.base.Apparatus` protocol, the same
 target IDs, and the same contract as the real backend, so a dry-run exercises the session code
 path instead of a parallel one.
 """
@@ -42,7 +42,7 @@ class BilateralChoiceTwin:
         self.cfg = cfg or DEFAULT_TWIN
         self.proxy = proxy
         self.headless = bool(headless)
-        #: Cartesian speed cap, matching :class:`~vla_lab.rehab.safety.SafetyLimits`. The twin
+        #: Cartesian speed cap, matching :class:`~vla_lab.old_direction.rehab.safety.SafetyLimits`. The twin
         #: moves at the speed the study will actually use, or it has validated nothing.
         self.max_speed_ms = float(max_speed_ms)
         self.grid = contract.target_grid()
