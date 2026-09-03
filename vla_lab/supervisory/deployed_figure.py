@@ -27,12 +27,22 @@ PAPER = Path("vla_lab/paper/hri2027_carryover_vla")
 COLORS = {"none": "#6d8299", "text": "#8e44ad", "token": "#2e7d32", "film": "#c62828"}
 
 
+def policy_condition(deployed: Dict[str, Any], default: str = "carryover_aware") -> str:
+    """The policy the checkpoints drove, from the summary's own metadata."""
+    return str((deployed.get("_meta") or {}).get("policy") or default)
+
+
 def _rows(deployed: Dict[str, Any], condition: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for key, e in deployed.items():
+        if key.startswith("_"):
+            continue
         cell = e.get("conditions", {}).get(condition, {})
         g = e.get("grounder", {})
-        ctx = key.split("__")[-1] if "__" in key else None
+        # Keys are ``policy_<read>@<model>__<context>[__s<seed>]``: take the context segment,
+        # never the last one -- a seed suffix silently emptied the whole facts file once.
+        parts = key.split("@")[-1].split("__")
+        ctx = parts[1] if len(parts) > 1 else None
         out.append({
             "key": key,
             "read": ("lexical" if key == "lexical" else ("said" if key.startswith("policy_said") else "unprompted")),
@@ -44,6 +54,65 @@ def _rows(deployed: Dict[str, Any], condition: str) -> List[Dict[str, Any]]:
             "abstain_band": g.get("abstain_rate_band"),
         })
     return out
+
+
+def deployed_facts(runs: Sequence[Tuple[str, Dict[str, Any], Sequence[Dict[str, Any]]]],
+                   *, condition: str = "carryover_aware") -> Dict[str, Any]:
+    """What the closed-loop cells support, stated without a correlation coefficient.
+
+    The cell count is far below the minimum the analysis allows a coefficient on
+    (:data:`vla_lab.stats_utils.MIN_N_FOR_CORRELATION`), so the guard withholds it and the facts
+    reported are the two the evidence actually carries: whether the best offline cell on each
+    backbone is also the best deployed one, and how in-band abstention lines up with failure.
+    """
+    from ..stats_utils import guarded_correlation
+
+    cells: List[Dict[str, Any]] = []
+    for label, deployed, models in runs:
+        rows = _rows(deployed, policy_condition(deployed, condition))
+        ref = next((r["mae"] for r in rows if r["read"] == "lexical"), None)
+        offline = {str(m.get("context")): m for m in models if m.get("debias_gain_brier") is not None}
+        for r in rows:
+            if r["read"] != "unprompted" or r["mae"] is None or ref is None:
+                continue
+            m = offline.get(r["context"])
+            cells.append({"backbone": label, "context": r["context"], "deployed_rel": r["mae"] - ref,
+                          "deployed_mae": r["mae"], "reference_mae": ref,
+                          "offline_gain": (float(m["debias_gain_brier"]) if m else None),
+                          "offline_kappa_corr": (float(m["debias_kappa_corr"]) if m else None),
+                          "abstain_band": float(r.get("abstain_band") or 0.0)})
+    scored = [c for c in cells if c["offline_gain"] is not None]
+    gain_vs_dep = guarded_correlation([c["offline_gain"] for c in scored], [c["deployed_rel"] for c in scored])
+    abst_vs_dep = guarded_correlation([c["abstain_band"] for c in scored], [c["deployed_rel"] for c in scored])
+    per_backbone: Dict[str, Any] = {}
+    for label in {c["backbone"] for c in scored}:
+        mine = [c for c in scored if c["backbone"] == label]
+        best_off = max(mine, key=lambda c: c["offline_gain"])
+        by_dep = sorted(mine, key=lambda c: c["deployed_rel"])
+        per_backbone[label] = {
+            "best_offline_context": best_off["context"],
+            "best_offline_deployed_rank": 1 + by_dep.index(best_off),
+            "n_contexts": len(mine),
+            "best_deployed_context": by_dep[0]["context"],
+            "worst_deployed_context": by_dep[-1]["context"],
+            "worst_deployed_rel": by_dep[-1]["deployed_rel"],
+        }
+    worst = max(scored, key=lambda c: c["deployed_rel"]) if scored else None
+    most_abst = max(scored, key=lambda c: c["abstain_band"]) if scored else None
+    return {
+        "n_cells": len(scored),
+        "condition": condition,
+        "cells": cells,
+        "offline_gain_vs_deployed": gain_vs_dep,
+        "abstention_vs_deployed": abst_vs_dep,
+        "per_backbone": per_backbone,
+        "worst_cell": worst,
+        "most_abstaining_cell": most_abst,
+        "worst_is_most_abstaining": bool(worst and most_abst and worst is most_abst),
+        "cells_above_11pct_band_abstention": [f"{c['backbone']}/{c['context']}" for c in scored if c["abstain_band"] > 0.11],
+        "cells_failing": [f"{c['backbone']}/{c['context']}" for c in scored
+                          if c["deployed_rel"] > 0.005],
+    }
 
 
 def figure(runs: Sequence[Tuple[str, Dict[str, Any], Sequence[Dict[str, Any]]]], out: Path,
@@ -59,7 +128,7 @@ def figure(runs: Sequence[Tuple[str, Dict[str, Any], Sequence[Dict[str, Any]]]],
     bars: List[Dict[str, Any]] = []
     points: List[Dict[str, Any]] = []
     for label, deployed, models in runs:
-        rows = _rows(deployed, condition)
+        rows = _rows(deployed, policy_condition(deployed, condition))
         ref = next((r["mae"] for r in rows if r["read"] == "lexical"), None)
         offline = {str(m.get("context")): m for m in models if m.get("debias_kappa_corr") is not None}
         for r in sorted((r for r in rows if r["read"] == "unprompted"),
@@ -108,7 +177,10 @@ def figure(runs: Sequence[Tuple[str, Dict[str, Any], Sequence[Dict[str, Any]]]],
     fig.savefig(out, bbox_inches="tight")
     fig.savefig(out.with_suffix(".png"), dpi=170, bbox_inches="tight")
     plt.close(fig)
-    return {"n_cells": len(bars), "condition": condition, "figure": str(out)}
+    facts = deployed_facts(runs, condition=condition)
+    facts["figure"] = str(out)
+    out.with_name("facts.json").write_text(json.dumps(facts, indent=2, default=float) + "\n")
+    return facts
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

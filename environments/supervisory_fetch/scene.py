@@ -46,6 +46,10 @@ _COLOR_RGB = {
     "blue": (0.14, 0.32, 0.82),
     "green": (0.18, 0.60, 0.26),
     "yellow": (0.92, 0.78, 0.16),
+    "magenta": (0.72, 0.16, 0.66),
+    "teal": (0.10, 0.58, 0.62),
+    "white": (0.92, 0.92, 0.90),
+    "orange": (0.95, 0.52, 0.12),
 }
 
 #: Names of the object prims, in spawn order. ``target`` and ``blocker`` are the two the study
@@ -75,6 +79,9 @@ class SupervisoryFetchScene:
         self.controller = None
         self.follower = None
         self.cameras: Dict[str, Any] = {}
+        #: Extra named overhead cameras to create and capture (name -> SupTopDownCameraConfig).
+        #: Used by the distribution-shift atlas; never by a rollout.
+        self.extra_cameras: Dict[str, Any] = {}
         self._object_paths: List[str] = []
         self._views: Dict[str, Any] = {}
         self._rng = np.random.default_rng(self.seed)
@@ -153,9 +160,19 @@ class SupervisoryFetchScene:
 
         root = self.scene_cfg.objects_root
         s = float(self.scene_cfg.cube_size_m)
-        colors = [self.scene_cfg.target_color, self.scene_cfg.blocker_color, "green", "yellow"]
+        dcols = tuple(getattr(self.scene_cfg, "distractor_colors", ("green", "yellow")))
+        names = self.object_names
+        colors = [self.scene_cfg.target_color, self.scene_cfg.blocker_color] + [
+            dcols[i % max(len(dcols), 1)] for i in range(len(names) - 2)]
         self._object_paths = []
-        for i, (name, color) in enumerate(zip(OBJECT_NAMES, colors)):
+        overlay = getattr(self.scene_cfg, "table_overlay_color", None)
+        if overlay is not None:
+            # A visual-only slab: no rigid body, no collision, so the physics is untouched and
+            # only what the cameras see changes.
+            slab = sim_utils.CuboidCfg(size=(1.3, 1.3, 0.001),
+                                       visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=tuple(overlay)))
+            slab.func(f"{root}_overlay", slab, translation=(0.35, 0.0, self.scene_cfg.table_height_m + 0.0006))
+        for i, (name, color) in enumerate(zip(names, colors)):
             path = f"{root}/{name}"
             cfg = sim_utils.CuboidCfg(
                 size=(s, s, s),
@@ -171,11 +188,20 @@ class SupervisoryFetchScene:
             cfg.func(path, cfg, translation=(0.35 + 0.10 * i, 0.30, self.scene_cfg.table_height_m + s))  # world
             self._object_paths.append(path)
 
+    @property
+    def object_names(self) -> Tuple[str, ...]:
+        """``target``, ``blocker``, then as many distractor prims as the scene config asks for
+        (never fewer than two, so the default atlas is unchanged)."""
+        n = max(2, int(getattr(self.scene_cfg, "n_distractors", 2)))
+        return ("target", "blocker") + tuple(f"distractor_{i}" for i in range(n))
+
     def _create_camera_prims(self) -> None:
         """Create the USD camera prims. The sensors attach to these afterwards."""
         from environments.utils.camera import create_topdown_camera
 
         create_topdown_camera(DEFAULT_SUP_TOPDOWN_CAMERA)
+        for cfg in self.extra_cameras.values():
+            create_topdown_camera(cfg)
         self._create_figure_camera_prim()
 
     def _create_figure_camera_prim(self) -> None:
@@ -245,7 +271,8 @@ class SupervisoryFetchScene:
         from isaaclab.sensors import Camera, CameraCfg
 
         self.cameras = {}
-        for name, cfg in (("topdown", DEFAULT_SUP_TOPDOWN_CAMERA), ("figure", DEFAULT_SUP_FIGURE_CAMERA)):
+        for name, cfg in [("topdown", DEFAULT_SUP_TOPDOWN_CAMERA), ("figure", DEFAULT_SUP_FIGURE_CAMERA),
+                          *self.extra_cameras.items()]:
             try:
                 cam_cfg = CameraCfg(
                     prim_path=cfg.prim_path,
@@ -398,10 +425,11 @@ class SupervisoryFetchScene:
             ("target", layout["target"]["xy"], layout["target"]["z"]),
             ("blocker", layout["blocker"]["xy"], layout["blocker"]["z"]),
         ]
-        for i, d in enumerate(layout["distractors"][: len(OBJECT_NAMES) - 2]):
+        names = self.object_names
+        for i, d in enumerate(layout["distractors"][: len(names) - 2]):
             places.append((f"distractor_{i}", d["xy"], d["z"]))
         used = {n for n, _, _ in places}
-        for k, n in enumerate(OBJECT_NAMES):
+        for k, n in enumerate(names):
             if n not in used:
                 places.append((n, (0.15, 0.45 + 0.08 * k), 0.03))
 

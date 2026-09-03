@@ -228,6 +228,11 @@ class CarryoverPosterior:
             self.log_prior = self._log_prior()
         self.log_w = self.log_prior.copy()
         self.kappa = np.zeros_like(self.lam)
+        #: ``d kappa / d lambda`` per cell, carried alongside ``kappa`` so the Fisher information
+        #: for the decay rate is available at every slot (see :meth:`lambda_diagnostic`).
+        self.dkappa = np.zeros_like(self.lam)
+        #: Fisher information for ``lambda`` accumulated from the observed slots, per cell.
+        self.info_lam = np.zeros_like(self.lam)
         self.n_observations = 0
         self.n_coach = 0
         self.n_counter = 0
@@ -262,6 +267,7 @@ class CarryoverPosterior:
         act = str(action)
         inc = self.g * float(strength) * float(direction) if act == COACH else 0.0
         eff = self.kappa + inc
+        deff = self.dkappa                                   # the increment does not depend on lambda
         if pi_star is not None and chose_a is not None:
             rho = self.cfg.rho_for(act)
             lo = logit(float(pi_star))
@@ -270,11 +276,17 @@ class CarryoverPosterior:
             self.log_w = self.log_w + (y * np.log(p) + (1.0 - y) * np.log1p(-p))
             self.log_w -= logsumexp(self.log_w)
             self.n_observations += 1
+            # Fisher information for lambda carried by this observation, per cell:
+            # sigma(1 - sigma) * (d eta / d lambda)^2 with eta = logit pi* + rho beta kappa.
+            self.info_lam = self.info_lam + p * (1.0 - p) * (rho * self.beta * deff) ** 2
         if act == COACH:
             self.n_coach += 1
         if act == COUNTER:
             self.n_counter += 1
-        self.kappa = np.power(self.lam, float(delta)) * eff
+        d = float(delta)
+        lam_d = np.power(self.lam, d)
+        self.dkappa = d * np.power(self.lam, max(d - 1.0, 0.0)) * eff * (1.0 if d > 0 else 0.0) + lam_d * deff
+        self.kappa = lam_d * eff
 
     # -- summaries ---------------------------------------------------------
     def weights(self) -> np.ndarray:
@@ -373,7 +385,7 @@ class CarryoverPosterior:
         return 0.5 * (lo + hi)
 
     # -- diagnostics -------------------------------------------------------
-    def identifiability(self, *, tv_threshold: float = 0.05) -> Dict[str, Any]:
+    def identifiability(self, *, tv_threshold: float = 0.05, sd_ratio_threshold: float = 0.75) -> Dict[str, Any]:
         """Has the data moved the posterior away from the prior, and on which axis?
 
         Reported per axis as total variation between the prior and posterior marginals. An
@@ -389,10 +401,75 @@ class CarryoverPosterior:
             pri = np.array([prior[np.isclose(arr, e)].sum() for e in edges])
             pos = np.array([post[np.isclose(arr, e)].sum() for e in edges])
             tv = 0.5 * float(np.abs(pri - pos).sum())
-            out[name] = {"tv": tv, "identified": bool(tv >= float(tv_threshold))}
+            # **Two criteria, because the first one can fire for the wrong reason.** Total
+            # variation between the prior and posterior marginals moves whenever the marginal
+            # moves -- including when an empirical-Bayes prior correlates lambda with beta and
+            # the data identify beta: the lambda marginal then shifts without a single bit of
+            # information about lambda having arrived. Measured 2026-08-23: under the
+            # leave-one-out population prior the TV flag fired for 44% of the supervisors whose
+            # true beta is exactly zero, for whom lambda is unidentifiable by construction. The
+            # second criterion is posterior *contraction*: the posterior SD of the marginal
+            # against the prior SD. Information about a parameter is what shrinks it, and a
+            # non-complier's data carry none about lambda, so their ratio stays near one.
+            m_pri, m_pos = float(np.dot(pri, edges)), float(np.dot(pos, edges))
+            sd_pri = float(np.sqrt(max(0.0, float(np.dot(pri, (edges - m_pri) ** 2)))))
+            sd_pos = float(np.sqrt(max(0.0, float(np.dot(pos, (edges - m_pos) ** 2)))))
+            ratio = sd_pos / sd_pri if sd_pri > 1e-12 else 1.0
+            out[name] = {"tv": tv, "identified": bool(tv >= float(tv_threshold)),
+                         "sd_prior": sd_pri, "sd_post": sd_pos, "sd_ratio": float(ratio),
+                         "identified_sd": bool(ratio <= float(sd_ratio_threshold))}
         out["n_observations"] = int(self.n_observations)
         out["n_coach"] = int(self.n_coach)
         return out
+
+    def lambda_information(self, *, pi_star: Optional[float] = None, action: str = PROBE,
+                           after_delta: float = 0.0) -> Dict[str, float]:
+        """Fisher information for ``lambda``: what the data so far carry, and what one more
+        observation would add.
+
+        ``accumulated`` is the posterior-expected information from the observed slots.
+        ``gain_if_observe`` is the expected information one observation would add, taken now
+        (or after ``after_delta`` more decay units of waiting), at a scene whose plug-in
+        ``pi*`` is ``pi_star``. Information about the decay rate comes from seeing the residue
+        at *distinct* elapsed times with leverage on the response, so this is the quantity an
+        identification-first schedule maximises and a deployment can watch.
+        """
+        w = self.weights()
+        out: Dict[str, float] = {"accumulated": float(np.dot(w, self.info_lam))}
+        if pi_star is not None:
+            d = float(after_delta)
+            lam_d = np.power(self.lam, d)
+            k = lam_d * self.kappa
+            dk = (d * np.power(self.lam, max(d - 1.0, 0.0)) * self.kappa if d > 0 else 0.0) + lam_d * self.dkappa
+            rho = self.cfg.rho_for(action)
+            p = np.clip(sigmoid_np(logit(float(pi_star)) + rho * self.beta * k), 1e-12, 1.0 - 1e-12)
+            gain = p * (1.0 - p) * (rho * self.beta * dk) ** 2
+            out["gain_if_observe"] = float(np.dot(w, gain))
+        return out
+
+    def lambda_diagnostic(self, *, tv_threshold: float = 0.05) -> Dict[str, Any]:
+        """The prospective identification readout, logged every slot by the policies.
+
+        A system that can tell it is about to personalise on its prior is the practically
+        useful thing here: ``identified`` is whether the posterior over ``lambda`` has moved
+        off the prior by more than ``tv_threshold`` in total variation, ``information`` is the
+        accumulated Fisher information, and ``sd`` the current posterior spread.
+        """
+        ident = self.identifiability(tv_threshold=tv_threshold)["lambda"]
+        m = self.mean()
+        lam_hat = float(np.clip(m["lambda"], 1e-6, 1 - 1e-6))
+        return {
+            "lambda_mean": float(m["lambda"]),
+            "lambda_sd": float(self.sd()["lambda"]),
+            "lambda_tv": float(ident["tv"]),
+            "lambda_identified": bool(ident["identified"]),
+            "lambda_sd_ratio": float(ident["sd_ratio"]),
+            "lambda_identified_sd": bool(ident["identified_sd"]),
+            "lambda_information": float(self.lambda_information()["accumulated"]),
+            # The elapsed time at which one more observation is most informative about lambda
+            # under the current mean: Delta * lambda^Delta peaks at Delta = -1 / ln(lambda).
+            "lambda_efold_delta": float(-1.0 / math.log(lam_hat)),
+        }
 
     def effect(self, *, level: float = 0.9, threshold: float = 0.15) -> Dict[str, Any]:
         """Is there a compliance effect at all? The go/no-go, as a number.
@@ -420,6 +497,7 @@ class CarryoverPosterior:
             "contamination": self.contamination(),
             "washout_delta": self.washout_delta(),
             "identifiability": self.identifiability(),
+            "lambda_diagnostic": self.lambda_diagnostic(),
             "effect": self.effect(),
             "n_observations": int(self.n_observations),
             "n_coach": int(self.n_coach),
@@ -465,7 +543,7 @@ class CarryoverPosterior:
     def copy(self) -> "CarryoverPosterior":
         out = CarryoverPosterior.__new__(CarryoverPosterior)
         out.cfg = self.cfg
-        for attr in ("lam", "beta", "g", "log_prior", "log_w", "kappa"):
+        for attr in ("lam", "beta", "g", "log_prior", "log_w", "kappa", "dkappa", "info_lam"):
             setattr(out, attr, getattr(self, attr).copy())
         out._axes = self._axes
         out.n_observations = self.n_observations

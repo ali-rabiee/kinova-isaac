@@ -198,3 +198,79 @@ if __name__ == "__main__":
     from vla_lab.tests import run_namespace
 
     sys.exit(1 if run_namespace(dict(globals()), label="test_human_study") else 0)
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-23: the phrase-corpus tooling (P3-1). Fixture utterances only -- no corpus exists.
+# ---------------------------------------------------------------------------
+_FIXTURE = [
+    ("p1", "clear the blue one out of the way first", "A"),
+    ("p1", "just grab it directly", "B"),
+    ("p2", "hmm, either way I guess", None),
+    ("p2", "if the gap is big enough go straight for it, otherwise clear it", None),
+    ("p3", "lift it over the top of the blue one", None),
+    ("p3", "push the blocker aside then take the red one", "A"),
+    ("p4", "reach around and take it", "B"),
+    ("p4", "do something sensible", None),
+]
+
+
+def _write_fixture(path):
+    import csv
+
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["participant_id", "packet_index", "scene_id", "response_text", "modality"])
+        for i, (pid, text, _lab) in enumerate(_FIXTURE):
+            w.writerow([pid, 1 + i % 3, 7, text, "typed"])
+
+
+def test_phrase_corpus_evaluate_enumerates_every_failure_mode():
+    import tempfile
+    from pathlib import Path
+
+    from vla_lab.human_study.phrase_corpus import evaluate
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "responses.csv"
+        _write_fixture(p)
+        rep = evaluate(p)
+    assert rep["n_responses"] == 8 and rep["n_participants"] == 4
+    assert abs(rep["grounding_rate"] - 4 / 8) < 1e-9
+    assert not rep["meets_threshold"] and rep["verdict"].startswith("no-go")
+    fm = rep["failure_modes"]
+    assert fm.get("hedge") == 1 and fm.get("conditional") == 1
+    assert fm.get("unimplemented_strategy") == 1 and fm.get("names_neither") == 1
+    assert fm.get("multi_clause_both_sides") == 1            # the conditional names both sides
+
+
+def test_phrase_corpus_rebuild_installs_an_empirical_axis_that_the_contract_hashes():
+    import tempfile
+    from pathlib import Path
+
+    from vla_lab.human_study.phrase_corpus import install_empirical_axis, rebuild
+    from vla_lab.supervisory import strategies, supervisor
+    from vla_lab.supervisory.contract import Contract
+    from vla_lab.supervisory.narration import ground
+
+    before_axis, before_hedges = strategies.AXES["plan"], supervisor._HEDGES
+    before_hash = Contract().narration_hash()
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "responses.csv"
+            _write_fixture(p)
+            rep = rebuild(p)
+            f = Path(td) / "axis.json"
+            import json
+
+            f.write_text(json.dumps(rep))
+            info = install_empirical_axis(f)
+        assert info["n_phrases_a"] == 2 and info["n_phrases_b"] == 2 and info["n_hedges"] == 4
+        assert abs(info["ungrounded_rate"] - 0.5) < 1e-9
+        axis = strategies.get_axis("plan")
+        assert all(ground(ph, axis) == "A" for ph in axis.phrases_a), "every sampled phrase must still ground"
+        assert all(ground(ph, axis) == "B" for ph in axis.phrases_b)
+        assert Contract().narration_hash() != before_hash, "the rebuilt supervisor must not pool with the scripted one"
+    finally:
+        strategies.AXES["plan"] = before_axis
+        supervisor._HEDGES = before_hedges

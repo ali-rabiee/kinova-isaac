@@ -36,7 +36,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--shift", action="store_true",
+                    help="render the HELD-OUT atlas for the distribution-shift evaluation: shifted object "
+                         "colours and size, an altered table surface, an added distractor, and a second "
+                         "overhead camera pose captured alongside the contract one (see "
+                         "environments.supervisory_fetch.config.SHIFTED_SUP_SCENE_KW)")
     args = ap.parse_args(argv)
+    if args.shift and args.out == Path("vla_lab/results/physics/frames"):
+        args.out = Path("vla_lab/results/physics/frames_shift")
 
     from isaaclab.app import AppLauncher
 
@@ -51,7 +58,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     cfg = IsaacApparatusConfig(headless=bool(args.headless), device=args.device, capture_frames=True)
-    scene = SupervisoryFetchScene(cfg=cfg, seed=int(args.seed), capture_dir=out)
+    scene_cfg = None
+    if args.shift:
+        from dataclasses import replace as _replace
+
+        from environments.supervisory_fetch.config import (DEFAULT_SUP_SCENE, SHIFTED_SUP_SCENE_KW,
+                                                           SHIFTED_SUP_TOPDOWN_CAMERA)
+
+        scene_cfg = _replace(DEFAULT_SUP_SCENE, **SHIFTED_SUP_SCENE_KW)
+    scene = SupervisoryFetchScene(cfg=cfg, scene_cfg=scene_cfg, seed=int(args.seed) + (1000 if args.shift else 0),
+                                  capture_dir=out)
+    if args.shift:
+        scene.extra_cameras["topdown_shift"] = SHIFTED_SUP_TOPDOWN_CAMERA
     scene.open()
     grid = build_scene_grid()
 
@@ -63,6 +81,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             scene.reset_to(sc)
             errs.append(abs(float(scene._placement_error_m or 0.0)))
             which = ("topdown", "figure") if (v == 0 and args.figure_views) else ("topdown",)
+            if args.shift:
+                which = which + ("topdown_shift",)
             paths = scene.capture(sc, tag=f"v{v}", which=which)
             rows.append({"scene_id": int(sc.scene_id), "variant": v, "margin_m": float(sc.margin_m),
                          "c": float(sc.c), "placement_error_m": errs[-1],
@@ -77,12 +97,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "target_xy": list(scene.scene_cfg.target_xy),
         "blocker_bearing_rad": float(scene.scene_cfg.blocker_bearing_rad),
         "cube_size_m": float(scene.scene_cfg.cube_size_m),
+        "shift": bool(args.shift),
+        "scene_cfg": scene.scene_cfg.to_dict(),
+        "physics": grid.physics.to_dict(),
         "rows": rows,
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2, default=float) + "\n")
-    scene.close()
     print(f"\n{len(rows)} renders over {len(grid.scenes)} scenes in {time.time() - t0:.0f}s -> {out}")
     print(f"worst realised-gap error across every reset: {worst * 1000:.3f} mm")
+    # No ``scene.close()``: the simulator's teardown hangs after a headless run and every output
+    # is already on disk. Measured 2026-08-23: the render finished in 328 s and then sat in
+    # ``sim.stop()`` indefinitely, holding the GPU the next stage needed.
     _exit_now(0)
     return 0
 

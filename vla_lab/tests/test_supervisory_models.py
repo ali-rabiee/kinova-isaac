@@ -287,3 +287,50 @@ def test_smolvla_does_not_receive_the_from_scratch_vocabulary_size():
     assert not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()), (
         "if SmolVLABackbone starts taking **kw this guard stops working"
     )
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-23: seed dispersion and the seed floor (P0-1)
+# ---------------------------------------------------------------------------
+def test_seed_floor_is_the_mean_pairwise_difference_within_cells():
+    from vla_lab.training.seeds import aggregate_seeds, seed_floor
+
+    rows = []
+    for seed, g in ((1, 0.10), (2, 0.12), (3, 0.11)):
+        rows.append({"model": "tiny", "context": "film", "seed": seed, "debias_gain_brier": g,
+                     "debias_kappa_corr": 0.1 + 0.01 * seed, "ask_rank_corr": 0.0})
+    for seed, g in ((1, 0.09), (2, 0.09), (3, 0.09)):
+        rows.append({"model": "tiny", "context": "none", "seed": seed, "debias_gain_brier": g,
+                     "debias_kappa_corr": 0.0, "ask_rank_corr": 0.0})
+    fl = seed_floor(rows, "debias_gain_brier", group_by=("model", "context"))
+    # film pairs: |0.10-0.12|, |0.10-0.11|, |0.12-0.11| = 0.02, 0.01, 0.01; none pairs: 0, 0, 0
+    assert abs(fl["floor"] - (0.04 / 6)) < 1e-12 and fl["n_pairs"] == 6
+    agg = aggregate_seeds(rows)
+    film = next(c for c in agg["cells"] if c["context"] == "film")
+    assert film["n_seeds"] == 3 and abs(film["debias_gain_brier"]["mean"] - 0.11) < 1e-12
+    con = next(c for c in agg["contrasts"] if c["metric"] == "debias_gain_brier")
+    assert con["n_seeds"] == 3 and con["same_sign_every_seed"]
+    assert abs(abs(con["delta_b_minus_a"]) - 0.02) < 1e-12
+    assert con["clears_floor"], "a 0.02 difference clears a 0.0067 floor"
+
+
+def test_an_ordering_inside_the_seed_floor_is_not_allowed_to_clear_it():
+    from vla_lab.training.seeds import aggregate_seeds
+
+    rows = []
+    for seed, ga, gb in ((1, 0.10, 0.11), (2, 0.13, 0.10), (3, 0.11, 0.12)):
+        rows.append({"model": "m", "context": "a", "seed": seed, "debias_gain_brier": ga, "debias_kappa_corr": 0.0})
+        rows.append({"model": "m", "context": "b", "seed": seed, "debias_gain_brier": gb, "debias_kappa_corr": 0.0})
+    agg = aggregate_seeds(rows)
+    con = next(c for c in agg["contrasts"] if c["metric"] == "debias_gain_brier")
+    assert not con["clears_floor"] and not con["same_sign_every_seed"]
+
+
+def test_single_seed_rows_report_no_dispersion_rather_than_a_fake_one():
+    from vla_lab.training.seeds import aggregate_seeds
+
+    rows = [{"model": "m", "context": "a", "seed": 1, "debias_gain_brier": 0.1, "debias_kappa_corr": 0.2}]
+    agg = aggregate_seeds(rows)
+    cell = agg["cells"][0]
+    assert cell["n_seeds"] == 1 and cell["debias_gain_brier"]["sd"] is None
+    assert agg["seed_floor"]["debias_gain_brier"]["floor"] is None

@@ -37,7 +37,7 @@ from .apparatus import LexicalGrounder
 from .contract import Contract
 from .narration import grounding_agreement
 from .run_study import _fit_reported, aggregate, run_one_supervisor
-from .scheduler import CONDITION_CARRYOVER_AWARE, PRIMARY_COMPARATOR
+from .scheduler import CONDITION_CARRYOVER_AWARE, POLICY_RECOMMENDED, PRIMARY_COMPARATOR
 
 
 def _resolve(p: Path) -> Path:
@@ -77,7 +77,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--seed", type=int, default=20260823)
     ap.add_argument("--frames", type=Path, default=Path("vla_lab/results/physics/frames/topdown"))
     ap.add_argument("--min-confidence", type=float, default=0.60)
-    ap.add_argument("--conditions", nargs="+", default=[CONDITION_CARRYOVER_AWARE, PRIMARY_COMPARATOR])
+    ap.add_argument("--conditions", nargs="+", default=[POLICY_RECOMMENDED, PRIMARY_COMPARATOR],
+                    help="the policy the checkpoint drives; default is the RECOMMENDED configuration "
+                         "(corrected estimator + counter-proposals, adaptive schedule off) and the comparator")
     ap.add_argument("--channels", nargs="+", default=["lexical", "policy_said", "policy_unprompted"])
     ap.add_argument("--out", type=Path, default=Path("vla_lab/results/deployed"))
     ap.add_argument("--device", default=None, help="torch device for the policy (default: auto)")
@@ -118,6 +120,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         results[label] = summary
         print(f"[{label}] done in {summary['elapsed_s']:.0f}s", file=sys.stderr)
 
+    results["_meta"] = {"conditions": list(args.conditions), "policy": list(args.conditions)[0],
+                        "supervisors": int(args.supervisors), "seed": int(args.seed),
+                        "frames": str(args.frames), "min_confidence": float(args.min_confidence)}
     (out / "summary.json").write_text(json.dumps(results, indent=2, default=float) + "\n")
     print(render(results, list(args.conditions)))
     (out / "table.txt").write_text(render(results, list(args.conditions)) + "\n")
@@ -130,6 +135,8 @@ def render(results: Dict[str, Any], conditions: Sequence[str]) -> str:
     lines = ["", "Closed-loop evaluation: the policy in the session, not on held-out data.",
              head, "-" * len(head)]
     for chan, s in results.items():
+        if chan.startswith("_"):
+            continue
         g = s.get("grounder", {})
         for c in conditions:
             cell = s["conditions"].get(c, {})

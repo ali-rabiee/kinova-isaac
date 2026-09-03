@@ -167,20 +167,26 @@ def figure_curves(runs: Sequence[Dict[str, Any]], out: Path) -> Optional[Path]:
         ("acc_said", "grounding accuracy", False),
     ]
     fig, axes = plt.subplots(1, len(panels), figsize=(3.0 * len(panels), 2.5))
-    colors = plt.cm.viridis(np.linspace(0.05, 0.85, max(len(runs), 1)))
+    palette = {"none": "#c0392b", "text": "#8e44ad", "token": "#2c6fbb", "film": "#16a085"}
+    seen = set()
     for (key, label, zero_line), ax in zip(panels, axes):
-        for r, col in zip(runs, colors):
+        for r in runs:
             h = r["history"]
             ys = [x.get(key) for x in h if x.get(key) is not None]
             if not ys:
                 continue
-            name = f"{r['manifest'].get('context_mode')}"
-            ax.plot(range(len(ys)), ys, color=col, lw=1.3, label=name)
+            mode = str(r["manifest"].get("context_mode"))
+            first = (key, mode) not in seen
+            seen.add((key, mode))
+            # One colour per context mode, one line per seed: the vertical spread between lines
+            # of the same colour IS the seed floor, drawn rather than only tabulated.
+            ax.plot(range(len(ys)), ys, color=palette.get(mode, "#7f8c8d"), lw=1.1, alpha=0.75,
+                    label=(mode if (first and ax is axes[0]) else None))
         if zero_line:
             ax.axhline(0.0, color="#444", lw=0.8, ls="--")
         ax.set_xlabel("epoch")
         ax.set_title(label, loc="left", fontsize=8)
-    axes[0].legend(fontsize=6, frameon=False, title="context", title_fontsize=6)
+    axes[0].legend(fontsize=6, frameon=False, title="context (one line per seed)", title_fontsize=6)
     fig.tight_layout()
     out.mkdir(parents=True, exist_ok=True)
     p = out / "fig_training_curves.pdf"

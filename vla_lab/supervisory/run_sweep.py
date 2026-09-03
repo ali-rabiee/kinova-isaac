@@ -50,6 +50,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--scene-id-base", type=int, default=1000,
+                    help="first synthetic scene id. The expert's pose-noise draw is seeded from the scene id "
+                         "and the episode counter, so a SECOND sweep that reuses the default base replays "
+                         "the first sweep's noise draws rollout for rollout and measures nothing new. Give "
+                         "every additional sweep its own base (the tight-end sweep uses 5000).")
     ap.add_argument("--fit", action="store_true", help="fit ScenePhysics when the sweep finishes")
     ap.add_argument("--dry-run", action="store_true", help="print the plan and the geometry; no simulator")
     args = ap.parse_args(argv)
@@ -89,7 +94,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     n_ok = 0
     with path.open("w") as fh:
         for i, row in enumerate(rows):
-            scene = SceneSpec(scene_id=1000 + i, axis=grid.axis, margin_m=float(row["margin_m"]),
+            scene = SceneSpec(scene_id=int(args.scene_id_base) + i, axis=grid.axis, margin_m=float(row["margin_m"]),
                               clutter=2, c=float(grid.physics.coordinate(row["margin_m"])))
             appa.reset_scene(scene)
             outc = appa.execute(scene, row["strategy"])
@@ -99,25 +104,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             n_ok += int(outc.success)
             print(f"  [{i + 1}/{len(rows)}] gap={row['margin_m'] * 100:.1f}cm {row['strategy']} "
                   f"-> {'ok' if outc.success else 'fail'}  ({time.time() - t0:.0f}s)", file=sys.stderr)
-    appa.close()
-
+    # Deliberately no ``appa.close()`` before the fit: the simulator's teardown can hang for
+    # good after a long headless run, and with the fit queued behind it the physics would never
+    # be written. Everything below is pure Python; the process exits via ``_exit_now``.
     rollouts = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
     print(summarise(rollouts))
     if args.fit:
+        from .apparatus.measure import write_fit_outputs
+
         phys, report = fit_from_rollouts(rollouts)
-        save_physics(phys, out / "physics.json")
+        report["rollout_files"] = [str(path)]
         # The figure is written here rather than by a separate command because the value model
         # is the paper's least visible and most load-bearing object: a degenerate fit -- a step,
         # or two curves lying on top of each other -- is obvious in the picture and invisible in
         # the parameters.
-        try:
-            from .physics_figure import figure as _physics_figure
-
-            report["figure"] = _physics_figure(rollouts, phys, out / "fig_physics.pdf")
-        except Exception as exc:                                    # matplotlib is optional
-            report["figure_error"] = f"{type(exc).__name__}: {exc}"
-        (out / "physics_report.json").write_text(json.dumps(report, indent=2, default=float) + "\n")
-        print(json.dumps(report, indent=2, default=float))
+        write_fit_outputs(phys, report, out / "physics.json", rows=rollouts)
+        print(json.dumps({k: report[k] for k in ("crossover_margin_m", "transition_width_m", "degenerate")}, indent=2))
     print(f"\n{len(rollouts)} rollouts ({n_ok} successful) in {time.time() - t0:.0f}s -> {path}")
     _exit_now(0)
     return 0

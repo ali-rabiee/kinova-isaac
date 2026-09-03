@@ -33,6 +33,10 @@ copy vla_lab/results/physics/fig_physics.pdf      fig_physics.pdf
 copy vla_lab/results/reach/fig_reach.pdf          fig_reach.pdf
 copy vla_lab/results/deployed/fig_deployed.pdf    fig_deployed.pdf
 copy "${AUDIT_DIR:-vla_lab/results/models_isaac/audit}/fig_training_curves.pdf" fig_training_curves.pdf
+copy vla_lab/results/flip_w/fig_flip.pdf              fig_flip_w.pdf
+copy vla_lab/results/flip_mstar/fig_flip.pdf          fig_flip_mstar.pdf
+copy vla_lab/results/sensitivity/fig_dose_tracking.pdf fig_dose_tracking.pdf
+copy vla_lab/results/tier1/fig_identification.pdf    fig_identification.pdf
 echo
 echo "regenerating the manuscript's measured tables:"
 python -m vla_lab.supervisory.latex_tables || true

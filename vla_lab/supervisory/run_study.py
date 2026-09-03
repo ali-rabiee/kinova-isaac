@@ -181,7 +181,9 @@ def run_one_supervisor(
                 "identifiability": post.identifiability(),
             }
         if res.belief is not None:
-            row["online_belief"] = {"mean": res.belief["mean"], "effect": res.belief["effect"]}
+            row["online_belief"] = {"mean": res.belief["mean"], "effect": res.belief["effect"],
+                                    "lambda_diagnostic": res.belief.get("lambda_diagnostic"),
+                                    "identifiability": res.belief.get("identifiability")}
         pairs = [(r.get("grounded"), r.get("grounded_secondary")) for r in res.records if r.get("grounded_secondary")]
         if pairs:
             row["grounder_agreement"] = grounding_agreement(pairs)
@@ -386,6 +388,48 @@ def aggregate(rows: Sequence[Dict[str, Any]], conditions: Sequence[str], *, comp
         k: _mean_ci([r["test_retest"].get(k) for r in rows if r.get("test_retest")])
         for k in ("mae", "mae_crossover", "reference_vs_truth_mae", "retest_shift")
     }
+    # Per-condition identification of the carryover parameters, from the OFFLINE joint fit of
+    # each condition's own session. This is what B6 exists to move: the fraction of supervisors
+    # whose posterior over lambda left its prior, under that condition's schedule.
+    ident: Dict[str, Any] = {}
+    for cond in conditions:
+        lam, bg, n = 0, 0, 0
+        lam_sd, bg_sd, lam_sd_nonc, n_nonc, lam_tv_nonc = 0, 0, 0, 0, 0
+        lam_online, n_online = 0, 0
+        for r in rows:
+            jc = r["conditions"].get(cond, {}).get("joint_carryover")
+            if jc and jc.get("identifiability"):
+                n += 1
+                il, ib = jc["identifiability"].get("lambda", {}), jc["identifiability"].get("beta_g", {})
+                lam += int(il.get("identified", False))
+                bg += int(ib.get("identified", False))
+                lam_sd += int(il.get("identified_sd", False))
+                bg_sd += int(ib.get("identified_sd", False))
+                if float(r["params"]["beta"]) <= 1e-9:
+                    n_nonc += 1
+                    lam_sd_nonc += int(il.get("identified_sd", False))
+                    lam_tv_nonc += int(il.get("identified", False))
+            ob = r["conditions"].get(cond, {}).get("online_belief") or {}
+            ld = ob.get("lambda_diagnostic")
+            if ld:
+                n_online += 1
+                lam_online += int(bool(ld.get("lambda_identified_sd", ld.get("lambda_identified"))))
+        if n:
+            ident[cond] = {
+                "n": n,
+                # headline criterion: posterior contraction (a non-complier cannot satisfy it)
+                "lambda": lam_sd / n, "beta_g": bg_sd / n,
+                "lambda_ci": list(wilson_ci(lam_sd, n)), "beta_g_ci": list(wilson_ci(bg_sd, n)),
+                # the first draft's criterion: total variation of the marginal
+                "lambda_tv": lam / n, "beta_g_tv": bg / n,
+                "lambda_tv_ci": list(wilson_ci(lam, n)),
+                # the control: how often each criterion fires for supervisors with beta == 0
+                "lambda_noncomplier_rate": (lam_sd_nonc / n_nonc) if n_nonc else None,
+                "lambda_tv_noncomplier_rate": (lam_tv_nonc / n_nonc) if n_nonc else None,
+                "n_noncompliers": n_nonc,
+                "lambda_online": (lam_online / n_online) if n_online else None,
+            }
+    summary["identification"] = ident
     # Heterogeneity: the premise of the whole programme is that people differ.
     summary["population"] = {
         "beta_g": _mean_ci([r["params"]["beta"] * r["params"]["g"] for r in rows]),
@@ -459,6 +503,20 @@ def render_table(summary: Dict[str, Any], conditions: Sequence[str]) -> str:
             )
         lines.append("")
 
+    ident = summary.get("identification") or {}
+    if ident:
+        lines.append("identification of the carryover parameters (offline joint fit of each condition's own session):")
+        for cond in conditions:
+            d = ident.get(cond)
+            if not d:
+                continue
+            on = f"   online: {d['lambda_online']*100:.0f}%" if d.get("lambda_online") is not None else ""
+            nc = (f"   non-compliers: {d['lambda_noncomplier_rate']*100:.0f}% (TV criterion {d['lambda_tv_noncomplier_rate']*100:.0f}%)"
+                  if d.get("lambda_noncomplier_rate") is not None else "")
+            lines.append(f"    {DISPLAY_NAMES.get(cond, cond):30s} lambda {d['lambda']*100:3.0f}% "
+                         f"[{d['lambda_ci'][0]*100:.0f}, {d['lambda_ci'][1]*100:.0f}] (TV crit. {d['lambda_tv']*100:.0f}%)"
+                         f"   beta*g {d['beta_g']*100:3.0f}%{on}{nc}")
+        lines.append("")
     strata = summary.get("strata", {}).get("true_beta_g") or {}
     if strata:
         lines.append(f"stratified by {strata.get('split', '')} (cuts {np.round(strata.get('cuts', []), 2).tolist()}) "
@@ -497,6 +555,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--coach-regime", default=None, choices=["one_sided", "alternating", "runs"])
     ap.add_argument("--dose", default=None, choices=["weak", "moderate", "strong"])
     ap.add_argument("--physics", type=Path, default=None, help="measured ScenePhysics json from the Isaac sweep")
+    ap.add_argument("--physics-quantile", default="point", choices=["lower", "point", "upper"],
+                    help="rebuild the scene grid and band weights under the bootstrap draw of the physics whose "
+                         "transition width sits at the 2.5th (lower) or 97.5th (upper) percentile; the files "
+                         "physics_lower.json / physics_upper.json are written next to physics.json by the fit")
+    ap.add_argument("--assume-w-cm", type=float, default=None,
+                    help="COUNTERFACTUAL: override the transition width (cm), keeping the crossover; for the "
+                         "sensitivity-to-curve sweep of vla_lab.supervisory.flip")
+    ap.add_argument("--assume-mstar-cm", type=float, default=None,
+                    help="COUNTERFACTUAL: override the crossover margin (cm)")
     ap.add_argument(
         "--population-prior",
         default="loo",
@@ -504,18 +571,52 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="'loo' fits an empirical-Bayes prior over (lambda, beta, g) from the OTHER "
              "supervisors and re-runs; 'none' keeps the weakly-informative prior throughout.",
     )
+    ap.add_argument("--population", action="append", default=[], metavar="FIELD=lo,hi",
+                    help="override a SupervisorPopulation range, e.g. --population lapse_range=0.15,0.25. "
+                         "Used by the placebo control of the dose-tracking result: vary something the belief "
+                         "module has no access to and check the counter-proposal rate does NOT follow it.")
+    ap.add_argument("--phrase-corpus", type=Path, default=None,
+                    help="run under the EMPIRICAL phrase set rebuilt from a collected corpus "
+                         "(vla_lab.human_study.phrase_corpus rebuild): the supervisor speaks from people's "
+                         "phrases and hedges at their rate; the narration hash changes accordingly")
     ap.add_argument("--analyze", action="store_true", help="also write figures")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--reaggregate", type=Path, default=None, metavar="DIR",
+                    help="do not run anything: rebuild summary.json, table.txt and the figures of an existing "
+                         "run from its per_supervisor.json (after an aggregator change)")
     args = ap.parse_args(argv)
 
+    if args.reaggregate is not None:
+        return _reaggregate(Path(args.reaggregate), analyze=bool(args.analyze))
+
+    corpus_info = None
+    if args.phrase_corpus is not None:
+        from ..human_study.phrase_corpus import install_empirical_axis
+
+        corpus_info = install_empirical_axis(Path(args.phrase_corpus))
+        print(f"[corpus] empirical axis installed: {corpus_info}", file=sys.stderr)
     contract = Contract()
     if args.config is not None:
         raw = json.loads(Path(args.config).read_text()) if args.config.suffix == ".json" else _load_yaml(args.config)
         contract = Contract.from_dict({**contract.to_dict(), **raw.get("contract", raw)})
-    if args.physics is not None:
-        from .scenes import build_scene_grid, load_physics
+    from .scenes import DEFAULT_PHYSICS_PATH, build_scene_grid, default_physics, load_physics
 
-        contract.grid = build_scene_grid(axis=contract.axis, physics=load_physics(args.physics))
+    phys = load_physics(args.physics) if args.physics is not None else None
+    if args.physics_quantile != "point":
+        base = Path(args.physics) if args.physics is not None else DEFAULT_PHYSICS_PATH
+        qpath = base.with_name(f"physics_{args.physics_quantile}.json")
+        if not qpath.exists():
+            print(f"[FAIL] {qpath} does not exist; run the physics fit with --bootstrap first", file=sys.stderr)
+            return 2
+        phys = load_physics(qpath)
+    if args.assume_w_cm is not None or args.assume_mstar_cm is not None:
+        phys = phys if phys is not None else default_physics()
+        if args.assume_mstar_cm is not None:
+            phys = phys.with_crossover(float(args.assume_mstar_cm) / 100.0)
+        if args.assume_w_cm is not None:
+            phys = phys.with_transition_width(float(args.assume_w_cm) / 100.0, keep_crossover=True)
+    if phys is not None:
+        contract.grid = build_scene_grid(axis=contract.axis, physics=phys)
     if args.coach_regime:
         contract.budget.coach_regime = args.coach_regime
     if args.dose:
@@ -529,6 +630,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     conditions = list(args.conditions) if args.conditions else list(COMPARED_CONDITIONS) + list(ABLATIONS)
+    population = None
+    if corpus_info is not None:
+        # The hedge rate is measured, not chosen.
+        r = float(corpus_info["ungrounded_rate"])
+        args.population = list(args.population) + [f"ungrounded_range={r:.4f},{r:.4f}"]
+    if args.population:
+        overrides: Dict[str, Any] = {}
+        for item in args.population:
+            key, _, val = str(item).partition("=")
+            parts = [float(v) for v in val.split(",")]
+            overrides[key.strip()] = tuple(parts) if len(parts) > 1 else parts[0]
+        population = SupervisorPopulation(**{**asdict(SupervisorPopulation()), **overrides})
     t0 = time.time()
 
     def _pass(priors: Optional[List[Any]], label: str) -> List[Dict[str, Any]]:
@@ -540,6 +653,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     contract=contract,
                     conditions=conditions,
                     seed=int(args.seed),
+                    population=population,
                     log_root=args.log_root if priors is not None or args.population_prior == "none" else None,
                     log_prior=priors[i] if priors is not None else None,
                 )
@@ -571,6 +685,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if rows_pop is not None:
         summary["flat_prior"] = aggregate(rows_flat, conditions, seed=int(args.seed))
     summary["elapsed_s"] = time.time() - t0
+    summary["population_overrides"] = list(args.population)
+    summary["phrase_corpus"] = {"path": str(args.phrase_corpus), **corpus_info} if corpus_info else None
+    summary["population_spec"] = (population or SupervisorPopulation()).to_dict()
+    summary["physics_quantile"] = contract.grid.physics.quantile
+    summary["seed"] = int(args.seed)
+    summary["git_sha"] = _git_sha()
     summary["contract"] = contract.to_dict()
     summary["contract_hash"] = contract.hash()
     summary["conditions_run"] = conditions
@@ -597,6 +717,44 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         write_figures(summary, rows, out)
     return 0
+
+
+def _reaggregate(out: Path, *, analyze: bool = False) -> int:
+    from .analyze import audit_study, render_audit
+
+    old = json.loads((out / "summary.json").read_text())
+    rows = json.loads((out / "per_supervisor.json").read_text())
+    conditions = list(old.get("conditions_run") or old.get("conditions", {}).keys())
+    summary = aggregate(rows, conditions, seed=int(old.get("seed", 0)))
+    flat = out / "per_supervisor_flat_prior.json"
+    if flat.exists():
+        summary["flat_prior"] = aggregate(json.loads(flat.read_text()), conditions, seed=int(old.get("seed", 0)))
+    for k in ("prior", "elapsed_s", "contract", "contract_hash", "conditions_run", "population_overrides",
+              "population_spec", "physics_quantile", "seed", "git_sha", "phrase_corpus"):
+        if k in old:
+            summary[k] = old[k]
+    summary["audit"] = audit_study(summary, rows)
+    summary["reaggregated"] = True
+    (out / "summary.json").write_text(json.dumps(summary, indent=2, default=float) + "\n")
+    table = render_table(summary, conditions) + "\n" + render_audit(summary["audit"])
+    (out / "table.txt").write_text(table)
+    print(table)
+    if analyze:
+        from .analyze import write_figures
+
+        write_figures(summary, rows, out)
+    return 0
+
+
+def _git_sha() -> Optional[str]:
+    import subprocess
+
+    try:
+        sha = subprocess.run(["git", "rev-parse", "--short=12", "HEAD"], capture_output=True, text=True, timeout=5).stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, timeout=5).stdout.strip()
+        return (sha + ("-dirty" if dirty else "")) if sha else None
+    except Exception:                                            # pragma: no cover
+        return None
 
 
 def _load_yaml(path: Path) -> Dict[str, Any]:

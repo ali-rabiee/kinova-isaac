@@ -22,6 +22,8 @@ conda activate riften                     # Isaac Sim 5.x + Isaac Lab + torch; n
 
 # 2. Train one Carryover-Aware VLA cell.
 ./vla_lab/scripts/sup_train.sh            # tiny / token, ~2 min on a laptop 4090
+#    the sweeps run under SEED CONTROL: sup_models.sh ... --seeds 1 2 3 4 5 reports mean ± SD
+#    and a seed floor, and the tables refuse orderings smaller than it
 
 # 3. The architecture comparison table.
 ./vla_lab/scripts/sup_models.sh           # -> vla_lab/results/models_isaac/table.txt
@@ -32,7 +34,12 @@ conda activate riften                     # Isaac Sim 5.x + Isaac Lab + torch; n
 # 5. Audit what a run actually produced — provenance flags, curves, no re-running.
 ./vla_lab/scripts/sup_audit.sh vla_lab/results/models_isaac --figures
 
-# 6. The offline gate (238 tests, no Isaac, no torch needed for most).
+# 6. The physics-interval, sensitivity+placebo, and flip diagnostics (CPU only).
+./vla_lab/scripts/sup_physics_ci.sh
+./vla_lab/scripts/sup_sensitivity.sh
+./vla_lab/scripts/sup_flip.sh
+
+# 7. The offline gate (the count is generated: `run_tests --count`; no Isaac, no torch for most).
 ./vla_lab/scripts/run_tests.sh
 ```
 
@@ -42,7 +49,10 @@ matters** — each one invalidates what the next depends on:
 ```bash
 ./vla_lab/scripts/sup_reach.sh --headless          # 1. where the arm can actually reach
 ./vla_lab/scripts/sup_sweep.sh --headless --fit    # 2. measure the scene physics (~30 min)
+#    pooling several sweeps + bootstrap CIs + quantile physics:
+#    python -m vla_lab.supervisory.apparatus.measure fit A/rollouts.jsonl B/rollouts.jsonl --bootstrap 2000
 ./vla_lab/scripts/sup_frames.sh --headless         # 3. re-render the atlas on the new physics
+./vla_lab/scripts/sup_frames.sh --headless --shift # 4. render the HELD-OUT atlas (shift eval)
 #    ... then retrain (3 above), because the scene ids now map to different clearance gaps.
 ```
 
@@ -100,88 +110,70 @@ plus B5 with each of its three switches off.
 
 ---
 
-## What the Tier-1 study says
+## What the Tier-1 study says (2026-08-23, corrected physics)
 
 `vla_lab/results/tier1/table.txt`, N = 80 synthetic supervisors, paired, all conditions on an
-identical budget, under the **measured** scene physics. Read the test–retest floor (crossover
-MAE **0.1016**) first: it bounds everything below it, and the study audit prints that reminder
-itself.
+identical budget, under the **measured and corrected** scene physics (see the defect-(xii) note
+below — every number here was regenerated on 2026-08-23 after the value-model fit was found to
+be flattened by a unit error in its regulariser; the superseded results are intact in
+`results/legacy_2026-08-23/`). Read the test–retest floor first: it bounds everything below it,
+and the study audit prints that reminder itself.
 
-- **Ignoring your own coaching is expensive, and it is the only thing that clears the floor.**
-  B1 Memoryless is +0.0573 crossover-MAE [+0.0461, +0.0686] worse than the fixed washout and
-  +0.0616 [+0.0535, +0.0698] worse than always asking, with +0.0043 [+0.0029, +0.0058] more
-  decision regret. It wins **16 %** of paired comparisons. That gap is about four times the
-  entire spread among the other seven conditions.
-- **The penalty scales with the person.** Stratified by true compliance strength `βg`, B1's
-  excess error over the washout grows **+0.044 → +0.046 → +0.082** across terciles. Nothing in
-  any condition observes `βg`, so that dose–response runs through the contamination term.
-- **Among the remedies, nothing separates.** Their whole spread is 0.0155 against a floor of
-  0.1016; every paired interval against the washout contains zero. We report the ordering and
-  decline to interpret it.
-- **λ is poorly identified from one session**: identified in **44 %** of supervisors against
-  **86 %** for compliance strength. Schedule personalisation therefore runs largely on its prior
-  — and the schedule-only ablation is worst in the high-compliance tercile, where it would
-  matter most.
-- **A finding that did not survive re-measuring the physics.** Under the *prior* value model,
-  always-counter beat the washout by −0.0148 [−0.0248, −0.0046] and "asking beats waiting" was a
-  headline. Under the measured model, same policies and seeds, it is −0.0043 [−0.0171, +0.0089].
-  Nothing about the methods changed; the difficulty curve they are scored against did.
-- The study audit raises exactly two flags on this run: the λ identifiability, and that the
-  non-memoryless spread is inside the floor.
+- **Ignoring your own coaching is expensive, and it is the only thing that clears the floor** —
+  and it clears it under the lower and upper bootstrap draws of the physics too
+  (`results/physics_ci/table.txt`). It is a *validation*: the estimator inverts a bias we
+  injected, and the paper now says so in the same sentence that reports it.
+- **Among the remedies (B2–B7), nothing separates.** Every paired interval against the washout
+  contains zero, under the point physics and under both ends of its bootstrap interval. We
+  report the ordering and decline to interpret it.
+- **Two first-draft findings did not replicate under the corrected physics and are reported as
+  replaced:** the monotone-by-tercile memoryless penalty (still positive everywhere, no longer
+  monotone), and the "full policy worse than the washout in the high-compliance tercile"
+  ordering that had justified retiring the adaptive scheduler (now nominally better, inside the
+  floor). The scheduler is still off by default — but on identifiability and parsimony grounds,
+  not on measured harm.
+- **λ identification was re-measured with an honest criterion.** The first draft's 44% used a
+  total-variation flag that also fired for supervisors with β = 0 exactly — for whom the decay
+  rate is unidentifiable by construction (the empirical-Bayes prior correlates λ with β, so
+  identifying β moves the λ marginal). The headline criterion is now posterior *contraction*
+  (≥25%), which a non-complier cannot satisfy; rates per condition, with the non-complier control
+  column, are in the study table.
+- **B6 (identification-first) does not beat the natural schedule on λ identification beyond
+  noise.** The brief's log-spaced wait ladder is worse than not waiting: under time decay every
+  slot advances the residue clock, so consecutive probes already sample distinct elapsed times
+  and a wait forfeits an observation. Scene reordering toward leveraged scenes is worth a few
+  points; nothing separates the schedules' intervals. What survives is the *prospective
+  diagnostic*: every adaptive policy logs per slot whether its λ posterior has contracted, the
+  accumulated Fisher information, and the e-folding delay — so a system knows it is about to
+  personalise on its prior *before* it does.
+- **The dose-tracking result now has its control** (`results/sensitivity/placebo.json`): B5's
+  counter-proposal rate spans 2.2 → 2.7 → 9.7 per session across the dose ladder and 3.5 → 2.7 →
+  2.9 across the lapse-rate placebo the belief module cannot see. The rate follows the dose, not
+  the placebo. (Answer latency is *not* a placebo — it enters the decay clock — and is reported
+  as such.)
+- **The flip diagnostic** (`results/flip_w/`, `results/flip_mstar/`): every primary contrast as
+  a function of the *assumed* transition width / crossover, with the measured value and its
+  bootstrap CI on the same axis and every flip point marked. This is the reusable version of
+  "the finding that did not survive re-measuring the physics".
 
 ### The closed-loop evaluation
 
-`vla_lab/results/deployed{,_smolvla}/table.txt`. Dropping a trained checkpoint into the session as
-the grounding channel, on both backbones with a full set of injection modes.
+`vla_lab/results/deployed{,_smolvla,_qwen}/table.txt` — regenerated under the corrected physics
+with the **recommended** policy (B7) driving; the summary records which policy ran. The
+correlation coefficients the first draft quoted (ρ = −0.46, ρ = −0.14 on n = 7) are gone: the
+analysis refuses to emit a coefficient below n = 15 (`stats_utils.guarded_correlation`), and
+`results/deployed/facts.json` reports the facts the cells actually support (best-offline-vs-
+deployed rank per backbone; the >11% in-band abstention flag).
 
-- **Reading the utterance (`said`) is free accuracy.** Every checkpoint matches its lexical
-  reference to within 0.003 and resolves nearly all the hedged answers the keyword grounder
-  refuses (1.1–1.4 → 0.0–0.6 ungrounded per block). This replicates on both backbones.
-- **Letting the model answer (`unprompted`) helps on the pretrained backbone.** `token` and `film`
-  reach 0.1042 / 0.1038 against the reference's 0.1105, alignment 0.900 → 0.939 / 0.953, and
-  deployment regret cut four-fold (0.0027 → 0.0009 / 0.0006).
-- **And breaks one cell on the from-scratch one.** `film` — best in its row on *both* offline
-  metrics — is the worst channel anywhere: 0.1500 against a 0.1187 reference.
-- **Offline metrics do not determine deployment.** Across the seven `unprompted` cells, offline
-  gain orders deployed error only weakly (Spearman ρ = −0.46, n = 7) and in-band abstention barely
-  at all (ρ = −0.14). Moderate abstention (≤5% in band) is fine and sometimes better; the one cell
-  above 11% is the one that fails. Watch it as a threshold, not as a ranking.
+### The architecture comparison, under seed control
 
-### The architecture comparison
-
-`vla_lab/results/models_isaac{,_smolvla,_qwen}/table.txt`. All cells train on **rendered Isaac
-frames** from the study's own scene, so the comparison is between architectures under matched
-perception.
-
-- **The from-scratch backbone's context-blind cell lands on zero** (gap∼κ = **−0.006**), which is
-  what it must do — its encoder cannot see κ — and is the cleanest confirmation that the metric
-  measures what it claims to. Token injection takes it to +0.052, FiLM to +0.108.
-- **Scale changes what "context-blind" means.** SmolVLA with no context injection still reaches
-  +0.151, presumably from image and wording correlates of the residue. On a large backbone,
-  injection roughly *doubles* an ability the model already has in part — a weaker claim than the
-  from-scratch numbers alone would support, and we report it.
-- **`film` gives the best gain on both backbones** (+0.135, +0.137), and the ordering
-  none < token < film replicates.
-- **On SmolVLA, `text` achieves the highest residue-tracking of any cell (+0.273) and the lowest
-  gain (+0.082)** — tracking the residue and using it well are different abilities, and this is
-  where they come apart. Verbalising costs prompt: 43 context tokens against ~7 for the
-  instruction.
-
-### The objective ablations
-
-`vla_lab/results/ablations/table.txt`, on the best from-scratch cell. **Removing the reference
-supervision collapses the gain to +0.003 while sending gap∼κ to +0.353 — the highest anywhere in
-this project.** The model learns to move its belief *in step with* the residue and nothing about
-*where to move it*. That is a direct warning about the headline metric: a high gap∼κ is necessary
-and manifestly not sufficient, which is why both columns are always reported. Removing forward
-consistency *improves* the gain (+0.031) while reducing residue tracking — the self-supervised
-term costs a little fit to buy mechanism, and we say so rather than implying every term earns its
-place.
-
-Regenerate: `./vla_lab/scripts/sup_study.sh`. Figures land next to each result and reach the
-manuscript through `./vla_lab/scripts/build_paper.sh`.
-
----
+`vla_lab/results/models_isaac{,_smolvla,_qwen,_qwen25}/table_seeds.{txt,json}` — every cell
+mean ± seed SD (5 seeds from-scratch, 3 pretrained), with a **seed floor** per backbone (mean
+|difference| between seeds of the same cell) and paired within-backbone contrasts marked as
+clearing it or not. `results/shift/` scores every checkpoint on the held-out atlas (new colours,
+smaller cubes, new table surface, third distractor, second camera pose) — the distribution-shift
+test that decides whether residue tracking is an ability or a dataset regularity. The objective
+ablations run under the same seed control.
 
 ## Two tiers, and why
 
@@ -198,8 +190,16 @@ re-measures the same execution outcomes over and over.
   result. Tier 1 is a variance-reduction device whose validity rests entirely on that check.
 
 > **Status of the scene driver (2026-08-23): working.** The margin sweep runs end to end and the
-> scene physics is **measured** — 216 rollouts, crossover 8.5 cm, transition width 3.12 cm,
-> `ScenePhysics.source == "measured"`. Getting there took ten distinct defects, seven of which
+> scene physics is **measured** — 408 rollouts (216 + a tight-end sweep), crossover
+> **4.54 cm [3.9, 5.2]**, transition width **0.50 cm [0.17, 0.81]**, lapse-logistic fit checked
+> against an isotonic regression, `ScenePhysics.source == "measured"`. The 8.5 cm / 3.12 cm
+> previously quoted here was **defect (xii)**: the fit regularised a *per-metre* slope with
+> precision 0.01, which costs a steep curve ~110 nats and flattened the width by 6×; the fix,
+> the bootstrap CIs, and the quantile physics live in `supervisory/physics_fit.py` and
+> `results/physics/physics_report.json`. Note the value gap now has a *trivial second crossing*
+> near 0.6 cm (both strategies fail; the cheaper failure "wins") — `crossover_margin()` returns
+> the upper crossing and `lower_crossover_margin()` reports the other. Getting here took twelve
+> distinct defects, seven of which
 > presented with the identical symptom (*"every rollout times out on an early waypoint"*). They
 > are recorded in the paper (§ *Making the instrument work*) and at the line of code that fixes
 > each one. The four worth knowing before touching this scene:
@@ -290,14 +290,20 @@ vla_lab/
 │   ├── estimand.py         π*(c), three estimators, error/calibration/regret metrics
 │   ├── supervisor.py       the generative supervisor  ← read its docstring before citing any number
 │   ├── narration.py        what the robot says, and the conservative grounder
-│   ├── scheduler/          B0–B5 + B5's three ablations
+│   ├── scheduler/          B0–B7 (B6 identification-first, B7 recommended) + ablations
 │   ├── apparatus/          surrogate | Isaac | the fidelity check | the physics sweep
+│   ├── physics_fit.py      lapse psychometric + isotonic + bootstrap CIs + quantile physics
+│   ├── physics_ci.py       the primary contrasts under the physics interval
+│   ├── flip.py             the sensitivity-to-curve (flip) diagnostic
+│   ├── sensitivity.py      the assumption sweep + the dose-tracking placebo control
 │   ├── protocol.py         blocks, counterbalancing, the matched budget
 │   ├── session.py          the one session runner   verify_session.py  the gate
 │   ├── run_study.py        ★ Tier-1 study     run_sweep.py  ★ the Isaac margin sweep
 │   └── analyze.py          every figure in the paper
 ├── policy/               ★ the Carryover-Aware VLA: context modes, heads, backbone registry
-├── training/             ★ losses, dialogue data, trainer, the architecture sweep
+├── training/             ★ losses, dialogue data, trainer, seed-controlled sweeps (seeds.py),
+│                           the shift evaluation (eval_shift.py)
+├── human_study/            ... + phrase_corpus.py: collection packet / grounder eval / rebuild
 ├── paper/                ★ the HRI 2027 manuscript
 ├── results/                tier1/ · models/ · physics/
 ├── old_direction/          the previous (arm-choice rehabilitation) submission + its code, intact
@@ -330,9 +336,14 @@ Four boundaries are enforced in code and repeated in the paper:
    reported cell trains on rendered frames, and the audit refuses to be quiet about a run that
    does not.
 4. **Offline versus deployed.** A learned intent head's held-out accuracy does not determine what
-   it does in the loop (Spearman ρ = −0.46 over seven cells) — see `sup_deployed.sh`. Nothing here
-   reports one as evidence for the other, and the in-band abstention column is a red flag rather
-   than a ranking: ≤5% is fine, the one cell above 11% is the one that fails.
+   it does in the loop — see `sup_deployed.sh`. No correlation coefficient is quoted for this:
+   seven cells do not support one, and `guarded_correlation` refuses below n = 15. The in-band
+   abstention column is a red flag rather than a ranking.
+5. **Point estimates versus their noise.** Model-level numbers carry a seed SD and are read
+   against a seed floor; the physics carries a bootstrap CI and the primary contrasts are
+   re-run under its ends; λ-identification uses a contraction criterion whose non-complier
+   control is printed beside it. An ordering smaller than its own floor is reported as data,
+   never as a finding.
 
 ---
 

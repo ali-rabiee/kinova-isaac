@@ -10,6 +10,10 @@ from vla_lab.supervisory.contract import Contract
 from vla_lab.supervisory.protocol import build_protocol
 from vla_lab.supervisory.scenes import build_scene_grid
 from vla_lab.supervisory.scheduler import (
+    ABLATION_B6_FIXED_SCENES,
+    CONDITION_IDENTIFICATION_FIRST,
+    CONDITION_RECOMMENDED,
+    POLICY_RECOMMENDED,
     ABLATION_COUNTER_ONLY,
     ABLATION_ESTIMATOR_ONLY,
     ABLATION_SCHEDULE_ONLY,
@@ -166,3 +170,131 @@ def test_the_population_washout_follows_the_priors_it_is_derived_from():
     slow = population_washout_slots(cfg=CONTRACT.carryover, delta_model=dm, lam=0.95, beta=1.5, g=1.5)
     fast = population_washout_slots(cfg=CONTRACT.carryover, delta_model=dm, lam=0.10, beta=1.5, g=1.5)
     assert slow > fast
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-23: the recommended configuration, B6, and the identification diagnostic
+# ---------------------------------------------------------------------------
+def test_the_recommended_policy_has_the_adaptive_schedule_off():
+    """P2-1: ``policy_recommended`` is corrected estimator + counter-proposals, and never the
+    adaptive schedule. The scheduler the registry builds must agree with the config object."""
+    cfg = CarryoverAwareConfig.recommended()
+    assert cfg.adaptive_schedule is False
+    assert cfg.estimator_correction is True and cfg.counter_enabled is True
+    sch = build_scheduler(POLICY_RECOMMENDED, GRID, carryover_cfg=CONTRACT.carryover,
+                          delta_model=CONTRACT.delta_model(), seed=1)
+    assert sch.cfg.adaptive_schedule is False
+    assert sch.cfg.estimator_correction and sch.cfg.counter_enabled
+    assert estimator_for(POLICY_RECOMMENDED) == "carryover_corrected"
+    assert POLICY_RECOMMENDED == CONDITION_RECOMMENDED
+    full = CarryoverAwareConfig.full()
+    assert full.adaptive_schedule is True, "B5 as proposed keeps the schedule, behind its flag"
+
+
+def test_the_recommended_policy_places_probes_exactly_like_the_fixed_washout():
+    """With the schedule off, B7 differs from B2 only in what it does with a probe (counter or
+    not) and in how it estimates -- never in when it waits."""
+    acts_rec, sch = _run(CONDITION_RECOMMENDED)
+    acts_b2, _ = _run(CONDITION_FIXED_WASHOUT)
+    # B7's wait count can differ from B2's by the counter-proposals it spends where B2 would
+    # have waited out the last slot of a gap; its placement rule is the same fixed washout.
+    assert sch.cfg.adaptive_schedule is False
+    assert abs(acts_rec[WAIT] - acts_b2[WAIT]) <= 2, (acts_rec, acts_b2)
+    assert acts_rec[PROBE] + acts_rec[COUNTER] + acts_rec[WAIT] == acts_b2[PROBE] + acts_b2[WAIT]
+
+
+def test_b6_identifies_first_then_exploits_and_keeps_the_budget():
+    b = _budget()
+    acts, sch = _run(CONDITION_IDENTIFICATION_FIRST)
+    assert acts[COACH] == b.n_coach
+    assert sum(acts.values()) == b.n_slots
+    assert sch._phase == "exploit", "four gaps is enough to leave the identification phase"
+    assert not sch._pool, "every free-slot scene must have been consumed exactly once"
+    from vla_lab.supervisory.scheduler import ABLATION_B6_LADDER
+
+    acts_l, sch_l = _run(ABLATION_B6_LADDER)
+    assert acts_l[WAIT] >= 1, "the log-spaced ladder variant must spend at least one wait"
+    assert acts_l[COACH] == b.n_coach and sum(acts_l.values()) == b.n_slots
+
+
+def test_b6_with_reordering_presents_the_same_scene_multiset_as_the_protocol():
+    b = _budget()
+    sch = build_scheduler(CONDITION_IDENTIFICATION_FIRST, GRID, carryover_cfg=CONTRACT.carryover,
+                          delta_model=CONTRACT.delta_model(), seed=1)
+    sch.reset(b)
+    hist = History()
+    presented = []
+    for i in range(b.n_slots):
+        slot = Slot(index=i, scene_id=b.scene_sequence[i], is_coach_slot=i in set(b.coach_slots),
+                    coach_direction=b.direction_at(i), coach_strength=b.coach_strength,
+                    free_remaining=b.free_remaining_at(i), session_progress=i / max(1, b.n_slots - 1))
+        d = sch.decide(hist, slot)
+        if d.action != COACH:
+            presented.append(d.scene_id)
+        rec = HistoryRecord(slot=i, action=d.action, scene_id=d.scene_id,
+                            delta=CONTRACT.delta_model().for_action(d.action),
+                            coach_direction=slot.coach_direction, coach_strength=slot.coach_strength,
+                            instructed=None, c=GRID.by_id(d.scene_id).c, clutter=GRID.by_id(d.scene_id).clutter)
+        hist.append(rec)
+        sch.observe(rec)
+    free = [b.scene_sequence[i] for i in range(b.n_slots) if i not in set(b.coach_slots)]
+    assert Counter(presented) == Counter(free), "reordering may permute the free-slot scenes, never change them"
+    assert presented != free, "and it should actually have reordered something"
+
+
+def test_b6_fixed_scene_variant_does_not_reorder():
+    b = _budget()
+    sch = build_scheduler(ABLATION_B6_FIXED_SCENES, GRID, carryover_cfg=CONTRACT.carryover,
+                          delta_model=CONTRACT.delta_model(), seed=1)
+    assert sch.ident.reorder_scenes is False
+    sch.reset(b)
+    hist = History()
+    for i in range(b.n_slots):
+        slot = Slot(index=i, scene_id=b.scene_sequence[i], is_coach_slot=i in set(b.coach_slots),
+                    coach_direction=b.direction_at(i), coach_strength=b.coach_strength,
+                    free_remaining=b.free_remaining_at(i), session_progress=i / max(1, b.n_slots - 1))
+        d = sch.decide(hist, slot)
+        assert d.scene_id == slot.scene_id
+        rec = HistoryRecord(slot=i, action=d.action, scene_id=d.scene_id,
+                            delta=CONTRACT.delta_model().for_action(d.action),
+                            coach_direction=slot.coach_direction, coach_strength=slot.coach_strength,
+                            instructed=None, c=GRID.by_id(d.scene_id).c, clutter=GRID.by_id(d.scene_id).clutter)
+        hist.append(rec)
+        sch.observe(rec)
+
+
+def test_every_adaptive_policy_logs_the_lambda_identification_readout_each_slot():
+    """P1-3: the prospective diagnostic is a first-class per-slot output, not a post-hoc number."""
+    for cond in (CONDITION_CARRYOVER_AWARE, CONDITION_RECOMMENDED, CONDITION_IDENTIFICATION_FIRST):
+        b = _budget()
+        sch = build_scheduler(cond, GRID, carryover_cfg=CONTRACT.carryover,
+                              delta_model=CONTRACT.delta_model(), seed=1)
+        sch.reset(b)
+        hist = History()
+        i = next(j for j in range(b.n_slots) if j not in set(b.coach_slots))
+        slot = Slot(index=i, scene_id=b.scene_sequence[i], free_remaining=b.free_remaining_at(i))
+        d = sch.decide(hist, slot)
+        for key in ("lambda_tv", "lambda_identified", "lambda_information", "lambda_efold_delta"):
+            assert key in d.rationale, (cond, key, sorted(d.rationale))
+        assert d.rationale["lambda_identified"] is False, "nothing has been observed yet"
+
+
+def test_lambda_information_grows_with_observations_at_distinct_delays():
+    """Two probes at the same delay after a demonstration carry less information about lambda
+    than two at different delays -- the Fisher argument B6 is built on, checked numerically."""
+    from vla_lab.supervisory.carryover import CarryoverPosterior
+
+    def info(deltas):
+        post = CarryoverPosterior(CONTRACT.carryover)
+        post.force_point_mass(lam=0.6, beta=1.5, g=1.0)
+        post.step(action=COACH, delta=deltas[0], direction=1)
+        total = 0.0
+        for d in deltas[1:]:
+            total += post.lambda_information(pi_star=0.5)["gain_if_observe"]
+            post.step(action=PROBE, delta=d, pi_star=0.5, chose_a=True)
+        return total
+
+    same = info([1.0, 1.0, 1.0])
+    spread = info([0.2, 2.5, 1.0])
+    assert spread > 0.0 and same > 0.0
+    assert info([1.0, 1.0]) < info([1.0, 1.0, 1.0]), "information accumulates"

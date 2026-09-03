@@ -107,6 +107,27 @@ class CarryoverAwareConfig:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
+    @classmethod
+    def full(cls, **kw: Any) -> "CarryoverAwareConfig":
+        """B5 as proposed: all three switches on. Reported as proposed-and-rejected on the
+        scheduling half (see :meth:`recommended`)."""
+        return cls(adaptive_schedule=True, estimator_correction=True, counter_enabled=True, **kw)
+
+    @classmethod
+    def recommended(cls, **kw: Any) -> "CarryoverAwareConfig":
+        """**The configuration the evidence supports: corrected estimator + counter-proposals,
+        adaptive scheduling OFF.**
+
+        The adaptive schedule is kept behind its flag and reported, not shipped. Two results
+        argue against it, and an identifiability argument predicted both before they were
+        measured: the decay rate it personalises on is identified in a minority of supervisors
+        (so the schedule it computes is the population schedule wearing a different name), and
+        in the high-compliance tercile -- exactly where it should help -- the full policy is
+        worse than the same corrected estimator without it. A test asserts that this
+        configuration never turns the schedule on.
+        """
+        return cls(adaptive_schedule=False, estimator_correction=True, counter_enabled=True, **kw)
+
 
 def population_washout_slots(
     *,
@@ -530,6 +551,10 @@ class CarryoverAwareScheduler(Scheduler):
                 "waited": int(consumed),
                 "lambda_mean": float(m["lambda"]),
                 "beta_g_mean": float(m["beta_g"]),
+                # The prospective identification readout: is the schedule about to act on a
+                # decay rate the data have not identified? Logged every slot, for every policy
+                # that personalises, so the answer is in the record rather than in hindsight.
+                **self.posterior.lambda_diagnostic(),
             }
         )
         if consumed < w and slot.free_remaining > 1:

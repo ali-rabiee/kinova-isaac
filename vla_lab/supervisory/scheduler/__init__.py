@@ -21,6 +21,7 @@ from .baselines import (
     RandomStaticScheduler,
 )
 from .carryover_aware import CarryoverAwareConfig, CarryoverAwareScheduler, population_washout_slots
+from .identification_first import IdentificationFirstConfig, IdentificationFirstScheduler
 
 CONDITION_NO_COACH = "no_coach"
 CONDITION_MEMORYLESS = "memoryless"
@@ -28,10 +29,20 @@ CONDITION_FIXED_WASHOUT = "fixed_washout"
 CONDITION_RANDOM_STATIC = "random_static"
 CONDITION_ALWAYS_COUNTER = "always_counter"
 CONDITION_CARRYOVER_AWARE = "carryover_aware"
+#: B6: identify the decay rate first (log-spaced delays, leveraged scenes), then exploit it.
+CONDITION_IDENTIFICATION_FIRST = "identification_first"
+#: B7: the configuration the evidence supports -- corrected estimator + counter-proposals, with
+#: the adaptive schedule OFF. This is ``policy_recommended``.
+CONDITION_RECOMMENDED = "recommended"
 
 ABLATION_SCHEDULE_ONLY = "ablation_schedule_only"
 ABLATION_ESTIMATOR_ONLY = "ablation_estimator_only"
 ABLATION_COUNTER_ONLY = "ablation_counter_only"
+ABLATION_B6_FIXED_SCENES = "ablation_b6_fixed_scenes"
+#: B6 with the log-spaced wait ladder the brief specified (0, 1, 3 free slots before the first
+#: probe of each gap). Kept as a variant: under time decay every slot advances the residue clock,
+#: so consecutive probes already observe distinct elapsed times and a wait only forfeits one.
+ABLATION_B6_LADDER = "ablation_b6_ladder"
 
 #: Conditions that are compared to each other in the primary table, in report order.
 COMPARED_CONDITIONS = (
@@ -40,8 +51,13 @@ COMPARED_CONDITIONS = (
     CONDITION_RANDOM_STATIC,
     CONDITION_ALWAYS_COUNTER,
     CONDITION_CARRYOVER_AWARE,
+    CONDITION_IDENTIFICATION_FIRST,
+    CONDITION_RECOMMENDED,
 )
-ABLATIONS = (ABLATION_SCHEDULE_ONLY, ABLATION_ESTIMATOR_ONLY, ABLATION_COUNTER_ONLY)
+ABLATIONS = (ABLATION_SCHEDULE_ONLY, ABLATION_ESTIMATOR_ONLY, ABLATION_COUNTER_ONLY, ABLATION_B6_FIXED_SCENES,
+             ABLATION_B6_LADDER)
+#: The policy a deployment should run. Named so a test can assert what it does not contain.
+POLICY_RECOMMENDED = CONDITION_RECOMMENDED
 ALL_CONDITIONS = (CONDITION_NO_COACH,) + COMPARED_CONDITIONS + ABLATIONS
 
 #: Which baseline the pre-specified primary contrast runs against. Fixed before any data.
@@ -53,10 +69,14 @@ DISPLAY_NAMES: Dict[str, str] = {
     CONDITION_FIXED_WASHOUT: "B2 Fixed washout",
     CONDITION_RANDOM_STATIC: "B3 Random / static",
     CONDITION_ALWAYS_COUNTER: "B4 Always counter-propose",
-    CONDITION_CARRYOVER_AWARE: "B5 Carryover-aware VLA",
+    CONDITION_CARRYOVER_AWARE: "B5 Carryover-aware (full)",
+    CONDITION_IDENTIFICATION_FIRST: "B6 Identification-first",
+    CONDITION_RECOMMENDED: "B7 Recommended (no adaptive sched.)",
     ABLATION_SCHEDULE_ONLY: "  ablation: schedule only",
     ABLATION_ESTIMATOR_ONLY: "  ablation: estimator only",
     ABLATION_COUNTER_ONLY: "  ablation: counter only",
+    ABLATION_B6_FIXED_SCENES: "  B6 variant: fixed scene order",
+    ABLATION_B6_LADDER: "  B6 variant: log-spaced waits",
 }
 
 _ABLATION_SWITCHES: Dict[str, Dict[str, bool]] = {
@@ -70,7 +90,8 @@ def estimator_for(condition: str) -> str:
     """Which ``pi*`` estimator a condition's *reported* estimate uses."""
     if condition == CONDITION_MEMORYLESS:
         return METHOD_POOLED
-    if condition == CONDITION_CARRYOVER_AWARE:
+    if condition in (CONDITION_CARRYOVER_AWARE, CONDITION_IDENTIFICATION_FIRST, CONDITION_RECOMMENDED,
+                     ABLATION_B6_FIXED_SCENES, ABLATION_B6_LADDER):
         return METHOD_CORRECTED
     if condition in _ABLATION_SWITCHES:
         return METHOD_CORRECTED if _ABLATION_SWITCHES[condition]["estimator_correction"] else METHOD_PSYCHOMETRIC
@@ -120,6 +141,27 @@ def build_scheduler(
             grid, cfg=aware_cfg or CarryoverAwareConfig(), carryover_cfg=cfg, delta_model=dm,
             psych_cfg=psych_cfg, seed=seed, log_prior=log_prior,
         )
+    if condition == CONDITION_RECOMMENDED:
+        base = aware_cfg.to_dict() if aware_cfg else CarryoverAwareConfig().to_dict()
+        base.update({"adaptive_schedule": False, "estimator_correction": True, "counter_enabled": True})
+        if delta_model is not None and aware_cfg is None:
+            base["counter_time_ratio"] = max(0.0, (dm.counter_s - dm.probe_s) / max(dm.probe_s, 1e-6))
+        return CarryoverAwareScheduler(
+            grid, cfg=CarryoverAwareConfig(**base), carryover_cfg=cfg, delta_model=dm,
+            psych_cfg=psych_cfg, seed=seed, name=condition, log_prior=log_prior,
+        )
+    if condition in (CONDITION_IDENTIFICATION_FIRST, ABLATION_B6_FIXED_SCENES, ABLATION_B6_LADDER):
+        base = aware_cfg.to_dict() if aware_cfg else CarryoverAwareConfig.full().to_dict()
+        if delta_model is not None and aware_cfg is None:
+            base["counter_time_ratio"] = max(0.0, (dm.counter_s - dm.probe_s) / max(dm.probe_s, 1e-6))
+        ident = IdentificationFirstConfig(
+            reorder_scenes=(condition != ABLATION_B6_FIXED_SCENES),
+            wait_ladder=((0, 1, 3) if condition == ABLATION_B6_LADDER else (0,)),
+        )
+        return IdentificationFirstScheduler(
+            grid, ident_cfg=ident, cfg=CarryoverAwareConfig(**base), carryover_cfg=cfg, delta_model=dm,
+            psych_cfg=psych_cfg, seed=seed, name=condition, log_prior=log_prior,
+        )
     if condition in _ABLATION_SWITCHES:
         base = aware_cfg.to_dict() if aware_cfg else CarryoverAwareConfig().to_dict()
         base.update(_ABLATION_SWITCHES[condition])
@@ -137,6 +179,13 @@ __all__ = [
     "CONDITION_RANDOM_STATIC",
     "CONDITION_ALWAYS_COUNTER",
     "CONDITION_CARRYOVER_AWARE",
+    "CONDITION_IDENTIFICATION_FIRST",
+    "CONDITION_RECOMMENDED",
+    "POLICY_RECOMMENDED",
+    "ABLATION_B6_FIXED_SCENES",
+    "ABLATION_B6_LADDER",
+    "IdentificationFirstConfig",
+    "IdentificationFirstScheduler",
     "ABLATION_SCHEDULE_ONLY",
     "ABLATION_ESTIMATOR_ONLY",
     "ABLATION_COUNTER_ONLY",

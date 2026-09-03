@@ -15,5 +15,5 @@ EXTRA=()
 exec python -m vla_lab.training.sweep_models \
   --models ${MODELS:-tiny} --contexts ${CONTEXTS:-none token film} \
   --epochs "${EPOCHS:-25}" --supervisors "${SUPERVISORS:-80}" \
-  --batch "${BATCH:-32}" --accum "${ACCUM:-1}" --seed "${SEED:-1}" \
+  --batch "${BATCH:-32}" --accum "${ACCUM:-1}" --seeds ${SEEDS:-1 2 3 4 5} --skip-existing \
   --out "${OUT:-vla_lab/results/models}" "${EXTRA[@]}" "$@"

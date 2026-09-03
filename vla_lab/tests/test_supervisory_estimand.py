@@ -120,12 +120,21 @@ def test_coverage_is_reported_at_every_nominal_level_and_is_monotone():
 
 
 def test_deployment_regret_is_zero_for_a_perfect_map_and_positive_for_a_wrong_one():
+    """Regret charges the robot for executing the value-worse strategy where the reference
+    prefers the value-better one -- so the wrong case must be a wrong ESTIMATE against the true
+    reference. (The earlier version flipped the reference instead, which makes every "want" the
+    value-worse strategy, clips every loss at zero, and only looked like a test because the old
+    defective physics happened to misalign a few band scenes; see defect (xii).)"""
     truth = _true_map()
-    perfect = PsychometricEstimator().fit(_draw(2000, seed=8), GRID)
+    seq = _draw(2000, seed=8)
+    perfect = PsychometricEstimator().fit(seq, GRID)
     good = decision_regret(perfect, truth, GRID)
-    flipped = {k: 1.0 - v for k, v in truth.items()}
-    bad = decision_regret(perfect, flipped, GRID)
+    for o in seq:                                             # a supervisor heard exactly backwards
+        o.instructed = STRATEGY_A if o.instructed == STRATEGY_B else STRATEGY_B
+    flipped_fit = PsychometricEstimator().fit(seq, GRID)
+    bad = decision_regret(flipped_fit, truth, GRID)
     assert good["deployment_regret"] < bad["deployment_regret"]
+    assert bad["deployment_regret"] > 0.0, "executing against the preference must cost task value somewhere"
     assert good["alignment"] > bad["alignment"]
 
 

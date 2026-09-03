@@ -213,6 +213,14 @@ class SmolVLABackbone(Backbone):
         # Pool the **instruction segment**, not the whole prefix. ``embed_prefix`` lays out
         # image tokens first, then the language tokens, then one state token; with three camera
         # slots the image tokens outnumber the 48 language ones by an order of magnitude, and a
+        #
+        # **Discovered consequence (2026-08-24, by the shift evaluation):** ``embed_prefix``
+        # emits the prefix BEFORE any attention mixes the modalities, so the language-segment
+        # positions are pure text embeddings -- the intent heads on this backbone are
+        # image-blind by construction (verified: zero logit change under a wholly different
+        # scene image). Its "context-blind residue tracking" is therefore carried by the
+        # utterance wording alone, its shift-invariance is trivial rather than robust, and the
+        # paper says so where those numbers appear.
         # mean over the whole sequence dilutes the utterance to the point where the intent head
         # sits at chance. Everything the heads are asked about -- what was said, what they would
         # have said -- lives in the language and state positions.

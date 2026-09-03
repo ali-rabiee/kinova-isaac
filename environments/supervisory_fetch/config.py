@@ -69,9 +69,28 @@ class SupSceneConfig:
 
     target_color: str = "red"
     blocker_color: str = "blue"
+    distractor_colors: Tuple[str, ...] = ("green", "yellow", "white")
+    #: A visual-only slab laid on the table top with this diffuse colour, to change the
+    #: background texture a camera sees without touching the physics. ``None`` = bare table.
+    table_overlay_color: Optional[Tuple[float, float, float]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+#: The **held-out** scene configuration for the distribution-shift evaluation
+#: (``run_frames.py --shift``): different object colours and size, an altered table surface,
+#: one more distractor, and -- captured alongside -- a second top-down camera pose. Nothing
+#: here is trained on. The margin definition and the corridor are unchanged, so every scene id
+#: still realises the same clearance gap and the same coordinate ``c``.
+SHIFTED_SUP_SCENE_KW: Dict[str, Any] = dict(
+    cube_size_m=0.045,
+    target_color="magenta",
+    blocker_color="teal",
+    distractor_colors=("white", "orange", "green"),
+    n_distractors=3,
+    table_overlay_color=(0.55, 0.42, 0.30),
+)
 
 
 @dataclass
@@ -119,6 +138,15 @@ class SupFigureCameraConfig:
 
 DEFAULT_SUP_SCENE = SupSceneConfig()
 DEFAULT_SUP_TOPDOWN_CAMERA = SupTopDownCameraConfig()
+#: A second overhead pose for the distribution-shift atlas: 7 cm of translation and a few
+#: degrees of tilt off the collection contract, slightly narrower field of view. Still overhead.
+SHIFTED_SUP_TOPDOWN_CAMERA = SupTopDownCameraConfig(
+    prim_path="/World/Origin1/TopDownCameraShift",
+    position=(0.47, -0.06, 2.05),
+    target=(0.42, -0.03, 0.8),
+    resolution=(640, 640),
+    fov=61.0,
+)
 DEFAULT_SUP_FIGURE_CAMERA = SupFigureCameraConfig()
 DEFAULT_SUP_WRIST_CAMERA = SupWristCameraConfig()
 

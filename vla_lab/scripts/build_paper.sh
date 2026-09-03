@@ -20,15 +20,23 @@ if [[ ${SYNC_RC} -ne 0 && "${ALLOW_STALE:-0}" != "1" ]]; then
 fi
 
 cd "${PAPER}"
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 # Source-level checks first: these catch the two failure modes that compile cleanly and read
 # wrong (see lint.py), so they are worth a second before spending a minute on pdflatex.
 if ! python lint.py main.tex; then
   echo "source lint failed; fix before building."
   exit 1
 fi
-# Every number the manuscript quotes from a result file, re-derived from that file and looked for
-# in the source. Generated tables cannot drift; prose can, and this is where it would.
-python check_numbers.py
+# The test count is generated, never hand-written (the manuscript once said 235 in one place and
+# 234 in another).
+python -m vla_lab.tests.run_tests --count --count-tex tables/testcount.tex > /dev/null
+# Every numeric literal in the prose must trace to a generated artifact or to a justified
+# allowlist entry. Generated tables cannot drift; prose can, and this is where it would -- so
+# an uncovered literal fails the build.
+if ! python check_numbers.py --strict; then
+  echo "numbers audit failed; regenerate the artifact, quote a macro, or justify the literal in numbers_allowlist.txt."
+  exit 1
+fi
 
 # latexmk's rerun heuristic does not always notice that an \input-ed table changed a label, so a
 # freshly generated table can leave `Reference undefined' behind on an otherwise clean build.

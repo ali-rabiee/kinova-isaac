@@ -327,6 +327,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "context_style": style,
         "prompt_audit": prompt_audit,
         "contract_hash": contract.hash(),
+        "physics": {"source": contract.grid.physics.source, "fit_method": contract.grid.physics.fit_method,
+                    "quantile": contract.grid.physics.quantile,
+                    "crossover_margin_m": contract.grid.physics.crossover_margin(),
+                    "transition_width_m": contract.grid.physics.transition_width_m()},
+        "git_sha": _git_sha(),
         "optim": {"lr": args.lr, "batch": args.batch, "accum": args.accum, "epochs": args.epochs, "amp": amp},
         "preflight": pre,
         "env": {"python": platform.python_version(), "torch": torch.__version__},
@@ -398,6 +403,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
          "final": row}, indent=2, default=str) + "\n")
     print(f"\nbest de-biasing gain {best:+.3f}   ->  {out_dir}", file=sys.stderr)
     return 0
+
+
+def _git_sha() -> Optional[str]:
+    """The commit this run was produced from, for the manifest. ``None`` outside a checkout."""
+    import subprocess
+
+    try:
+        out = subprocess.run(["git", "rev-parse", "--short=12", "HEAD"], capture_output=True, text=True, timeout=5)
+        sha = out.stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, timeout=5).stdout.strip()
+        return (sha + ("-dirty" if dirty else "")) if sha else None
+    except Exception:                                           # pragma: no cover
+        return None
 
 
 class _null:

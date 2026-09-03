@@ -101,6 +101,12 @@ class ScenePhysics:
     p_b_asym: float = 0.97
     b_slope: float = 45.0
     b_mid: float = 0.035
+    #: Lapse floors: the success rate each strategy keeps even with no room at all. Zero in the
+    #: prior; the measured clear-first curve has a real one (2/12 at a 0 cm gap). A curve forced
+    #: through zero has to buy that floor with a shallower slope, which is one of the two ways
+    #: the first fit of this scene went wrong (see ``physics_fit.py``).
+    p_a_floor: float = 0.0
+    p_b_floor: float = 0.0
     t_a: float = 26.0
     t_b: float = 15.0
     t_b_tight: float = 9.0
@@ -109,12 +115,21 @@ class ScenePhysics:
     disturbance_penalty: float = 0.05
     source: str = SOURCE_PRIOR
     n_measured: int = 0
+    #: Which fitter produced the success curves (``physics_fit.FIT_LAPSE`` for the measured
+    #: physics from 2026-08-23 on; the legacy scaled logistic before that).
+    fit_method: str = "prior"
+    #: ``point`` / ``lower`` / ``upper`` when this object is one draw from the bootstrap
+    #: interval rather than the point estimate. Stamped into the contract so a study run under
+    #: the lower bound of ``w`` can never be pooled with one run under the point estimate.
+    quantile: str = "point"
 
     # -- success / time -----------------------------------------------------
     def p_success(self, strategy: str, m: float) -> float:
         if strategy == STRATEGY_A:
-            return float(self.p_a_asym * sigmoid(self.a_slope * (float(m) - self.a_mid)))
-        return float(self.p_b_asym * sigmoid(self.b_slope * (float(m) - self.b_mid)))
+            floor, asym = float(self.p_a_floor), float(self.p_a_asym)
+            return float(floor + (asym - floor) * sigmoid(self.a_slope * (float(m) - self.a_mid)))
+        floor, asym = float(self.p_b_floor), float(self.p_b_asym)
+        return float(floor + (asym - floor) * sigmoid(self.b_slope * (float(m) - self.b_mid)))
 
     def duration_s(self, strategy: str, m: float) -> float:
         if strategy == STRATEGY_A:
@@ -139,25 +154,70 @@ class ScenePhysics:
         return STRATEGY_A if self.value_gap(m) >= 0.0 else STRATEGY_B
 
     # -- the coordinate -----------------------------------------------------
+    def _crossings(self, lo: float, hi: float, n: int = 2001) -> List[Tuple[float, float]]:
+        """Brackets ``(m_i, m_{i+1})`` where the value gap goes from A-better to B-better.
+
+        The measured physics can carry **two** sign changes: at a gap of a few millimetres
+        neither strategy works, and the cheaper failure -- reaching directly -- is then worth
+        marginally more than the slower one; the trade the study is about only appears once
+        clearing first starts working and reaching directly does not. The crossover the
+        coordinate is defined on is therefore the *upper* one, where the direct strategy
+        overtakes as the gap opens; the lower, trivial one sits outside every scene grid and is
+        reported in ``physics_report.json`` rather than silently bisected onto.
+        """
+        ms = np.linspace(float(lo), float(hi), int(n))
+        gaps = np.array([self.value_gap(m) for m in ms])
+        out: List[Tuple[float, float]] = []
+        for i in range(len(ms) - 1):
+            if gaps[i] > 0.0 >= gaps[i + 1]:
+                out.append((float(ms[i]), float(ms[i + 1])))
+        return out
+
     def crossover_margin(self, lo: float = 0.0, hi: float = 0.20) -> float:
-        """The margin at which ``V_A = V_B``. Bisection; the gap is monotone decreasing in m."""
-        f_lo, f_hi = self.value_gap(lo), self.value_gap(hi)
-        if f_lo * f_hi > 0:
-            # No sign change in the bracket: the axis is degenerate at these settings. Return
-            # the endpoint whose gap is smaller so ``c`` stays finite and the caller's grid is
-            # still usable; :meth:`is_degenerate` lets the contract check refuse it loudly.
-            return lo if abs(f_lo) < abs(f_hi) else hi
-        for _ in range(80):
-            mid = 0.5 * (lo + hi)
-            if self.value_gap(lo) * self.value_gap(mid) <= 0:
-                hi = mid
-            else:
-                lo = mid
-        return 0.5 * (lo + hi)
+        """The margin at which ``V_A = V_B`` with the direct strategy overtaking as ``m`` grows.
+
+        Bisection inside the last A-to-B bracket. With no such bracket the axis is degenerate at
+        these settings; the endpoint whose gap is smaller is returned so ``c`` stays finite and
+        the caller's grid is still usable, and :meth:`is_degenerate` lets the contract check
+        refuse it loudly.
+        """
+        key = (self._param_key(), float(lo), float(hi))
+        cache = self.__dict__.setdefault("_crossover_cache", {})
+        if key in cache:
+            return cache[key]
+        brackets = self._crossings(lo, hi)
+        if not brackets:
+            f_lo, f_hi = self.value_gap(lo), self.value_gap(hi)
+            val = float(lo if abs(f_lo) < abs(f_hi) else hi)
+        else:
+            a, b = brackets[-1]
+            for _ in range(60):
+                mid = 0.5 * (a + b)
+                if self.value_gap(mid) > 0.0:
+                    a = mid
+                else:
+                    b = mid
+            val = 0.5 * (a + b)
+        cache[key] = val
+        return val
+
+    def lower_crossover_margin(self, lo: float = 0.0, hi: float = 0.20) -> Optional[float]:
+        """The trivial B-to-A crossing below which both strategies fail, if the fit has one."""
+        ms = np.linspace(float(lo), float(hi), 2001)
+        gaps = np.array([self.value_gap(m) for m in ms])
+        for i in range(len(ms) - 1):
+            if gaps[i] <= 0.0 < gaps[i + 1]:
+                return float(0.5 * (ms[i] + ms[i + 1]))
+        return None
+
+    def _param_key(self) -> Tuple[float, ...]:
+        return (self.p_a_asym, self.a_slope, self.a_mid, self.p_b_asym, self.b_slope, self.b_mid,
+                self.p_a_floor, self.p_b_floor, self.t_a, self.t_b, self.t_b_tight, self.reward,
+                self.time_cost, self.disturbance_penalty)
 
     def is_degenerate(self, lo: float = 0.0, hi: float = 0.20) -> bool:
-        """True when no crossover exists in the bracket -- one strategy always wins."""
-        return self.value_gap(lo) * self.value_gap(hi) > 0
+        """True when no A-to-B crossover exists in the bracket -- one strategy always wins."""
+        return not self._crossings(lo, hi)
 
     def transition_width_m(self) -> float:
         """Margin change over which the margin-sensitive strategy goes from failing to working.
@@ -195,6 +255,7 @@ class ScenePhysics:
         *,
         base: Optional["ScenePhysics"] = None,
         prior_precision: float = 1e-2,
+        method: str = "lapse",
     ) -> "ScenePhysics":
         """Fit success curves and mean durations from executed rollouts.
 
@@ -203,7 +264,17 @@ class ScenePhysics:
         from an Isaac margin sweep. Everything the rollouts do not constrain (``reward``,
         ``time_cost``, ``disturbance_penalty``) is carried over from ``base``, because those
         are contract constants rather than measurements.
+
+        ``method="lapse"`` (the default) is the four-parameter psychometric of
+        :mod:`vla_lab.supervisory.physics_fit`. ``method="scaled_legacy"`` reproduces the
+        original two-parameter fit with its per-metre ridge prior; it is kept so the two can be
+        reported side by side, and it is not what any study runs under.
         """
+        if str(method) == "lapse":
+            from .physics_fit import fit_physics_lapse
+
+            out, _ = fit_physics_lapse(records, base=base)
+            return out
         out = replace(base or cls())
         by_strategy: Dict[str, List[Dict[str, Any]]] = {STRATEGY_A: [], STRATEGY_B: []}
         for r in records:
@@ -233,6 +304,53 @@ class ScenePhysics:
                     out.t_b_tight = float(max(0.0, (np.mean(tight) if tight else out.t_b) - out.t_b))
         out.source = SOURCE_MEASURED if n_used else SOURCE_PRIOR
         out.n_measured = int(n_used)
+        out.fit_method = "scaled_logistic_legacy"
+        out.p_a_floor = 0.0
+        out.p_b_floor = 0.0
+        return out
+
+    # -- counterfactual physics, for the sensitivity-to-curve diagnostic ------------------
+    def with_transition_width(self, w_m: float, *, keep_crossover: bool = True,
+                              lo: float = 0.0, hi: float = 0.20) -> "ScenePhysics":
+        """The same physics with the direct strategy's transition width set to ``w_m``.
+
+        With ``keep_crossover`` the direct strategy's midpoint is re-solved so the value
+        crossover stays where it is, which isolates *how sharp the trade is* from *where it
+        sits*. This is what the assumed-``w`` sweep of :mod:`vla_lab.supervisory.flip` varies,
+        and it is tagged as a counterfactual in ``quantile`` so it can never be mistaken for a
+        measurement.
+        """
+        out = replace(self)
+        target = self.crossover_margin(lo, hi) if keep_crossover else None
+        out.b_slope = 1.0 / max(float(w_m), 1e-6)
+        if target is not None:
+            out = out.with_crossover(target, lo=lo, hi=hi)
+        out.quantile = f"assumed_w={float(w_m) * 100:.2f}cm"
+        return out
+
+    def with_crossover(self, m_star: float, *, lo: float = 0.0, hi: float = 0.20) -> "ScenePhysics":
+        """Shift the direct strategy's midpoint until the value crossover sits at ``m_star``."""
+        out = replace(self)
+        lo_mid, hi_mid = -0.30, 0.50
+
+        def effective_crossover(phys: "ScenePhysics") -> float:
+            # A degenerate physics has its crossover at +/- infinity, not at the bracket's
+            # endpoint the fallback returns: B working everywhere means "too low", B never
+            # working means "too high". Without this the bisection is not monotone.
+            if phys.is_degenerate(lo, hi):
+                return float("inf") if phys.value_gap(hi) > 0.0 else float("-inf")
+            return phys.crossover_margin(lo, hi)
+
+        for _ in range(80):
+            mid = 0.5 * (lo_mid + hi_mid)
+            out.b_mid = mid
+            if effective_crossover(out) < float(m_star):
+                lo_mid = mid
+            else:
+                hi_mid = mid
+        out.b_mid = 0.5 * (lo_mid + hi_mid)
+        if out.quantile == "point":
+            out.quantile = f"assumed_mstar={float(m_star) * 100:.2f}cm"
         return out
 
     def to_dict(self) -> Dict[str, Any]:

@@ -1,15 +1,27 @@
-"""Emit the manuscript's result tables as LaTeX fragments, straight from the result files.
+"""Emit the manuscript's result tables and macros as LaTeX fragments, straight from the result files.
 
 Every number in a paper that a person copied out of a JSON file by hand is a number that can
 silently disagree with the run it claims to come from. Re-running an experiment and forgetting
 to update one cell leaves no trace: the table still compiles, the caption still reads correctly,
-and the error survives review. So the tables that carry measurements are generated.
+and the error survives review. So every table that carries a measurement is generated, and so is
+every macro the prose quotes.
 
     python -m vla_lab.supervisory.latex_tables
 
-Writes ``tab_models.tex``, ``tab_deployed.tex`` and ``tab_sensitivity.tex`` into the paper's
-``tables/`` directory, each with a provenance comment naming the file and its modification time.
-The manuscript ``\\input``s them, so a stale table is impossible rather than merely unlikely.
+Writes into the paper's ``tables/`` directory, each file with a provenance comment naming its
+source and the source's modification time:
+
+``headline.tex``        the macros the abstract, introduction, results and discussion quote
+``tab_primary.tex``     the primary outcome table (every condition, floor row)
+``tab_identification.tex``  per-condition identification of lambda and beta*g
+``tab_physics_ci.tex``  the primary contrasts under the bootstrap draws of the physics
+``tab_models.tex``      the architecture comparison, mean +- seed SD, seed-floor row
+``tab_ablations.tex``   the objective ablations, mean +- seed SD, seed-floor row
+``tab_shift.tex``       matched vs. held-out distribution, per cell
+``tab_sensitivity.tex`` the assumption sweep with the placebo rows
+``tab_deployed.tex``    the closed-loop evaluation, one block per backbone
+
+A missing source skips its table and says so; the build decides whether that is acceptable.
 """
 
 from __future__ import annotations
@@ -17,10 +29,12 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 PAPER = Path("vla_lab/paper/hri2027_carryover_vla")
+RESULTS = Path("vla_lab/results")
 
 
 def _stamp(src: Path) -> str:
@@ -38,126 +52,285 @@ def _f(x: Any, nd: int = 4, signed: bool = False) -> str:
     return f"${v:+.{nd}f}$" if signed else f"${v:.{nd}f}$"
 
 
-#: Context modes in the order the paper discusses them, so the table reads the same for every
-#: backbone regardless of which order the sweep happened to run them in.
+def _pm(d: Optional[Dict[str, Any]], nd: int = 3, signed: bool = True, bold: bool = False) -> str:
+    """``$+0.135 \\pm 0.004$`` from a ``{mean, sd}`` cell; a lone value when there is one seed."""
+    if not d or d.get("mean") is None:
+        return "--"
+    m = float(d["mean"])
+    ms = f"{m:+.{nd}f}" if signed else f"{m:.{nd}f}"
+    if bold:
+        ms = f"\\mathbf{{{ms}}}"
+    if d.get("sd") is None:
+        return f"${ms}$"
+    return f"${ms} \\pm {float(d['sd']):.{nd}f}$"
+
+
+def _load(p: Path) -> Any:
+    return json.loads(Path(p).read_text()) if Path(p).exists() else None
+
+
+#: Context modes in the order the paper discusses them.
 CONTEXT_ORDER = {"none": 0, "text": 1, "token": 2, "film": 3}
+#: Conditions in report order, with their paper labels.
+CONDITION_ORDER = ["memoryless", "fixed_washout", "random_static", "always_counter", "carryover_aware",
+                   "identification_first", "recommended", "ablation_schedule_only", "ablation_estimator_only",
+                   "ablation_counter_only", "ablation_b6_fixed_scenes", "ablation_b6_ladder"]
+CONDITION_LABEL = {
+    "memoryless": "B1 Memoryless VLA", "fixed_washout": "B2 Fixed washout", "random_static": "B3 Random / static",
+    "always_counter": "B4 Always counter-propose", "carryover_aware": "B5 Carryover-aware (full)",
+    "identification_first": "B6 Identification-first", "recommended": "B7 Recommended",
+    "ablation_schedule_only": "\\quad abl.\\ schedule only", "ablation_estimator_only": "\\quad abl.\\ estimator only",
+    "ablation_counter_only": "\\quad abl.\\ counter only", "ablation_b6_fixed_scenes": "\\quad B6, fixed scene order",
+    "ablation_b6_ladder": "\\quad B6, log-spaced waits",
+}
 
 
-def models_table(src: Path, extra: Sequence[Path] = ()) -> str:
-    """The architecture comparison: one row per (backbone, context mode).
-
-    Takes several ``table.json`` files -- one per backbone sweep -- and merges them, so adding a
-    backbone to the roster is a matter of running its sweep rather than editing LaTeX.
-    """
-    rows: List[Dict[str, Any]] = []
-    for p in [src, *extra]:
-        if Path(p).exists():
-            rows.extend(json.loads(Path(p).read_text()))
-    by_model: Dict[str, List[Dict[str, Any]]] = {}
-    for r in rows:
-        if r.get("debias_gain_brier") is None:       # a cell that failed to train
-            continue
-        by_model.setdefault(str(r.get("display", r.get("model", "?"))), []).append(r)
-    for cells in by_model.values():
-        cells.sort(key=lambda c: CONTEXT_ORDER.get(str(c.get("context")), 9))
-
-    out = [_stamp(src), "\\begin{tabular}{@{}llrrrr@{}}", "\\toprule",
-           "Backbone & Context & Trainable & Gain (Brier) & gap$\\sim\\kappa$ & ask $\\rho$ \\\\", "\\midrule"]
-    for i, (display, cells) in enumerate(by_model.items()):
-        if i:
+# ---------------------------------------------------------------------------
+# Primary table and identification
+# ---------------------------------------------------------------------------
+def primary_table(src: Path) -> str:
+    d = _load(src)
+    conds = d["conditions"]
+    order = [c for c in CONDITION_ORDER if c in conds]
+    floor = (d.get("test_retest", {}).get("mae_crossover") or {}).get("mean")
+    out = [_stamp(src), "\\begin{tabular}{@{}lccccccc@{}}", "\\toprule",
+           "Condition & MAE$_\\times$ & MAE & Regret & Align. & Cov@95 & Ctr & min \\\\", "\\midrule"]
+    remedies = [c for c in order if c != "memoryless"]
+    best = {k: min(conds[c][k]["mean"] for c in remedies) for k in ("mae_crossover", "mae", "deployment_regret")}
+    best_align = max(conds[c]["alignment"]["mean"] for c in remedies)
+    for c in order:
+        if c == "ablation_schedule_only":
             out.append("\\midrule")
-        best_gain = max((c.get("debias_gain_brier", float("-inf")) for c in cells), default=None)
-        best_corr = max((c.get("debias_kappa_corr", float("-inf")) for c in cells), default=None)
-        out.append(f"\\multirow{{{len(cells)}}}{{*}}{{{display}}}")
-        for c in cells:
-            g, k = c.get("debias_gain_brier"), c.get("debias_kappa_corr")
-            gs = _f(g, 3, signed=True)
-            ks = _f(k, 3, signed=True)
-            if g is not None and g == best_gain:
-                gs = f"$\\mathbf{{{float(g):+.3f}}}$"
-            if k is not None and k == best_corr:
-                ks = f"$\\mathbf{{{float(k):+.3f}}}$"
-            n, tot = c.get("params_trainable"), c.get("params_total")
-            if not isinstance(n, (int, float)):
-                npretty = "--"
-            elif isinstance(tot, (int, float)) and tot > 1.5 * n:
-                # LoRA rows: the trainable count alone reads as though the model were small.
-                npretty = f"{n / 1e6:.1f}\\,M / {tot / 1e9:.1f}\\,B"
-            else:
-                npretty = f"{n / 1e6:.1f}\\,M"
-            out.append(f" & \\textsf{{{c.get('context', '?')}}} & {npretty} & {gs} & {ks} "
-                       f"& {_f(c.get('ask_rank_corr'), 3, signed=True)} \\\\")
+        v = conds[c]
+
+        def cell(k: str, nd: int, is_best: bool) -> str:
+            s = f"{v[k]['mean']:.{nd}f}"
+            return f"\\textbf{{{s}}}" if is_best else s
+
+        label = CONDITION_LABEL.get(c, c)
+        if c in ("memoryless", "recommended"):
+            label = f"\\textbf{{{label}}}"
+        out.append(
+            f"{label} & {cell('mae_crossover', 4, v['mae_crossover']['mean'] == best['mae_crossover'])} "
+            f"& {cell('mae', 4, v['mae']['mean'] == best['mae'])} "
+            f"& {cell('deployment_regret', 4, v['deployment_regret']['mean'] == best['deployment_regret'])} "
+            f"& {cell('alignment', 3, v['alignment']['mean'] == best_align)} "
+            f"& {v['coverage@95']['mean']:.3f} & {v['n_counter']['mean']:.1f} & {v['wall_clock_s']['mean'] / 60:.1f} \\\\")
+    out += ["\\midrule",
+            f"\\multicolumn{{2}}{{@{{}}l}}{{\\emph{{test--retest floor}}}} & \\multicolumn{{6}}{{l}}{{{floor:.4f} "
+            "(reference vs.\\ terminal retest, both uncoached)} \\\\",
+            "\\bottomrule", "\\end{tabular}", ""]
+    return "\n".join(out)
+
+
+def identification_table(src: Path) -> str:
+    """Both criteria side by side, each with its non-complier control -- the table has to carry
+    the argument that the total-variation criterion was firing for people it cannot be true of."""
+    d = _load(src)
+    ident = d.get("identification") or {}
+    order = [c for c in CONDITION_ORDER if c in ident]
+    out = [_stamp(src),
+           "\\begin{tabular}{@{}lcccc@{}}", "\\toprule",
+           " & \\multicolumn{2}{c}{$\\lambda$ identified} & $\\beta g$ & \\\\",
+           "Condition & contraction & TV criterion & contraction & MAE$_\\times$ \\\\", "\\midrule"]
+    for c in order:
+        if c == "ablation_estimator_only":
+            out.append("\\midrule")
+        e = ident[c]
+        mae = d["conditions"][c]["mae_crossover"]["mean"]
+        lam = f"{e['lambda'] * 100:.0f}\\% [{e['lambda_ci'][0] * 100:.0f}, {e['lambda_ci'][1] * 100:.0f}]"
+        tv = f"{e.get('lambda_tv', float('nan')) * 100:.0f}\\%"
+        if e.get("lambda_tv_noncomplier_rate") is not None:
+            tv += f" ({e['lambda_tv_noncomplier_rate'] * 100:.0f}\\% of $\\beta{{=}}0$)"
+        out.append(f"{CONDITION_LABEL.get(c, c)} & {lam} & {tv} & {e['beta_g'] * 100:.0f}\\% & {mae:.4f} \\\\")
     out += ["\\bottomrule", "\\end{tabular}", ""]
     return "\n".join(out)
 
 
-def deployed_table(src: Path, extra: Sequence[Tuple[str, Path]] = (),
-                   *, condition: str = "carryover_aware") -> str:
-    """The closed-loop evaluation: the reference channel, then each read of each checkpoint.
-
-    Takes one summary per backbone. Each brings its own lexical reference, because the reference
-    is run inside that backbone's evaluation and must be compared against on its own terms.
-    """
-    blocks: List[Tuple[str, Dict[str, Any]]] = [("TinyVLA-2M", json.loads(src.read_text()))]
-    for label, p in extra:
-        if Path(p).exists():
-            blocks.append((label, json.loads(Path(p).read_text())))
-    return "\n".join([_stamp(src)] + [_deployed_block(label, d, condition, first=(i == 0))
-                                      for i, (label, d) in enumerate(blocks)]
-                     + ["\\bottomrule", "\\end{tabular}", ""])
-
-
-def _deployed_block(label: str, data: Dict[str, Any], condition: str, *, first: bool) -> str:
-    def cell(entry: Dict[str, Any], key: str) -> Any:
-        return entry.get("conditions", {}).get(condition, {}).get(key, {}).get("mean")
-
-    out: List[str] = []
-    if first:
-        out += ["\\begin{tabular}{@{}lllrrrrr@{}}", "\\toprule",
-                "Backbone & Channel & Context & MAE$_\\times$ & regret & align & ungr. & abst./band \\\\",
-                "\\midrule"]
-    else:
-        out.append("\\midrule")
-    out.append(f"\\multicolumn{{8}}{{@{{}}l}}{{\\emph{{{label}}}}} \\\\")
-
-    if "lexical" in data:
-        e = data["lexical"]
-        out.append(f" & lexical (ref.) & --- & {_f(cell(e, 'mae_crossover'))} "
-                   f"& {_f(cell(e, 'deployment_regret'))} & {_f(cell(e, 'alignment'), 3)} "
-                   f"& {_f(cell(e, 'n_ungrounded'), 1)} & --- \\\\")
-
-    for read in ("policy_said", "policy_unprompted"):
-        keys = [k for k in data if k.startswith(read + "@")]
-        if not keys:
-            continue
-        keys.sort(key=lambda k: CONTEXT_ORDER.get(k.split("__")[-1], 9))
-        read_label = "said" if read.endswith("said") else "unprompted"
-        best = min((cell(data[k], "mae_crossover") for k in keys
-                    if cell(data[k], "mae_crossover") is not None), default=None)
-        for i, k in enumerate(keys):
-            e = data[k]
-            g = e.get("grounder", {})
-            ctx = k.split("__")[-1] if "__" in k else k.split("@")[-1]
-            mae = cell(e, "mae_crossover")
-            maes = f"$\\mathbf{{{float(mae):.4f}}}$" if (mae is not None and mae == best) else _f(mae)
-            head = (f"\\multirow{{{len(keys)}}}{{*}}{{\\textsf{{{read_label}}}}}" if i == 0 else "")
-            out.append(f" & {head} & \\textsf{{{ctx}}} & {maes} & {_f(cell(e, 'deployment_regret'))} "
-                       f"& {_f(cell(e, 'alignment'), 3)} & {_f(cell(e, 'n_ungrounded'), 1)} "
-                       f"& {_f(g.get('abstain_rate'), 3)} / {_f(g.get('abstain_rate_band'), 3)} \\\\")
+def physics_ci_table(src: Path) -> str:
+    rows = _load(src)
+    contrasts = ["memoryless", "always_counter", "recommended", "carryover_aware", "identification_first"]
+    out = [_stamp(src), "\\begin{tabular}{@{}lcccccccc@{}}", "\\toprule",
+           "Physics draw & $m^*$ (cm) & $w$ (cm) & floor & spread & B1 & B4 & B7 & B5 \\\\", "\\midrule"]
+    for r in rows:
+        cells = []
+        for c in contrasts[:4]:
+            ct = r["contrasts"].get(c)
+            if not ct:
+                cells.append("--")
+                continue
+            s = f"${ct['delta']:+.4f}$ {{\\scriptsize $[{ct['lo']:+.4f}, {ct['hi']:+.4f}]$}}"
+            cells.append(f"\\textbf{{{s}}}" if ct["excludes_zero"] else s)
+        out.append(f"{r['draw']} & {r['mstar_cm']:.2f} & {r['w_cm']:.2f} & {r['floor']:.4f} & "
+                   f"{(r['spread_remedies'] or float('nan')):.4f} & " + " & ".join(cells) + " \\\\")
+    out += ["\\bottomrule", "\\end{tabular}", ""]
     return "\n".join(out)
 
 
-def sensitivity_table(src: Path) -> str:
-    """One row per setting of the assumptions; B1 bolded where it is worst, as it should be."""
-    rows: List[Dict[str, Any]] = json.loads(src.read_text())
-    # Present the dose ladder in dose order, not alphabetically: the interesting pattern is
-    # monotone in the dose, and a reader should be able to see that by reading downwards.
-    rank = {"dose_weak": 0, "dose_moderate": 1, "dose_strong": 2, "prior_flat": 3, "regime_alternating": 4}
-    rows = sorted(rows, key=lambda r: rank.get(str(r.get("cell", "")), 99))
-    order = ["memoryless", "fixed_washout", "random_static", "always_counter", "carryover_aware"]
-    out = [_stamp(src), "\\begin{tabular}{lccccc c}", "\\toprule",
-           "Setting & B1 & B2 & B3 & B4 & B5 & B5 ctr \\\\", "\\midrule"]
+# ---------------------------------------------------------------------------
+# Model tables with seed dispersion
+# ---------------------------------------------------------------------------
+def _seed_cells(root: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Cells with ``{mean, sd}`` per metric, from ``table_seeds.json`` (or single-seed rows)."""
+    ts = _load(root / "table_seeds.json")
+    if ts:
+        return ts["cells"], ts.get("seed_floor", {})
+    rows = _load(root / "table.json") or []
+    cells = []
     for r in rows:
+        if r.get("debias_gain_brier") is None:
+            continue
+        cells.append({**r, "n_seeds": 1,
+                      **{k: {"mean": r.get(k), "sd": None} for k in ("debias_gain_brier", "debias_kappa_corr", "ask_rank_corr")}})
+    return cells, {}
+
+
+def _assert_matched_adaptation(roots: Sequence[Path]) -> List[str]:
+    """The within-family scale contrast is only clean if the 2B and 3B Qwen cells share every
+    adaptation setting: LoRA rank/alpha/dropout, target modules, learning rate, batch schedule
+    and epochs. The manifests record them; this compares them and returns human-readable
+    mismatches, which the generated table carries as a loud comment. An empty list is the
+    assertion the paper's within-family paragraph relies on."""
+    rows: List[Dict[str, Any]] = []
+    for root in roots:
+        rows.extend(_load(Path(root) / "table.json") or [])
+    qwen = [r for r in rows if str(r.get("model", "")).startswith(("qwen2vl", "qwen25vl")) and not r.get("skipped")]
+    problems: List[str] = []
+    if not qwen:
+        return problems
+    ref = qwen[0]
+    for r in qwen[1:]:
+        for key in ("adapt", "adapt_config", "lora_targets", "optim"):
+            a, b = ref.get(key), r.get(key)
+            if isinstance(a, list) and isinstance(b, list):
+                a, b = sorted(map(str, a)), sorted(map(str, b))
+            if a != b and a is not None and b is not None:
+                problems.append(f"{r.get('model')}/{r.get('context')}/s{r.get('seed')}: {key} differs from "
+                                f"{ref.get('model')}/{ref.get('context')}/s{ref.get('seed')}: {b!r} != {a!r}")
+    return problems
+
+
+def models_table(roots: Sequence[Path]) -> str:
+    """The architecture comparison: one row per (backbone, context), mean +- seed SD, floor row."""
+    blocks: List[Tuple[str, List[Dict[str, Any]], Dict[str, Any]]] = []
+    for root in roots:
+        cells, floors = _seed_cells(Path(root))
+        if cells:
+            blocks.append((str(cells[0].get("display") or cells[0].get("model")), cells, floors))
+    src = Path(roots[0]) / "table_seeds.json"
+    mismatches = _assert_matched_adaptation(roots)
+    out = [_stamp(src)]
+    if mismatches:
+        out.append("% !! ADAPTATION SETTINGS DIFFER ACROSS THE QWEN FAMILY -- the within-family scale")
+        out.append("% !! contrast is NOT clean. The paper must not quote it until this is resolved:")
+        out += [f"% !!   {m}" for m in mismatches]
+        print("[tab_models] WARNING: Qwen adaptation settings differ across the family:")
+        for m in mismatches:
+            print("   " + m)
+    else:
+        out.append("% qwen-family adaptation settings verified identical across cells (see _assert_matched_adaptation)")
+    out += ["\\begin{tabular}{@{}llrrrr@{}}", "\\toprule",
+            "Backbone & Context & Trainable & Gain (Brier) & gap$\\sim\\kappa$ & seeds \\\\", "\\midrule"]
+    pooled_floor_gain: List[float] = []
+    pooled_floor_kappa: List[float] = []
+    for i, (display, cells, floors) in enumerate(blocks):
+        if i:
+            out.append("\\midrule")
+        cells = sorted(cells, key=lambda c: CONTEXT_ORDER.get(str(c.get("context")), 9))
+        best_gain = max(c["debias_gain_brier"]["mean"] for c in cells)
+        best_corr = max(c["debias_kappa_corr"]["mean"] for c in cells)
+        out.append(f"\\multirow{{{len(cells)}}}{{*}}{{{display}}}")
+        for c in cells:
+            n, tot = c.get("params_trainable"), c.get("params_total")
+            if not isinstance(n, (int, float)):
+                npretty = "--"
+            elif isinstance(tot, (int, float)) and tot > 1.5 * n:
+                npretty = f"{n / 1e6:.1f}\\,M / {tot / 1e9:.1f}\\,B"
+            else:
+                npretty = f"{n / 1e6:.1f}\\,M"
+            out.append(f" & \\textsf{{{c.get('context')}}} & {npretty} "
+                       f"& {_pm(c['debias_gain_brier'], bold=c['debias_gain_brier']['mean'] == best_gain)} "
+                       f"& {_pm(c['debias_kappa_corr'], bold=c['debias_kappa_corr']['mean'] == best_corr)} "
+                       f"& {c.get('n_seeds', 1)} \\\\")
+        fg, fk = (floors.get("debias_gain_brier") or {}).get("floor"), (floors.get("debias_kappa_corr") or {}).get("floor")
+        if fg is not None and fk is not None:
+            out.append(f" & \\multicolumn{{2}}{{l}}{{\\emph{{seed floor}}}} & ${fg:.3f}$ & ${fk:.3f}$ & \\\\")
+            pooled_floor_gain.append(fg)
+            pooled_floor_kappa.append(fk)
+    out += ["\\bottomrule", "\\end{tabular}", ""]
+    return "\n".join(out)
+
+
+def ablations_table(root: Path) -> str:
+    labels = {"full": ("every term", 0), "no-forward": ("without forward consistency", 1),
+              "no-anti-copy": ("without the compliance penalty", 2), "no-reference": ("without reference supervision", 3)}
+    cells, floors = _seed_cells(Path(root))
+    cells = sorted(cells, key=lambda c: labels.get(str(c.get("ablation")), ("", 9))[1])
+    full = next((c for c in cells if c.get("ablation") == "full"), None)
+    base = float(full["debias_gain_brier"]["mean"]) if full else 0.0
+    src = Path(root) / "table_seeds.json"
+    out = [_stamp(src), "\\begin{tabular}{@{}lrrrr@{}}", "\\toprule",
+           "Objective & Gain (Brier) & $\\Delta$ vs.\\ full & gap$\\sim\\kappa$ & seeds \\\\", "\\midrule"]
+    fg = (floors.get("debias_gain_brier") or {}).get("floor")
+    for c in cells:
+        label = labels.get(str(c.get("ablation")), (str(c.get("ablation")), 9))[0]
+        g = float(c["debias_gain_brier"]["mean"])
+        if c is full:
+            d = "---"
+        else:
+            d = f"${g - base:+.4f}$"
+            if fg is not None and abs(g - base) <= fg:
+                d += "{\\scriptsize\\ (inside floor)}"
+        out.append(f"{label} & {_pm(c['debias_gain_brier'], 4)} & {d} & {_pm(c['debias_kappa_corr'], 3)} & {c.get('n_seeds', 1)} \\\\")
+    fk = (floors.get("debias_kappa_corr") or {}).get("floor")
+    if fg is not None and fk is not None:
+        out.append(f"\\midrule\n\\emph{{seed floor}} & ${fg:.4f}$ & & ${fk:.3f}$ & \\\\")
+    out += ["\\bottomrule", "\\end{tabular}", ""]
+    return "\n".join(out)
+
+
+def shift_table(src: Path) -> str:
+    d = _load(src)
+    cells = d["cells"]
+    names = [n for n in d["atlases"] if n != "matched"]
+    by_model: Dict[str, List[Dict[str, Any]]] = {}
+    for c in cells:
+        by_model.setdefault(str(c.get("display") or c.get("model")), []).append(c)
+    out = [_stamp(src), "\\begin{tabular}{@{}ll" + "rr" * (1 + len(names)) + "@{}}", "\\toprule",
+           "Backbone & Context & \\multicolumn{2}{c}{matched} " +
+           "".join(f"& \\multicolumn{{2}}{{c}}{{{n}}} " for n in names) + "\\\\",
+           " & & gain & gap$\\sim\\kappa$ " + "& gain & gap$\\sim\\kappa$ " * len(names) + "\\\\", "\\midrule"]
+    for i, (display, cs) in enumerate(by_model.items()):
+        if i:
+            out.append("\\midrule")
+        cs = sorted(cs, key=lambda c: CONTEXT_ORDER.get(str(c.get("context")), 9))
+        out.append(f"\\multirow{{{len(cs)}}}{{*}}{{{display}}}")
+        for c in cs:
+            row = f" & \\textsf{{{c.get('context')}}} & {_pm(c.get('matched__debias_gain_brier'))} & {_pm(c.get('matched__debias_kappa_corr'))} "
+            for n in names:
+                row += f"& {_pm(c.get(f'{n}__debias_gain_brier'))} & {_pm(c.get(f'{n}__debias_kappa_corr'))} "
+            out.append(row + "\\\\")
+    out += ["\\bottomrule", "\\end{tabular}", ""]
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Sensitivity and deployed
+# ---------------------------------------------------------------------------
+def sensitivity_table(src: Path) -> str:
+    rows: List[Dict[str, Any]] = _load(src)
+    rank = {"dose_weak": 0, "dose_moderate": 1, "dose_strong": 2, "prior_flat": 3, "regime_alternating": 4,
+            "placebo_lapse_low": 5, "placebo_lapse_high": 6, "placebo_latency_slow": 7}
+    rows = sorted(rows, key=lambda r: rank.get(str(r.get("cell", "")), 99))
+    order = ["memoryless", "fixed_washout", "random_static", "always_counter", "carryover_aware",
+             "identification_first", "recommended"]
+    out = [_stamp(src), "\\begin{tabular}{lccccccc cc}", "\\toprule",
+           "Setting & B1 & B2 & B3 & B4 & B5 & B6 & B7 & B5 ctr & B7 ctr \\\\", "\\midrule"]
+    placebo_started = False
+    for r in rows:
+        if str(r.get("cell", "")).startswith("placebo") and not placebo_started:
+            out.append("\\midrule")
+            placebo_started = True
         vals = [r.get(k) for k in order]
         best = min((v for v in vals if v is not None), default=None)
         cells = []
@@ -168,140 +341,519 @@ def sensitivity_table(src: Path) -> str:
                 cells.append(f"\\textbf{{{v:.3f}}}")
             else:
                 cells.append(f"{v:.3f}")
-        ctr = r.get("carryover_aware__ctr")
-        out.append(f"{r.get('label', r.get('cell', '?'))} & " + " & ".join(cells) +
-                   f" & {ctr:.1f} \\\\" if ctr is not None else " & -- \\\\")
+        c5, c7 = r.get("carryover_aware__ctr"), r.get("recommended__ctr")
+        line = f"{r.get('label', r.get('cell', '?'))} & " + " & ".join(cells)
+        line += f" & {c5:.1f}" if c5 is not None else " & --"
+        line += f" & {c7:.1f} \\\\" if c7 is not None else " & -- \\\\"
+        out.append(line)
     out += ["\\bottomrule", "\\end{tabular}", ""]
     return "\n".join(out)
 
 
-#: How the objective ablations are named in the paper, in the order they are discussed.
-ABLATION_LABELS = {
-    "full": ("every term", 0),
-    "no-forward": ("without forward consistency", 1),
-    "no-anti-copy": ("without the compliance penalty", 2),
-    "no-reference": ("without reference supervision", 3),
-}
+def deployed_table(blocks: Sequence[Tuple[str, Path]]) -> str:
+    present = [(label, _load(p)) for label, p in blocks if Path(p).exists()]
+    if not present:
+        return ""
+    src = Path(blocks[0][1])
+    out = [_stamp(src), "\\begin{tabular}{@{}lllrrrrr@{}}", "\\toprule",
+           "Backbone & Channel & Context & MAE$_\\times$ & regret & align & ungr. & abst./band \\\\", "\\midrule"]
+    for i, (label, data) in enumerate(present):
+        condition = str((data.get("_meta") or {}).get("policy") or "carryover_aware")
+        if i:
+            out.append("\\midrule")
+        out.append(f"\\multicolumn{{8}}{{@{{}}l}}{{\\emph{{{label}}} (policy: {CONDITION_LABEL.get(condition, condition)})}} \\\\")
 
+        def cell(entry: Dict[str, Any], key: str) -> Any:
+            return entry.get("conditions", {}).get(condition, {}).get(key, {}).get("mean")
 
-def ablations_table(src: Path) -> str:
-    """Which terms of the training objective are load-bearing."""
-    rows: List[Dict[str, Any]] = json.loads(src.read_text())
-    rows = [r for r in rows if r.get("debias_gain_brier") is not None]
-    rows.sort(key=lambda r: ABLATION_LABELS.get(str(r.get("ablation")), ("", 9))[1])
-    full = next((r for r in rows if r.get("ablation") == "full"), None)
-    base = float(full["debias_gain_brier"]) if full else 0.0
+        if "lexical" in data:
+            e = data["lexical"]
+            out.append(f" & lexical (ref.) & --- & {_f(cell(e, 'mae_crossover'))} & {_f(cell(e, 'deployment_regret'))} "
+                       f"& {_f(cell(e, 'alignment'), 3)} & {_f(cell(e, 'n_ungrounded'), 1)} & --- \\\\")
+        for read in ("policy_said", "policy_unprompted"):
+            keys = [k for k in data if k.startswith(read + "@")]
+            if not keys:
+                continue
+            def _ctx(k: str) -> str:
+                parts = k.split("@")[-1].split("__")          # model__context[__sN]
+                return parts[1] if len(parts) > 1 else parts[0]
 
-    out = [_stamp(src), "\\begin{tabular}{@{}lrrr@{}}", "\\toprule",
-           "Objective & Gain (Brier) & $\\Delta$ vs.\\ full & gap$\\sim\\kappa$ \\\\", "\\midrule"]
-    for r in rows:
-        label = ABLATION_LABELS.get(str(r.get("ablation")), (str(r.get("ablation")), 9))[0]
-        g = float(r["debias_gain_brier"])
-        d = "---" if r is full else f"${g - base:+.4f}$"
-        out.append(f"{label} & {_f(g, 4, signed=True)} & {d} & {_f(r.get('debias_kappa_corr'), 3, signed=True)} \\\\")
+            keys.sort(key=lambda k: CONTEXT_ORDER.get(_ctx(k), 9))
+            read_label = "said" if read.endswith("said") else "unprompted"
+            best = min((cell(data[k], "mae_crossover") for k in keys if cell(data[k], "mae_crossover") is not None), default=None)
+            for j, k in enumerate(keys):
+                e = data[k]
+                g = e.get("grounder", {})
+                ctx = _ctx(k)
+                mae = cell(e, "mae_crossover")
+                maes = f"$\\mathbf{{{float(mae):.4f}}}$" if (mae is not None and mae == best) else _f(mae)
+                head = f"\\multirow{{{len(keys)}}}{{*}}{{\\textsf{{{read_label}}}}}" if j == 0 else ""
+                out.append(f" & {head} & \\textsf{{{ctx}}} & {maes} & {_f(cell(e, 'deployment_regret'))} "
+                           f"& {_f(cell(e, 'alignment'), 3)} & {_f(cell(e, 'n_ungrounded'), 1)} "
+                           f"& {_f(g.get('abstain_rate'), 3)} / {_f(g.get('abstain_rate_band'), 3)} \\\\")
     out += ["\\bottomrule", "\\end{tabular}", ""]
     return "\n".join(out)
 
 
+# ---------------------------------------------------------------------------
+# The macros
+# ---------------------------------------------------------------------------
 def _ci(d: Dict[str, Any], nd: int = 4) -> str:
-    """``$-0.0148$, CI $[-0.0248, -0.0046]$`` from a contrast entry.
-
-    Emitted as a **text-mode** fragment with its own math delimiters, and wrapped in ``\mbox``
-    so that writing ``$\MemorylessMAE$`` in the manuscript is an error rather than a silent
-    disaster. Without the guard, the macro's first ``$`` closes the surrounding math, its last one
-    re-opens it, and the remaining half-paragraph renders in italic maths --- which compiles
-    cleanly and is only visible by reading the PDF.
-    """
-    return ("\\mbox{$%+.*f$, CI $[%+.*f, %+.*f]$}"
-            % (nd, d["delta"], nd, d["lo"], nd, d["hi"]))
+    """``$-0.0148$, CI $[-0.0248, -0.0046]$`` as a text-mode fragment, ``\\mbox``-guarded."""
+    return "\\mbox{$%+.*f$, CI $[%+.*f, %+.*f]$}" % (nd, d["delta"], nd, d["lo"], nd, d["hi"])
 
 
-def headline_macros(src: Path) -> str:
-    """``\newcommand``s for every number the abstract and introduction quote.
-
-    The abstract, the introduction's findings list, the results text and the discussion all cite
-    the same handful of contrasts. Typing them in four places is how a paper ends up disagreeing
-    with itself after a re-run; here they are defined once from the study's own summary.
-    """
-    d: Dict[str, Any] = json.loads(src.read_text())
+def headline_macros(study: Path, *, physics_report: Path, legacy_report: Optional[Path] = None,
+                    physics_ci: Optional[Path] = None, seed_roots: Sequence[Path] = (),
+                    flip_w: Optional[Path] = None, placebo: Optional[Path] = None,
+                    facts: Optional[Path] = None) -> str:
+    d: Dict[str, Any] = _load(study)
     conds = d.get("conditions", {})
     contr = d.get("contrasts", {})
     tr = d.get("test_retest", {})
+    out = [_stamp(study)]
 
-    def mac(name: str, value: str) -> str:
-        return f"\\newcommand{{\\{name}}}{{{value}}}"
+    def mac(name: str, value: str) -> None:
+        out.append(f"\\newcommand{{\\{name}}}{{{value}}}")
 
-    out = [_stamp(src)]
-    out.append(mac("NSupervisors", str(int(d.get("n_supervisors", 0)))))
+    mac("NSupervisors", str(int(d.get("n_supervisors", 0))))
     floor = (tr.get("mae_crossover") or {}).get("mean")
     if floor is not None:
-        out.append(mac("TestRetestFloor", f"{float(floor):.4f}"))
-    for key, name in (("memoryless", "Memoryless"), ("always_counter", "AlwaysCounter"),
-                      ("carryover_aware", "CarryoverAware"), ("random_static", "RandomStatic")):
+        mac("TestRetestFloor", f"{float(floor):.4f}")
+        mac("TestRetestFloorUnweighted", f"{float((tr.get('mae') or {}).get('mean', float('nan'))):.4f}")
+        mac("ReferenceVsTruth", f"{float((tr.get('reference_vs_truth_mae') or {}).get('mean', float('nan'))):.4f}")
+    names = (("memoryless", "Memoryless"), ("always_counter", "AlwaysCounter"), ("carryover_aware", "CarryoverAware"),
+             ("random_static", "RandomStatic"), ("recommended", "Recommended"), ("identification_first", "IdentFirst"),
+             ("fixed_washout", "FixedWashout"), ("ablation_schedule_only", "ScheduleOnly"),
+             ("ablation_estimator_only", "EstimatorOnly"), ("ablation_counter_only", "CounterOnly"),
+             ("ablation_b6_fixed_scenes", "IdentFirstFixed"), ("ablation_b6_ladder", "IdentFirstLadder"))
+    for key, name in names:
         c = contr.get(key, {})
         if "mae_crossover" in c:
-            out.append(mac(f"{name}MAE", _ci(c["mae_crossover"])))
+            mac(f"{name}MAE", _ci(c["mae_crossover"]))
+            mac(f"{name}Wins", f"{float(c['mae_crossover'].get('p_better', float('nan'))) * 100:.0f}")
         if "deployment_regret" in c:
-            out.append(mac(f"{name}Regret", _ci(c["deployment_regret"], 4)))
+            mac(f"{name}Regret", _ci(c["deployment_regret"], 4))
         cell = conds.get(key, {})
-        n_ctr = (cell.get("n_counter") or {}).get("mean")
-        if n_ctr is not None:
-            out.append(mac(f"{name}Counters", f"{float(n_ctr):.1f}"))
-        mae = (cell.get("mae_crossover") or {}).get("mean")
-        if mae is not None:
-            out.append(mac(f"{name}AbsMAE", f"{float(mae):.4f}"))
+        for k, suffix, nd in (("n_counter", "Counters", 1), ("mae_crossover", "AbsMAE", 4), ("alignment", "Align", 3),
+                              ("coverage@95", "Cov", 3), ("n_wait", "Waits", 1), ("deployment_regret", "AbsRegret", 4)):
+            v = (cell.get(k) or {}).get("mean")
+            if v is not None:
+                mac(f"{name}{suffix}", f"{float(v):.{nd}f}")
+        m = (cell.get("wall_clock_s") or {}).get("mean")
+        if m is not None:
+            mac(f"{name}Minutes", f"{float(m) / 60:.1f}")
+    vs4 = d.get("contrasts_vs_always_counter", {})
+    for key, name in names:
+        c = vs4.get(key, {})
+        if "mae_crossover" in c:
+            mac(f"{name}VsAlwaysMAE", _ci(c["mae_crossover"]))
+            mac(f"{name}VsAlwaysMinutes", f"{abs(float(c['wall_clock_s']['delta'])) / 60:.1f}")
+    others = [v["mae_crossover"]["mean"] for k, v in conds.items() if k != "memoryless"]
+    if others:
+        mac("RemedySpread", f"{max(others) - min(others):.4f}")
+        mac("RemedyMin", f"{min(others):.4f}")
+        mac("RemedyMax", f"{max(others):.4f}")
+        if floor:
+            mac("FloorOverSpread", f"{float(floor) / max(max(others) - min(others), 1e-9):.0f}")
+    mem = (contr.get("memoryless") or {}).get("mae_crossover", {}).get("delta")
+    if mem is not None and others:
+        mac("MemorylessOverSpread", f"{float(mem) / max(max(others) - min(others), 1e-9):.0f}")
     checks = ((d.get("audit") or {}).get("checks") or {})
     ident = checks.get("identified_fraction") or {}
     for k, name in (("lambda", "LambdaIdent"), ("beta_g", "BetaIdent")):
         if k in ident:
-            out.append(mac(name, f"{float(ident[k]) * 100:.0f}"))
+            mac(name, f"{float(ident[k]) * 100:.0f}")
+    per = d.get("identification") or {}
+    for key, name in names:
+        e = per.get(key)
+        if e:
+            mac(f"LambdaIdent{name}", f"{float(e['lambda']) * 100:.0f}")
+            mac(f"BetaIdent{name}", f"{float(e['beta_g']) * 100:.0f}")
+            mac(f"LambdaIdent{name}CI", f"[{e['lambda_ci'][0] * 100:.0f}, {e['lambda_ci'][1] * 100:.0f}]")
+            if e.get("lambda_tv") is not None:
+                mac(f"LambdaIdentTV{name}", f"{float(e['lambda_tv']) * 100:.0f}")
+            if e.get("lambda_noncomplier_rate") is not None:
+                mac(f"LambdaIdentNonc{name}", f"{float(e['lambda_noncomplier_rate']) * 100:.0f}")
+                mac(f"LambdaIdentTVNonc{name}", f"{float(e['lambda_tv_noncomplier_rate']) * 100:.0f}")
+    pop = d.get("population", {})
+    if pop:
+        mac("PopBetaG", f"{float(pop['beta_g']['mean']):.2f}")
+        mac("NNonCompliers", str(int(pop.get("n_noncompliers", 0))))
+    strata = (d.get("strata") or {}).get("true_beta_g") or {}
+    if strata:
+        for b, name in (("low", "Low"), ("mid", "Mid"), ("high", "High")):
+            s = strata.get(b, {})
+            for key, cname in names:
+                dd = (s.get("contrasts", {}).get(key) or {}).get("mae_crossover")
+                if dd:
+                    mac(f"{cname}Delta{name}", f"{float(dd['delta']):+.3f}")
+                ab = (s.get("conditions", {}).get(key) or {}).get("mae_crossover")
+                if ab:
+                    mac(f"{cname}Abs{name}", f"{float(ab['mean']):.4f}")
+        cuts = strata.get("cuts", [])
+        if len(cuts) == 2:
+            mac("TercileCutLow", f"{cuts[0]:.2f}")
+            mac("TercileCutHigh", f"{cuts[1]:.2f}")
+    ung = checks.get("worst_ungrounded_fraction")
+    if ung is not None:
+        mac("WorstUngrounded", f"{float(ung) * 100:.1f}")
     src_phys = checks.get("physics_source")
     if src_phys:
-        out.append(mac("PhysicsSource", str(src_phys)))
-        out.append(mac("PhysicsRollouts", str(int(checks.get("physics_n_measured", 0)))))
+        mac("PhysicsSource", str(src_phys))
+        mac("PhysicsRollouts", str(int(checks.get("physics_n_measured", 0))))
+
+    # --- physics ---------------------------------------------------------------------------
+    pr = _load(physics_report)
+    if pr:
+        out.append("% physics: " + str(physics_report))
+        b = pr.get("bootstrap") or {}
+        mac("CrossoverCm", f"{pr['crossover_margin_m'] * 100:.2f}")
+        mac("CrossoverCmShort", f"{pr['crossover_margin_m'] * 100:.1f}")
+        mac("WidthCm", f"{pr['transition_width_m'] * 100:.2f}")
+        mac("NRollouts", str(int(pr["n_rollouts"])))
+        mac("NPhysicsCells", str(int(pr.get("n_cells", 0))))
+        mac("LowerCrossoverCm", f"{(pr.get('lower_crossover_margin_m') or 0) * 100:.1f}")
+        if "crossover_margin_m" in b:
+            ci = b["crossover_margin_m"]
+            mac("CrossoverCI", f"[{ci['p2.5'] * 100:.1f}, {ci['p97.5'] * 100:.1f}]")
+            mac("CrossoverSD", f"{ci['sd'] * 100:.2f}")
+            wi = b["transition_width_m"]
+            mac("WidthCI", f"[{wi['p2.5'] * 100:.2f}, {wi['p97.5'] * 100:.2f}]")
+            mac("WidthSD", f"{wi['sd'] * 100:.2f}")
+            mac("WidthLowerCm", f"{wi['p2.5'] * 100:.2f}")
+            mac("WidthUpperCm", f"{wi['p97.5'] * 100:.2f}")
+            mac("NBoot", str(int(b.get("n_boot", 0))))
+            iso = b.get("isotonic") or {}
+            if iso:
+                mac("IsoWidthCI", f"[{iso['transition_width_m']['p2.5'] * 100:.2f}, {iso['transition_width_m']['p97.5'] * 100:.2f}]")
+                mac("IsoCrossoverCI", f"[{iso['crossover_margin_m']['p2.5'] * 100:.1f}, {iso['crossover_margin_m']['p97.5'] * 100:.1f}]")
+        iso = pr.get("isotonic") or {}
+        if iso:
+            mac("IsoCrossoverCm", f"{iso['crossover_margin_m'] * 100:.2f}")
+            mac("IsoWidthCm", f"{iso['transition_width_m'] * 100:.2f}")
+        fr = pr.get("fit_residuals") or {}
+        if fr:
+            mac("FitResidInBand", f"{fr['worst_abs_dp_in_band']:.3f}")
+            mac("FitResidOutBand", f"{fr['worst_abs_dp_out_of_band']:.2f}")
+            mac("FitResidDuration", f"{fr['worst_abs_dd_s']:.1f}")
+            mac("BandLoCm", f"{fr['band_m'][0] * 100:.1f}")
+            mac("BandHiCm", f"{fr['band_m'][1] * 100:.1f}")
+        lg = pr.get("legacy_fit") or {}
+        if lg:
+            mac("LegacyRefitCrossoverCm", f"{lg['crossover_margin_m'] * 100:.1f}")
+            mac("LegacyRefitWidthCm", f"{lg['transition_width_m'] * 100:.2f}")
+            mac("LegacyRefitResidInBand", f"{lg['fit_residuals']['worst_abs_dp_in_band']:.2f}")
+            mac("LegacyRefitResidOutBand", f"{lg['fit_residuals']['worst_abs_dp_out_of_band']:.2f}")
+        cf = pr.get("curve_fits") or {}
+        if cf:
+            mac("FloorA", f"{cf['A']['floor']:.2f}")
+            mac("FloorB", f"{cf['B']['floor']:.2f}")
+            mac("SlopeAPerCm", f"{cf['A']['slope_per_cm']:.1f}")
+            mac("SlopeBPerCm", f"{cf['B']['slope_per_cm']:.1f}")
+            mac("MidACm", f"{cf['A']['mid_cm']:.1f}")
+            mac("MidBCm", f"{cf['B']['mid_cm']:.1f}")
+            mac("NTimeoutExcluded", str(int(sum(int(v.get('n_duration_excluded_timeouts', 0)) for v in cf.values()))))
+        p = pr.get("p_success") or {}
+        if p:
+            for key, name in (("0cm", "Zero"), ("2cm", "Two"), ("4cm", "Four"), ("5cm", "Five"), ("6cm", "Six")):
+                if key in p:
+                    mac(f"PSuccA{name}", f"{p[key]['A']:.2f}")
+                    mac(f"PSuccB{name}", f"{p[key]['B']:.2f}")
+    legacy_study = Path(study).parents[1] / "legacy_2026-08-23" / "tier1" / "summary.json"
+    if legacy_study.exists():
+        ls = _load(legacy_study)
+        out.append("% legacy study (under the defective physics fit): " + str(legacy_study))
+        strata_l = (ls.get("strata") or {}).get("true_beta_g") or {}
+        for b, name in (("low", "Low"), ("mid", "Mid"), ("high", "High")):
+            dd = ((strata_l.get(b, {}).get("contrasts", {}).get("memoryless") or {}).get("mae_crossover"))
+            if dd:
+                mac(f"MemorylessLegacyDelta{name}", f"{float(dd['delta']):+.3f}")
+            ca = ((strata_l.get(b, {}).get("contrasts", {}).get("carryover_aware") or {}).get("mae_crossover"))
+            if ca:
+                mac(f"CarryoverAwareLegacyDelta{name}", f"{float(ca['delta']):+.3f}")
+        fl = ((ls.get("test_retest") or {}).get("mae_crossover") or {}).get("mean")
+        if fl is not None:
+            mac("LegacyTestRetestFloor", f"{float(fl):.4f}")
+        lct = (ls.get("contrasts", {}).get("always_counter") or {}).get("mae_crossover")
+        if lct:
+            mac("AlwaysCounterMAELegacy", _ci(lct))
+        li = (((ls.get("audit") or {}).get("checks") or {}).get("identified_fraction") or {})
+        if "lambda" in li:
+            mac("LambdaIdentLegacyTV", f"{float(li['lambda']) * 100:.0f}")
+    if legacy_report and Path(legacy_report).exists():
+        lr = _load(legacy_report)
+        out.append("% legacy physics (as published 2026-08-23 morning): " + str(legacy_report))
+        mac("LegacyCrossoverCm", f"{lr['crossover_margin_m'] * 100:.1f}")
+        mac("LegacyWidthCm", f"{lr['transition_width_m'] * 100:.2f}")
+        mac("LegacyNRollouts", str(int(lr["n_rollouts"])))
+        fr = lr.get("fit_residuals") or {}
+        if fr:
+            mac("LegacyResidWorst", f"{fr['worst_abs_dp']:.2f}")
+            mac("LegacyResidInBand", f"{fr['worst_abs_dp_in_band']:.3f}")
+
+    # --- physics CI ------------------------------------------------------------------------
+    if physics_ci and Path(physics_ci).exists():
+        rows = _load(physics_ci)
+        out.append("% physics CI: " + str(physics_ci))
+        for r in rows:
+            tag = {"lower": "Lower", "point": "Point", "upper": "Upper"}[r["draw"]]
+            for key, name in (("memoryless", "Memoryless"), ("always_counter", "AlwaysCounter"),
+                              ("recommended", "Recommended"), ("carryover_aware", "CarryoverAware"),
+                              ("identification_first", "IdentFirst")):
+                ct = r["contrasts"].get(key)
+                if ct:
+                    mac(f"{name}MAE{tag}", _ci(ct))
+            if r.get("floor") is not None:
+                mac(f"Floor{tag}", f"{r['floor']:.4f}")
+            if r.get("spread_remedies") is not None:
+                mac(f"RemedySpread{tag}", f"{r['spread_remedies']:.4f}")
+        mem_all = all(r["contrasts"].get("memoryless", {}).get("excludes_zero") for r in rows)
+        rem_any = any(ct["excludes_zero"] for r in rows for c, ct in r["contrasts"].items() if c != "memoryless")
+        mac("PhysicsCIMemorylessRobust", "every" if mem_all else "not every")
+        mac("PhysicsCIRemedyAny", "at least one" if rem_any else "no")
+
+    # --- seeds -----------------------------------------------------------------------------
+    for root, tag in zip(seed_roots, ("Tiny", "Smol", "Qwen", "QwenXL")):
+        ts = _load(Path(root) / "table_seeds.json")
+        if not ts:
+            continue
+        out.append(f"% seeds: {root}")
+        fl = ts.get("seed_floor", {})
+        if (fl.get("debias_gain_brier") or {}).get("floor") is not None:
+            mac(f"SeedFloorGain{tag}", f"{fl['debias_gain_brier']['floor']:.3f}")
+            mac(f"SeedFloorKappa{tag}", f"{fl['debias_kappa_corr']['floor']:.3f}")
+        n_seeds = max((c.get("n_seeds", 1) for c in ts.get("cells", [])), default=1)
+        mac(f"NSeeds{tag}", str(int(n_seeds)))
+        for c in ts.get("cells", []):
+            ctx = str(c.get("context") or c.get("ablation") or "").replace("-", "").title()
+            g, k = c["debias_gain_brier"], c["debias_kappa_corr"]
+            mac(f"Gain{tag}{ctx}", f"{g['mean']:+.3f}")
+            mac(f"GainSD{tag}{ctx}", f"{g['sd']:.3f}" if g.get("sd") is not None else "--")
+            mac(f"Kappa{tag}{ctx}", f"{k['mean']:+.3f}")
+            mac(f"KappaSD{tag}{ctx}", f"{k['sd']:.3f}" if k.get("sd") is not None else "--")
+        clears = [c for c in ts.get("contrasts", []) if c["clears_floor"]]
+        inside = [c for c in ts.get("contrasts", []) if not c["clears_floor"]]
+        mac(f"NContrastsClear{tag}", str(len(clears)))
+        mac(f"NContrastsInside{tag}", str(len(inside)))
+
+    # --- ablation seeds ----------------------------------------------------------------------
+    # The R6 prose quotes per-ablation macros (GainTinyFull, GainTinyNoreference, ...). These
+    # cells live in their own sweep directory and are keyed by ablation name, not context, so
+    # the model-roster loop above never sees them.
+    abl = _load(Path(study).parents[1] / "ablations" / "table_seeds.json")
+    if abl:
+        out.append("% ablation seeds: results/ablations")
+        fl = abl.get("seed_floor", {})
+        if (fl.get("debias_gain_brier") or {}).get("floor") is not None:
+            mac("SeedFloorGainAblations", f"{fl['debias_gain_brier']['floor']:.3f}")
+            mac("SeedFloorKappaAblations", f"{fl['debias_kappa_corr']['floor']:.3f}")
+        for c in abl.get("cells", []):
+            name = str(c.get("ablation") or "").replace("-", "").title()
+            if not name:
+                continue
+            g, k = c["debias_gain_brier"], c["debias_kappa_corr"]
+            mac(f"GainTiny{name}", f"{g['mean']:+.3f}")
+            mac(f"GainSDTiny{name}", f"{g['sd']:.3f}" if g.get("sd") is not None else "--")
+            mac(f"KappaTiny{name}", f"{k['mean']:+.3f}")
+            mac(f"KappaSDTiny{name}", f"{k['sd']:.3f}" if k.get("sd") is not None else "--")
+
+    # --- flip ------------------------------------------------------------------------------
+    if flip_w and Path(flip_w).exists():
+        fw = _load(flip_w)
+        out.append("% flip: " + str(flip_w))
+        for key, name in (("memoryless", "Memoryless"), ("always_counter", "AlwaysCounter"),
+                          ("recommended", "Recommended"), ("carryover_aware", "CarryoverAware"),
+                          ("identification_first", "IdentFirst")):
+            v = (fw.get("verdicts") or {}).get(key) or {}
+            hold = v.get("holds_at_cm") or []
+            if not hold:
+                txt = "nowhere in the sweep"
+            elif v.get("holds_contiguous"):
+                txt = f"$[{min(hold):g}, {max(hold):g}]$"
+            else:
+                txt = ", ".join(f"{x:g}" for x in hold) + " (not contiguous)"
+            mac(f"FlipWHold{name}", txt)
+            mac(f"FlipWN{name}", str(len(v.get("flips") or [])))
+            if "stable_inside_measured_ci" in v:
+                mac(f"FlipWStable{name}", "is stable across" if v["stable_inside_measured_ci"]
+                    else "flickers inside")
+        vals = [r["value_cm"] for r in fw.get("rows", [])]
+        if vals:
+            mac("FlipWMin", f"{min(vals):g}")
+            mac("FlipWMax", f"{max(vals):g}")
+            mac("FlipWNCells", str(len(vals)))
+
+    # --- placebo ---------------------------------------------------------------------------
+    if placebo and Path(placebo).exists():
+        pc = _load(placebo)
+        out.append("% placebo: " + str(placebo))
+        dc, pl = pc["dose_ctr"], pc["placebo_ctr"]
+        mac("DoseCtrWeak", f"{dc[0]:.1f}")
+        mac("DoseCtrModerate", f"{dc[1]:.1f}")
+        mac("DoseCtrStrong", f"{dc[2]:.1f}")
+        mac("PlaceboCtrLow", f"{pl[0]:.1f}")
+        mac("PlaceboCtrHigh", f"{pl[2]:.1f}")
+        mac("DoseCtrSpan", f"{pc['dose_span']:.1f}")
+        mac("PlaceboCtrSpan", f"{pc['placebo_span']:.1f}")
+        mac("PlaceboVerdict", "passes" if pc.get("ok") else "fails")
+
+    # --- deployed facts ---------------------------------------------------------------------
+    if facts and Path(facts).exists():
+        fc = _load(facts)
+        out.append("% deployed facts: " + str(facts))
+        mac("NDeployedCells", str(int(fc.get("n_cells", 0))))
+        worst = fc.get("worst_cell") or {}
+        if worst:
+            mac("WorstDeployedCell", f"{worst['backbone']}/\\textsf{{{worst['context']}}}")
+            mac("WorstDeployedAbst", f"{worst['abstain_band'] * 100:.1f}")
+            mac("WorstDeployedRel", f"{worst['deployed_rel']:+.4f}")
+        mac("NCellsAboveElevenPct", str(len(fc.get("cells_above_11pct_band_abstention") or [])))
+        mac("NCellsFailing", str(len(fc.get("cells_failing") or [])))
+
+    # --- availability flags and defaults ----------------------------------------------------
+    # The manuscript is rebuilt as results land. A section whose source has not run yet must
+    # say so in the PDF rather than fail the build or, worse, quote a stale macro; so every
+    # stage exports a 0/1 flag the prose can branch on, and any macro the prose may use that no
+    # source defined is given a visible \pending{} placeholder.
+    R = Path(study).parents[1]
+
+    def sweep_ready(root: Path, expected: Sequence[str], key: str = "context", min_seeds: int = 3) -> bool:
+        """A sweep is 'ready' only when every expected cell has enough seeds -- a partially run
+        sweep must present as pending, not quote its first cells as the result."""
+        ts = _load(root / "table_seeds.json")
+        if not ts:
+            return False
+        have = {str(c.get(key)): int(c.get("n_seeds", 0)) for c in ts.get("cells", [])}
+        return all(have.get(e, 0) >= min_seeds for e in expected)
+
+    flags = {
+        "SeedsTinyReady": sweep_ready(R / "models_isaac", ("none", "token", "film")),
+        "SeedsSmolReady": sweep_ready(R / "models_isaac_smolvla", ("none", "text", "token", "film")),
+        "SeedsQwenReady": sweep_ready(R / "models_isaac_qwen", ("none", "text", "film")),
+        "QwenXLReady": sweep_ready(R / "models_isaac_qwen25", ("none", "text", "film")),
+        "AblationsReady": sweep_ready(R / "ablations", ("full", "no-forward", "no-anti-copy", "no-reference"),
+                                      key="ablation"),
+        "ShiftReady": (R / "shift" / "table_cells.json").exists(),
+        "DeployedReady": (R / "deployed" / "summary.json").exists(),
+        "DeployedSmolReady": (R / "deployed_smolvla" / "summary.json").exists(),
+        "DeployedQwenReady": (R / "deployed_qwen" / "summary.json").exists(),
+        "PhysicsCIReady": bool(physics_ci and Path(physics_ci).exists()),
+        "FlipReady": bool(flip_w and Path(flip_w).exists()),
+        "PlaceboReady": bool(placebo and Path(placebo).exists()),
+        "CorpusReady": (R / "phrase_corpus" / "grounding_report.json").exists(),
+    }
+    for k, v in flags.items():
+        mac(k, "1" if v else "0")
+    # Self-healing defaults: any CamelCase macro the manuscript uses that no generated file
+    # defines gets a visible \pending{} placeholder, so a stage that has not run yet shows up
+    # in the PDF as a marked gap rather than failing the build or, worse, quoting a stale value.
+    defined = set(re.findall(r"\\newcommand\{\\([A-Za-z]+)\}", "\n".join(out)))
+    tables_dir = PAPER / "tables"
+    main_tex = PAPER / "main.tex"
+    for f in tables_dir.glob("*.tex"):
+        if f.name != "headline.tex":
+            try:
+                defined |= set(re.findall(r"\\newcommand\{\\([A-Za-z]+)\}", f.read_text()))
+            except OSError:
+                pass
+    if main_tex.exists():
+        text = main_tex.read_text()
+        defined |= set(re.findall(r"\\newcommand\{\\([A-Za-z]+)\}", text))
+        used = set(re.findall(r"\\([A-Z][A-Za-z]{3,})\b", text))
+        for name in sorted(used - defined):
+            # Our macros are CamelCase with at least two capitals and a lowercase letter;
+            # LaTeX's own (\Delta, \Big, \Pr) have one capital and are skipped. Emitted with
+            # \providecommand, which yields to anything already defined -- \IfFileExists once
+            # collided with a \newcommand default here.
+            if sum(c.isupper() for c in name) >= 2 and any(c.islower() for c in name):
+                out.append(f"\\providecommand{{\\{name}}}{{\\pending{{{name}}}}}")
     return "\n".join(out) + "\n"
 
 
+def shift_scene_figure(frames: Path, frames_shift: Path, out: Path, scene: str = "scene_007") -> Optional[Path]:
+    """Matched | held-out | held-out-from-the-second-pose, side by side, for the shift section."""
+    from PIL import Image
+
+    panels = [frames / "topdown" / scene, frames_shift / "topdown" / scene, frames_shift / "topdown_shift" / scene]
+    imgs = []
+    for d in panels:
+        cands = sorted(Path(d).glob("*.png"))
+        if not cands:
+            return None
+        imgs.append(Image.open(cands[0]).convert("RGB").resize((420, 420)))
+    combo = Image.new("RGB", (420 * 3 + 16, 420), (255, 255, 255))
+    for i, im in enumerate(imgs):
+        combo.paste(im, (i * (420 + 8), 0))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    combo.save(out)
+    return out
+
+
+# ---------------------------------------------------------------------------
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--models", type=Path, default=Path("vla_lab/results/models_isaac/table.json"))
-    ap.add_argument("--models-extra", type=Path, nargs="*", default=[
-        Path("vla_lab/results/models_isaac_smolvla/table.json"),
-        Path("vla_lab/results/models_isaac_qwen/table.json"),
-    ], help="further backbone sweeps to merge into the same table")
-    ap.add_argument("--deployed", type=Path, default=Path("vla_lab/results/deployed/summary.json"))
-    ap.add_argument("--sensitivity", type=Path, default=Path("vla_lab/results/sensitivity/table.json"))
-    ap.add_argument("--study", type=Path, default=Path("vla_lab/results/tier1/summary.json"))
-    ap.add_argument("--ablations", type=Path, default=Path("vla_lab/results/ablations/table.json"))
+    ap.add_argument("--results", type=Path, default=RESULTS)
     ap.add_argument("--out", type=Path, default=PAPER / "tables")
     args = ap.parse_args(argv)
-
+    R = Path(args.results)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     made, missing = [], []
-    fns = {"tab_models.tex": lambda p: models_table(p, args.models_extra)}
-    for name, src, fn in (("tab_models.tex", args.models, fns["tab_models.tex"]),
-                          ("tab_deployed.tex", args.deployed,
-                           lambda p: deployed_table(p, [("SmolVLA-450M",
-                                                         Path("vla_lab/results/deployed_smolvla/summary.json"))])),
-                          ("tab_sensitivity.tex", args.sensitivity, sensitivity_table),
-                          ("tab_ablations.tex", args.ablations, ablations_table),
-                          ("headline.tex", args.study, headline_macros)):
+
+    def emit(name: str, src: Path, fn) -> None:
         if not Path(src).exists():
             missing.append(f"{name} <- {src}")
-            continue
-        (out / name).write_text(fn(Path(src)))
-        made.append(f"{name} <- {src}")
+            return
+        text = fn()
+        if text:
+            (out / name).write_text(text)
+            made.append(f"{name} <- {src}")
+        else:
+            missing.append(f"{name} <- {src} (empty)")
+
+    study = R / "tier1" / "summary.json"
+    emit("tab_primary.tex", study, lambda: primary_table(study))
+    emit("tab_identification.tex", study, lambda: identification_table(study))
+    emit("tab_physics_ci.tex", R / "physics_ci" / "table.json", lambda: physics_ci_table(R / "physics_ci" / "table.json"))
+    model_roots = [R / "models_isaac", R / "models_isaac_smolvla", R / "models_isaac_qwen", R / "models_isaac_qwen25"]
+    present_roots = [p for p in model_roots if (p / "table_seeds.json").exists() or (p / "table.json").exists()]
+    emit("tab_models.tex", present_roots[0] / "table.json" if present_roots else R / "models_isaac" / "table.json",
+         lambda: models_table(present_roots))
+    emit("tab_ablations.tex", R / "ablations" / "table.json", lambda: ablations_table(R / "ablations"))
+    emit("tab_shift.tex", R / "shift" / "table_cells.json", lambda: shift_table(R / "shift" / "table_cells.json"))
+    emit("tab_sensitivity.tex", R / "sensitivity" / "table.json", lambda: sensitivity_table(R / "sensitivity" / "table.json"))
+    dep_blocks = [("TinyVLA-2M", R / "deployed" / "summary.json"), ("SmolVLA-450M", R / "deployed_smolvla" / "summary.json"),
+                  ("Qwen2-VL-2B", R / "deployed_qwen" / "summary.json")]
+    emit("tab_deployed.tex", R / "deployed" / "summary.json", lambda: deployed_table(dep_blocks))
+    emit("headline.tex", study, lambda: headline_macros(
+        study, physics_report=R / "physics" / "physics_report.json",
+        legacy_report=R / "physics" / "legacy_2026-08-23" / "physics_report.json",
+        physics_ci=R / "physics_ci" / "table.json",
+        seed_roots=model_roots, flip_w=R / "flip_w" / "flip.json",
+        placebo=R / "sensitivity" / "placebo.json", facts=R / "deployed" / "facts.json"))
     try:
         from .deployed_figure import figure as _deployed_figure
 
-        if Path(args.deployed).exists():
-            models = json.loads(Path(args.models).read_text()) if Path(args.models).exists() else []
-            _deployed_figure(json.loads(Path(args.deployed).read_text()), models,
-                             Path(args.deployed).parent / "fig_deployed.pdf")
-            made.append("fig_deployed.pdf <- " + str(args.deployed))
+        runs = []
+        for label, p in dep_blocks:
+            if p.exists():
+                mt = {"TinyVLA-2M": R / "models_isaac", "SmolVLA-450M": R / "models_isaac_smolvla",
+                      "Qwen2-VL-2B": R / "models_isaac_qwen"}[label] / "table.json"
+                models = _load(mt) or []
+                runs.append((label, _load(p), models))
+        if runs:
+            _deployed_figure(runs, R / "deployed" / "fig_deployed.pdf")
+            made.append("fig_deployed.pdf + facts.json <- deployed summaries")
     except Exception as exc:                                    # matplotlib is optional
         print(f"  (deployed figure skipped: {type(exc).__name__}: {exc})")
+    try:
+        p_fig = shift_scene_figure(R / "physics" / "frames", R / "physics" / "frames_shift",
+                                   PAPER / "figures" / "fig_shift_scenes.png")
+        if p_fig:
+            made.append(str(p_fig))
+    except Exception as exc:                                    # PIL is optional
+        print(f"  (shift scene figure skipped: {type(exc).__name__}: {exc})")
     for m in made:
         print("  wrote", m)
     for m in missing:

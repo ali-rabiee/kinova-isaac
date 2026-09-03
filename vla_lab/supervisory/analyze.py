@@ -194,10 +194,13 @@ def fig_carryover(rows: Sequence[Dict[str, Any]], out: Path) -> Path:
         lo, hi = min(min(t), min(e)), max(max(t), max(e))
         ax.plot([lo, hi], [lo, hi], color="#444", lw=0.8, ls="--")
         ax.scatter(t, e, s=16, alpha=0.7, color="#2c6fbb", edgecolor="white", linewidth=0.4)
-        rho = float(np.corrcoef(t, e)[0, 1]) if len(t) > 2 else float("nan")
+        from ..stats_utils import guarded_correlation
+
+        g = guarded_correlation(t, e, method="pearson")
         ax.set_xlabel(f"true {lab}")
         ax.set_ylabel(f"recovered {lab}")
-        ax.set_title(f"r = {rho:.2f}", loc="left", fontsize=8)
+        ax.set_title((f"r = {g['rho']:.2f} (n = {g['n']})" if g["reported"] else f"n = {g['n']}: r withheld"),
+                     loc="left", fontsize=8)
     axes[2].hist(true_bg, bins=12, color="#7f8c8d", alpha=0.85)
     axes[2].set_xlabel(r"true $\beta_p g_p$ across the population")
     axes[2].set_ylabel("supervisors")
@@ -249,6 +252,58 @@ def fig_scene_model(contract_dict: Dict[str, Any], out: Path) -> Path:
     return p
 
 
+def fig_identification(summary: Dict[str, Any], rows: Sequence[Dict[str, Any]], out: Path) -> Path:
+    """B6's claim in one figure. Left: per-condition identification rate of the decay rate, with
+    Wilson intervals. Right: recovered against true lambda per supervisor, under the natural
+    schedule (B5) and the identification-first one (B6)."""
+    plt = _mpl()
+    ident = summary.get("identification") or {}
+    conds = [c for c in ("fixed_washout", "carryover_aware", "recommended", "ablation_b6_fixed_scenes",
+                         "identification_first") if c in ident]
+    fig, (ax, bx) = plt.subplots(1, 2, figsize=(8.8, 3.0), gridspec_kw={"width_ratios": [1.15, 1.0]})
+    y = np.arange(len(conds))
+    vals = [ident[c]["lambda"] for c in conds]
+    err = np.array([[ident[c]["lambda"] - ident[c]["lambda_ci"][0] for c in conds],
+                    [ident[c]["lambda_ci"][1] - ident[c]["lambda"] for c in conds]])
+    tv = [ident[c].get("lambda_tv", np.nan) for c in conds]
+    tv_nc = [ident[c].get("lambda_tv_noncomplier_rate") for c in conds]
+    cols = ["#8e44ad" if c.startswith("identification") or c.startswith("ablation_b6") else "#7f8c8d" for c in conds]
+    ax.barh(y - 0.18, vals, xerr=err, color=cols, height=0.34, error_kw={"lw": 0.9, "capsize": 2},
+            label="posterior contraction (honest)")
+    ax.barh(y + 0.18, tv, color=cols, height=0.34, alpha=0.35, label="TV criterion (first draft)")
+    for yi, (t, nc) in enumerate(zip(tv, tv_nc)):
+        if nc is not None and np.isfinite(t):
+            ax.plot([nc], [yi + 0.18], marker="x", color="#c0392b", ms=5,
+                    label=r"TV rate among $\beta{=}0$" if yi == 0 else None)
+    ax.set_yticks(y, [DISPLAY_NAMES.get(c, c).strip() for c in conds])
+    ax.invert_yaxis()
+    ax.set_xlim(0, 1)
+    ax.set_xlabel(r"fraction of supervisors with $\lambda$ 'identified'")
+    ax.legend(fontsize=6, frameon=False, loc="lower right")
+    ax.set_title("Identification of the decay rate, by schedule and by criterion", loc="left", fontsize=8.5)
+    for a, b, col, lab in (("carryover_aware", "B5 (natural schedule)", "#7f8c8d", "B5"),
+                           ("identification_first", "B6 (identification-first)", "#8e44ad", "B6")):
+        t, e = [], []
+        for r in rows:
+            jc = r["conditions"].get(a, {}).get("joint_carryover")
+            if jc:
+                t.append(float(r["params"]["lam"]))
+                e.append(float(jc["mean"]["lambda"]))
+        if t:
+            bx.scatter(t, e, s=14, alpha=0.65, color=col, edgecolor="white", linewidth=0.4, label=b)
+    bx.plot([0, 1], [0, 1], color="#444", lw=0.8, ls="--")
+    bx.set_xlabel(r"true $\lambda_p$")
+    bx.set_ylabel(r"recovered $\lambda_p$ (posterior mean)")
+    bx.set_title("Recovery per supervisor", loc="left", fontsize=8.5)
+    bx.legend(fontsize=6.5, frameon=False)
+    fig.tight_layout()
+    p = out / "fig_identification.pdf"
+    fig.savefig(p)
+    fig.savefig(p.with_suffix(".png"))
+    plt.close(fig)
+    return p
+
+
 def audit_study(summary: Dict[str, Any], rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """Study-level provenance and internal-consistency checks.
 
@@ -271,6 +326,22 @@ def audit_study(summary: Dict[str, Any], rows: Sequence[Dict[str, Any]]) -> Dict
     if phys.get("source") != "measured":
         flags.append("scene physics is a PRIOR, not a measurement: every scene coordinate, and "
                      "therefore every regret number, is 'under the assumed physics'")
+    checks["physics_fit_method"] = phys.get("fit_method")
+    checks["physics_quantile"] = phys.get("quantile", "point")
+    checks["crossover_margin_m"] = None
+    checks["transition_width_m"] = None
+    try:
+        from .scenes import ScenePhysics
+
+        sp = ScenePhysics.from_dict(phys)
+        checks["crossover_margin_m"] = float(sp.crossover_margin())
+        checks["transition_width_m"] = float(sp.transition_width_m())
+    except Exception:                                           # pragma: no cover
+        pass
+    if str(phys.get("quantile", "point")) != "point":
+        flags.append(f"scene physics is the '{phys.get('quantile')}' draw, NOT the point estimate: this run "
+                     "exists to bound a contrast under physics uncertainty and must not be pooled with, "
+                     "or quoted in place of, the point-estimate study")
 
     conds = summary.get("conditions_run") or []
     slots = {c: summary["conditions"][c] for c in conds if c in summary.get("conditions", {})}
@@ -296,7 +367,8 @@ def audit_study(summary: Dict[str, Any], rows: Sequence[Dict[str, Any]]) -> Dict
             if jc and jc.get("identifiability"):
                 ident["n"] += 1
                 for k in ("lambda", "beta_g"):
-                    ident[k] += int(jc["identifiability"].get(k, {}).get("identified", False))
+                    crit = jc["identifiability"].get(k, {})
+                    ident[k] += int(crit.get("identified_sd", crit.get("identified", False)))
                 break
     if ident["n"]:
         checks["identified_fraction"] = {k: ident[k] / ident["n"] for k in ("lambda", "beta_g")}
@@ -327,7 +399,9 @@ def render_audit(audit: Dict[str, Any]) -> str:
     lines = ["", "study audit", "-" * 60,
              f"  supervisors      : {c.get('n_supervisors')} "
              f"({c.get('n_noncompliers')} non-compliers)   prior: {c.get('prior')}",
-             f"  scene physics    : {c.get('physics_source')} (n={c.get('physics_n_measured')})",
+             f"  scene physics    : {c.get('physics_source')} (n={c.get('physics_n_measured')}, "
+             f"fit={c.get('physics_fit_method')}, draw={c.get('physics_quantile')}, "
+             f"m*={(c.get('crossover_margin_m') or 0) * 100:.2f} cm, w={(c.get('transition_width_m') or 0) * 100:.2f} cm)",
              f"  test-retest floor: {c.get('test_retest_floor')}",
              f"  ungrounded (max) : {c.get('worst_ungrounded_fraction', 0)*100:.1f}%"]
     idf = c.get("identified_fraction")
@@ -350,6 +424,7 @@ def write_figures(summary: Dict[str, Any], rows: Sequence[Dict[str, Any]], out: 
         lambda: fig_frontier(summary, out),
         lambda: fig_heterogeneity(rows, out),
         lambda: fig_carryover(rows, out),
+        lambda: fig_identification(summary, rows, out) if summary.get("identification") else None,
         lambda: fig_scene_model(summary["contract"], out) if "contract" in summary else None,
     ):
         try:

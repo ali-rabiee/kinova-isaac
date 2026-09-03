@@ -206,3 +206,54 @@ def test_session_supplies_context_to_a_learned_grounder():
     assert hasattr(ctx, "kappa") and hasattr(ctx, "slots_since_coach")
     assert -8.0 < float(ctx.kappa) < 8.0, f"implausible kappa handed to the grounder: {ctx.kappa}"
 
+
+
+def test_the_ask_decision_comes_from_the_belief_module_never_from_the_learned_gate():
+    """P2-2. The learned ask gate is a functional of the quantity under estimation and cannot be
+    identified from data in which that quantity is unknown; the deployed system therefore takes
+    the counter-proposal decision from the explicit belief module. Concretely: a grounder that
+    screams "ask!" on every call must not change a single action the session takes."""
+    import random
+
+    from vla_lab.supervisory.apparatus import LexicalGrounder, SimulatedSupervisorChannel, SurrogateApparatus
+    from vla_lab.supervisory.contract import Contract
+    from vla_lab.supervisory.protocol import build_protocol
+    from vla_lab.supervisory.scheduler import POLICY_RECOMMENDED, build_scheduler
+    from vla_lab.supervisory.session import run_block
+    from vla_lab.supervisory.supervisor import SimulatedSupervisor, draw_supervisor
+
+    contract = Contract()
+
+    class LoudGate(LexicalGrounder):
+        """Grounds like the lexical channel and carries an ask gate pinned to certainty."""
+
+        name = "loud-gate"
+        ask_logit = 1e9
+        ask_calls = 0
+
+        def set_context(self, ctx):
+            self.last_context = ctx
+
+        def should_ask(self, *a, **k):                      # nothing in the session may call this
+            LoudGate.ask_calls += 1
+            return True
+
+    def actions(grounder):
+        rng = random.Random(11)
+        params = draw_supervisor(rng, None, supervisor_id="S011")
+        proto = build_protocol(supervisor_id="S011", contract=contract, seed=11,
+                               conditions=[POLICY_RECOMMENDED], order_index=0)
+        block = proto.condition_blocks()[0]
+        sup = SimulatedSupervisor(params, axis=contract.axis, cfg=contract.carryover, seed=11)
+        sch = build_scheduler(POLICY_RECOMMENDED, contract.grid, carryover_cfg=contract.carryover,
+                              delta_model=contract.delta_model(), seed=11)
+        res = run_block(contract=contract, block=block, scheduler=sch, channel=SimulatedSupervisorChannel(sup),
+                        apparatus=SurrogateApparatus(contract.grid, seed=11), grounder=grounder, seed=11)
+        return [r["action"] for r in res.records], [r["rationale"].get("reason") for r in res.records]
+
+    a_lex, why_lex = actions(LexicalGrounder(contract.axis))
+    a_loud, why_loud = actions(LoudGate(contract.axis))
+    assert a_lex == a_loud, "the grounder's opinion about asking leaked into the action sequence"
+    assert LoudGate.ask_calls == 0, "the session consulted the grounder's gate"
+    assert any("counter" in str(w).lower() or "posterior" in str(w).lower() or "washout" in str(w).lower()
+               for w in why_loud if w), "every ask/wait decision must carry a belief-module rationale"

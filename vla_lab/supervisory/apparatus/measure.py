@@ -78,16 +78,19 @@ def summarise(rows: Sequence[Dict[str, Any]]) -> str:
 
 
 def fit_residuals(rows: Sequence[Dict[str, Any]], phys: ScenePhysics,
-                  band: Tuple[float, float] = (0.048, 0.123)) -> Dict[str, Any]:
+                  band: Optional[Tuple[float, float]] = None, band_c: float = 1.2) -> Dict[str, Any]:
     """How far the fitted curves sit from the measurement, per cell and worst-case.
 
-    A two-parameter logistic cannot follow a near-step, and this scene's success curves are
-    close to one at the tight end. That is not a reason to hide the fit -- the study only uses
-    it inside the ambiguous band -- but it is a reason to report *where* it holds rather than
-    quoting a single R-squared. Reported per cell, and summarised separately inside and outside
-    the band the estimand is defined over.
+    Reported per cell, and summarised separately inside and outside the ambiguous band the
+    estimand is defined over. The band is derived from the fit itself (``|c| <= band_c``) unless
+    given explicitly, so a re-measured physics cannot be scored against a stale band.
     """
     from collections import defaultdict
+
+    if band is None:
+        lo_m = phys.margin_for_coordinate(+band_c)
+        hi_m = phys.margin_for_coordinate(-band_c)
+        band = (min(lo_m, hi_m), max(lo_m, hi_m))
 
     tally: Dict[Tuple[float, str], List[Any]] = defaultdict(lambda: [0, 0, []])
     for r in rows:
@@ -117,8 +120,26 @@ def fit_residuals(rows: Sequence[Dict[str, Any]], phys: ScenePhysics,
         "cells": cells,
         "worst_abs_dp": worst(lambda c: True),
         "worst_abs_dp_in_band": worst(lambda c: c["in_band"]),
+        "worst_abs_dp_out_of_band": worst(lambda c: not c["in_band"]),
         "worst_abs_dd_s": max((abs(c["dd_s"]) for c in cells if c["dd_s"] == c["dd_s"]), default=float("nan")),
         "band_m": list(band),
+        "n_cells_in_band": int(sum(1 for c in cells if c["in_band"])),
+    }
+
+
+def _physics_summary(phys: ScenePhysics) -> Dict[str, Any]:
+    return {
+        "fit_method": phys.fit_method,
+        "crossover_margin_m": phys.crossover_margin(),
+        "transition_width_m": phys.transition_width_m(),
+        "lower_crossover_margin_m": phys.lower_crossover_margin(),
+        "degenerate": phys.is_degenerate(),
+        "p_success": {
+            f"{m * 100:g}cm": {"A": phys.p_success(STRATEGY_A, m), "B": phys.p_success(STRATEGY_B, m)}
+            for m in (0.0, 0.02, 0.04, 0.05, 0.06, 0.08, 0.12, 0.16)
+        },
+        "coordinate": {f"{m * 100:g}cm": phys.coordinate(m) for m in (0.0, 0.02, 0.04, 0.05, 0.06, 0.08, 0.12, 0.16)},
+        "params": phys.to_dict(),
     }
 
 
@@ -126,32 +147,79 @@ def fit_from_rollouts(
     rows: Sequence[Dict[str, Any]],
     *,
     base: Optional[ScenePhysics] = None,
+    n_boot: int = 2000,
+    seed: int = 0,
 ) -> Tuple[ScenePhysics, Dict[str, Any]]:
-    """Fit :class:`ScenePhysics` and report what the fit implies."""
-    phys = ScenePhysics.fit(rows, base=base)
-    report = {
+    """Fit :class:`ScenePhysics` and report what the fit implies -- with its uncertainty.
+
+    The primary fit is the lapse-parameterised psychometric; the isotonic fit is the model-free
+    check; the legacy scaled logistic is reproduced for the comparison (it is what the first
+    version of the paper ran under, and its residuals are reported alongside so the improvement
+    is documented rather than hidden). ``n_boot`` within-cell bootstrap replicates give
+    percentile intervals on ``m*`` and ``w`` and the ``lower``/``upper`` physics objects the
+    study runner can rebuild its grid under.
+    """
+    from ..physics_fit import (FIT_LEGACY, bootstrap_physics, fit_physics_lapse, fit_physics_legacy,
+                               isotonic_physics_summary)
+
+    phys, fits = fit_physics_lapse(rows, base=base)
+    legacy = fit_physics_legacy(rows, base=base)
+    report: Dict[str, Any] = {
         "source": phys.source,
         "n_rollouts": int(phys.n_measured),
+        "n_cells": len({(str(r["strategy"]), round(float(r["margin_m"]), 4)) for r in rows}),
+        "fit_method": phys.fit_method,
         "crossover_margin_m": phys.crossover_margin(),
         "transition_width_m": phys.transition_width_m(),
+        "lower_crossover_margin_m": phys.lower_crossover_margin(),
         "degenerate": phys.is_degenerate(),
-        "p_success": {
-            f"{int(m * 100)}cm": {"A": phys.p_success(STRATEGY_A, m), "B": phys.p_success(STRATEGY_B, m)}
-            for m in (0.0, 0.04, 0.08, 0.12, 0.16)
-        },
-        "coordinate": {f"{int(m * 100)}cm": phys.coordinate(m) for m in (0.0, 0.04, 0.08, 0.12, 0.16)},
+        "p_success": _physics_summary(phys)["p_success"],
+        "coordinate": _physics_summary(phys)["coordinate"],
+        "curve_fits": fits,
         "fit_residuals": fit_residuals(rows, phys),
+        "isotonic": isotonic_physics_summary(rows, phys),
+        "legacy_fit": {
+            **_physics_summary(legacy),
+            "fit_residuals": fit_residuals(rows, legacy),
+            "note": "the original scaled logistic with a ridge prior of precision 1e-2 on a PER-METRE slope; "
+                    "reported for comparison only (defect xii), never run under",
+        },
     }
+    if int(n_boot) > 0:
+        report["bootstrap"] = bootstrap_physics(rows, base=base, n_boot=int(n_boot), seed=int(seed))
     return phys, report
+
+
+def write_fit_outputs(phys: ScenePhysics, report: Dict[str, Any], out: Path,
+                      *, rows: Optional[Sequence[Dict[str, Any]]] = None) -> None:
+    """``physics.json``, ``physics_report.json``, the quantile physics files, and the figure."""
+    from ..scenes import ScenePhysics as _SP
+
+    out = Path(out)
+    save_physics(phys, out)
+    qp = (report.get("bootstrap") or {}).get("quantile_physics") or {}
+    for tag in ("lower", "upper"):
+        if tag in qp:
+            save_physics(_SP.from_dict(qp[tag]), out.with_name(f"physics_{tag}.json"))
+    if rows is not None:
+        try:
+            from ..physics_figure import figure as _physics_figure
+
+            report["figure"] = _physics_figure(rows, phys, out.with_name("fig_physics.pdf"), report=report)
+        except Exception as exc:                                    # matplotlib is optional
+            report["figure_error"] = f"{type(exc).__name__}: {exc}"
+    out.with_name("physics_report.json").write_text(json.dumps(report, indent=2, default=float) + "\n")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    f = sub.add_parser("fit", help="fit ScenePhysics from an existing rollouts.jsonl")
-    f.add_argument("rollouts", type=Path)
+    f = sub.add_parser("fit", help="fit ScenePhysics from one or more rollouts.jsonl files (pooled)")
+    f.add_argument("rollouts", type=Path, nargs="+")
     f.add_argument("--out", type=Path, default=Path("vla_lab/results/physics/physics.json"))
+    f.add_argument("--bootstrap", type=int, default=2000, help="within-cell bootstrap replicates (0 = skip)")
+    f.add_argument("--seed", type=int, default=0)
     f.add_argument("--quiet", action="store_true")
 
     g = sub.add_parser("grid", help="print the margin grid a sweep should cover")
@@ -165,15 +233,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(" ".join(f"{m:.4f}" for m in default_margin_grid(args.lo, args.hi, args.n)))
         return 0
 
-    rows = read_rollouts(args.rollouts)
+    rows: List[Dict[str, Any]] = []
+    for path in args.rollouts:
+        rows.extend(read_rollouts(path))
     if not rows:
         print(f"[FAIL] no rollouts in {args.rollouts}", file=sys.stderr)
         return 2
     if not args.quiet:
         print(summarise(rows))
-    phys, report = fit_from_rollouts(rows)
-    save_physics(phys, args.out)
-    Path(args.out).with_name("physics_report.json").write_text(json.dumps(report, indent=2, default=float) + "\n")
+    phys, report = fit_from_rollouts(rows, n_boot=int(args.bootstrap), seed=int(args.seed))
+    report["rollout_files"] = [str(p) for p in args.rollouts]
+    write_fit_outputs(phys, report, Path(args.out), rows=rows)
     if not args.quiet:
         print()
         print(json.dumps(report, indent=2, default=float))
